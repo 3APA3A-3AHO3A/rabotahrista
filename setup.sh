@@ -30,6 +30,10 @@ while [[ -z "$REMNA_SECRET" ]]; do
     read -p "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
 done
 
+echo -e "\n--- Опциональные компоненты ---"
+read -p "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
+read -p "Установить Speedtest CLI (Ookla)? [y/N]: " INSTALL_SPEEDTEST
+
 echo -e "\n--- Дополнительные проверки после установки ---"
 read -p "Запустить проверку железа и сети (bench.sh)? [y/N]: " RUN_BENCH
 read -p "Запустить проверку геобазы IP (ipregion)? [y/N]: " RUN_GEO
@@ -71,17 +75,21 @@ apt autoremove --purge -y
 apt install -y curl wget unzip git ufw fail2ban socat jq certbot python3-certbot-nginx nginx dnsutils chrony iperf3 btop ncdu
 
 # ==========================================
-# 2.5. Установка Speedtest CLI от Ookla
+# 2.5. Установка Speedtest CLI (Опционально)
 # ==========================================
-echo "Установка Speedtest CLI..."
-curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash || true
+if [[ "$INSTALL_SPEEDTEST" =~ ^[Yy]$ ]]; then
+    echo "Установка Speedtest CLI..."
+    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash || true
 
-# Workaround для Ubuntu 24.04 (Noble) - меняем на jammy, если репы для noble еще нет
-if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
-    sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list
-    apt update
+    # Workaround для Ubuntu 24.04 (Noble) - меняем на jammy
+    if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
+        sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list
+        apt update
+    fi
+    apt install speedtest -y || echo "Speedtest установить не удалось, продолжаем..."
+else
+    echo "Пропуск установки Speedtest..."
 fi
-apt install speedtest -y || echo "Speedtest установить не удалось, продолжаем..."
 
 # ==========================================
 # 3. Настройка GRUB (Отключение IPv6)
@@ -153,7 +161,12 @@ sysctl --system
 # ==========================================
 echo "Установка Docker и Warp..."
 curl -fsSL https://get.docker.com | sh
-bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh)
+if [[ "$INSTALL_WARP" =~ ^[Yy]$ ]]; then
+    echo "Установка Cloudflare WARP..."
+    bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh) || echo "Ошибка установки WARP, продолжаем..."
+else
+    echo "Пропуск установки Cloudflare WARP..."
+fi
 
 # ==========================================
 # 7. Поднятие Remnanode в Docker
