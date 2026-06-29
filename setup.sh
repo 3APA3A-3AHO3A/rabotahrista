@@ -30,6 +30,14 @@ while [[ -z "$REMNA_SECRET" ]]; do
     read -p "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
 done
 
+echo -e "\n--- Настройка SSH ---"
+read -p "Настроить беспарольный вход по SSH-ключу для root? [y/N]: " SETUP_SSH
+if [[ "$SETUP_SSH" =~ ^[Yy]$ ]]; then
+    while [[ -z "$SSH_PUBLIC_KEY" ]]; do
+        read -p "Вставьте ваш публичный SSH-ключ (например, ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
+    done
+fi
+
 echo -e "\n--- Опциональные компоненты ---"
 read -p "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
 read -p "Установить Speedtest CLI (Ookla)? [y/N]: " INSTALL_SPEEDTEST
@@ -47,6 +55,35 @@ sleep 2
 
 # Отключаем интерактивные окна apt
 export DEBIAN_FRONTEND=noninteractive
+
+# ==========================================
+# 1.2. Настройка беспарольного входа по SSH (Опционально)
+# ==========================================
+if [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && [[ -n "$SSH_PUBLIC_KEY" ]]; then
+    echo "Настройка беспарольного входа по SSH для root..."
+    
+    # Создаем директорию и настраиваем права
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+
+    # Добавляем публичный ключ, если его еще нет в файле
+    touch /root/.ssh/authorized_keys
+    grep -qF "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys || echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+
+    # Изменяем настройки в sshd_config
+    sed -i "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+    grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+
+    sed -i "s/^[# ]*PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+    grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
+
+    # Перезапускаем службу SSH
+    systemctl restart ssh || systemctl restart sshd
+    echo "SSH-доступ по ключу успешно настроен!"
+else
+    echo "Пропуск настройки SSH по ключу..."
+fi
 
 # ==========================================
 # 1.5. Настройка Swap-файла (Защита от падений по памяти)
@@ -203,7 +240,7 @@ chown -R www-data:www-data /var/lib/letsencrypt/.well-known
 chmod -R 755 /var/lib/letsencrypt/.well-known
 echo "test" | tee /var/lib/letsencrypt/.well-known/acme-challenge/test.txt
 
-# Записываем HTML (используем 'EOF' в кавычках, чтобы Bash не трогал код внутри)
+# Записываем HTML
 cat <<'EOF' > /var/www/stub/index.html
 <!DOCTYPE html>
 <html lang="en">
@@ -233,7 +270,7 @@ cat <<'EOF' > /var/www/stub/index.html
         /* Main Container */
         main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 4rem; padding: 4rem 5%; max-width: 1400px; margin: 0 auto; }
         
-        /* Left Side: Marketing / Justification */
+        /* Left Side */
         .hero-text h1 { font-size: 3.5rem; line-height: 1.1; margin-bottom: 1.5rem; }
         .hero-text h1 span { background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .hero-text p { font-size: 1.125rem; color: var(--text-muted); margin-bottom: 2rem; line-height: 1.6; max-width: 500px; }
@@ -415,7 +452,6 @@ echo "[ОЖИДАНИЕ] Проверка привязки домена $FULL_DO
 SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
 
 for i in {1..30}; do
-    # Получаем IP, на который указывает домен
     RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1)
     
     if [ "$RESOLVED_IP" == "$SERVER_IP" ]; then
@@ -431,7 +467,6 @@ for i in {1..30}; do
         exit 1
     fi
 done
-# Выпускаем сертификат с помощью стандартного конфига Nginx, чтобы Certbot сделал всё сам
 certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive
 
 # ==========================================
@@ -453,11 +488,8 @@ server {
 }
 
 server {
-    # Этот блок ловит всё, что не подошло по домену
     listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
     server_name _;
-
-    # Жестко обрываем TLS-соединение до выдачи сертификата!
     ssl_reject_handshake on;
 }
 
@@ -465,11 +497,9 @@ server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name $FULL_DOMAIN;
 
-    # SSL сертификаты Let's Encrypt
     ssl_certificate /etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem;
 
-    # Безопасность SSL
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
     ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
@@ -489,7 +519,6 @@ server {
 }
 EOF
 
-# Удаляем дефолтные конфиги, как ты и просил
 rm -f /etc/nginx/sites-available/default
 rm -f /etc/nginx/sites-enabled/default 
 ln -sf /etc/nginx/sites-available/$FULL_DOMAIN /etc/nginx/sites-enabled/
