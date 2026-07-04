@@ -451,7 +451,10 @@ echo "Выпуск SSL сертификата..."
 echo "[ОЖИДАНИЕ] Проверка привязки домена $FULL_DOMAIN к IP сервера..."
 SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
 
-for i in {1..30}; do
+ATTEMPTS=0
+MAX_ATTEMPTS=30
+
+while true; do
     RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1)
     
     if [ "$RESOLVED_IP" == "$SERVER_IP" ]; then
@@ -459,12 +462,16 @@ for i in {1..30}; do
         break
     fi
     
-    echo "Попытка $i/30: DNS еще не обновился (Сервер: $SERVER_IP, Домен: ${RESOLVED_IP:-ПУСТО}). Ждем 10 сек..."
+    ((ATTEMPTS++))
+    echo "Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS еще не обновился (Сервер: $SERVER_IP, Домен: ${RESOLVED_IP:-ПУСТО}). Ждем 10 сек..."
     sleep 10
     
-    if [ "$i" -eq 30 ]; then
-        echo -e "\n[ОШИБКА] DNS так и не обновился за 5 минут. Проверьте DNS. Скрипт прерван."
-        exit 1
+    if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
+        echo -e "\n[ВНИМАНИЕ] Прошло 5 минут, но DNS так и не обновился!"
+        echo "Пожалуйста, проверьте у регистратора, что для $FULL_DOMAIN создана A-запись на IP $SERVER_IP."
+        echo "(Если используете Cloudflare, отключите оранжевое облако на время установки)."
+        read -p "Нажмите Enter, чтобы попробовать еще $MAX_ATTEMPTS раз, или Ctrl+C для прерывания..."
+        ATTEMPTS=0 # Сбрасываем счетчик и пробуем снова
     fi
 done
 certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive
