@@ -25,6 +25,8 @@ while [[ -z "$SUBDOMAIN" ]]; do
     read -p "Введите имя этой ноды/субдомен (например, node-1): " SUBDOMAIN
 done
 
+read -p "Пропустить строгую проверку DNS? (Нажмите 'y', если используете Cloudflare Proxy ☁️) [y/N]: " SKIP_DNS
+
 FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
 echo -e "\nНачинаем перенос ноды на $FULL_DOMAIN..."
 
@@ -32,33 +34,35 @@ echo -e "\nНачинаем перенос ноды на $FULL_DOMAIN..."
 # 2. Проверка DNS
 # ==========================================
 SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
-echo -e "\n[ОЖИДАНИЕ] Проверка привязки домена $FULL_DOMAIN к IP $SERVER_IP..."
 
-ATTEMPTS=0
-MAX_ATTEMPTS=30
+if [[ "$SKIP_DNS" =~ ^[Yy]$ ]]; then
+    echo -e "\n[ПРОПУСК] Строгая проверка DNS отключена пользователем. Надеемся, домен уже направлен куда надо!"
+else
+    echo -e "\n[ОЖИДАНИЕ] Проверка привязки домена $FULL_DOMAIN к IP $SERVER_IP..."
+    ATTEMPTS=0
+    MAX_ATTEMPTS=30
 
-while true; do
-    # Добавлено || true, чтобы set -e не убил скрипт, если команда dig вернет ошибку
-    RESOLVED_IP=$(dig +short "$FULL_DOMAIN" 2>/dev/null | tail -n1 || true)
-    
-    if [ "$RESOLVED_IP" == "$SERVER_IP" ]; then
-        echo -e "-> DNS успешно обновлен! Домен указывает на $SERVER_IP\n"
-        break
-    fi
-    
-    # БЕЗОПАСНЫЙ инкремент (не возвращает ошибку при нуле)
-    ATTEMPTS=$((ATTEMPTS + 1))
-    
-    echo "Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS еще не обновился (Сервер: $SERVER_IP, Домен: ${RESOLVED_IP:-ПУСТО}). Ждем 10 сек..."
-    sleep 10
-    
-    if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
-        echo -e "\n[ВНИМАНИЕ] Прошло 5 минут, но DNS так и не обновился!"
-        echo "Убедитесь, что создали A-запись для $SUBDOMAIN, ведущую на $SERVER_IP."
-        read -p "Нажмите Enter, чтобы попробовать еще $MAX_ATTEMPTS раз, или Ctrl+C для выхода..."
-        ATTEMPTS=0
-    fi
-done
+    while true; do
+        RESOLVED_IP=$(dig +short "$FULL_DOMAIN" 2>/dev/null | tail -n1 || true)
+        
+        if [ "$RESOLVED_IP" == "$SERVER_IP" ]; then
+            echo -e "-> DNS успешно обновлен! Домен указывает на $SERVER_IP\n"
+            break
+        fi
+        
+        ATTEMPTS=$((ATTEMPTS + 1))
+        
+        echo "Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS еще не обновился (Сервер: $SERVER_IP, Домен: ${RESOLVED_IP:-ПУСТО}). Ждем 10 сек..."
+        sleep 10
+        
+        if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
+            echo -e "\n[ВНИМАНИЕ] Прошло 5 минут, но DNS так и не обновился!"
+            echo "Убедитесь, что создали A-запись для $SUBDOMAIN, ведущую на $SERVER_IP."
+            read -p "Нажмите Enter, чтобы попробовать еще $MAX_ATTEMPTS раз, или Ctrl+C для выхода..."
+            ATTEMPTS=0
+        fi
+    done
+fi
 
 # ==========================================
 # 3. Выпуск нового SSL сертификата
@@ -127,7 +131,6 @@ shopt -s nullglob
 for conf in /etc/nginx/sites-available/*; do
     [ -f "$conf" ] || continue
     basename_conf=$(basename "$conf")
-    # Исключаем только что созданный конфиг
     if [[ "$basename_conf" != "$FULL_DOMAIN" ]]; then
         nginx_configs+=("$basename_conf")
     fi
@@ -142,7 +145,6 @@ if [ ${#nginx_configs[@]} -gt 0 ]; then
     
     read -p "Укажите номера для удаления (например: 1, 2) или 'c': " choices
     if [[ "$choices" != "c" && "$choices" != "C" && -n "$choices" ]]; then
-        # Заменяем запятые на пробелы для цикла
         choices=$(echo "$choices" | tr ',' ' ')
         for choice in $choices; do
             if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#nginx_configs[@]}" ]; then
@@ -161,7 +163,6 @@ echo -e "\n=== Очистка сертификатов Certbot ==="
 declare -a certbot_certs
 for cert_conf in /etc/letsencrypt/renewal/*.conf; do
     cert_name=$(basename "$cert_conf" .conf)
-    # Исключаем только что созданный сертификат
     if [[ "$cert_name" != "$FULL_DOMAIN" ]]; then
         certbot_certs+=("$cert_name")
     fi
@@ -183,7 +184,6 @@ if [ ${#certbot_certs[@]} -gt 0 ]; then
                 index=$((choice-1))
                 cert_to_delete="${certbot_certs[$index]}"
                 echo " -> Удаление сертификата: $cert_to_delete"
-                # Используем штатную команду certbot, добавлено || true для безопасности
                 certbot delete --cert-name "$cert_to_delete" --non-interactive || true
             fi
         done
@@ -197,13 +197,8 @@ fi
 # ==========================================
 echo -e "\nПерезапуск Nginx..."
 
-# Безопасно очищаем симлинки, чтобы не было "мертвых" конфигов
 rm -f /etc/nginx/sites-enabled/*
-
-# Включаем только наш новый домен
 ln -sf /etc/nginx/sites-available/$FULL_DOMAIN /etc/nginx/sites-enabled/
-
-# Проверяем конфиг и применяем
 nginx -t
 systemctl restart nginx
 
