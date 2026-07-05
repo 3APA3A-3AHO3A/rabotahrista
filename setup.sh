@@ -18,29 +18,50 @@ fi
 # 1. Сбор данных
 # ==========================================
 echo -e "\n=========================================="
-while [[ -z "$DOMAIN" ]]; do
-    read -p "Введите основной домен (например, domain.com): " DOMAIN
+
+while true; do
+    read -ep "Введите основной домен (например, domain.com): " DOMAIN
+    DOMAIN=$(echo "$DOMAIN" | tr -d '[:space:]')
+    if [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+        break
+    else
+        echo -e "\e[31m[Ошибка]\e[0m Разрешены только английские буквы, цифры, точки и дефисы."
+    fi
 done
 
-while [[ -z "$PANEL_IP" ]]; do
-    read -p "Введите IP-адрес мастер-панели (для UFW): " PANEL_IP
+while true; do
+    read -ep "Введите IP-адрес мастер-панели (для UFW): " PANEL_IP
+    PANEL_IP=$(echo "$PANEL_IP" | tr -d '[:space:]')
+    if [[ "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        break
+    else
+        echo -e "\e[31m[Ошибка]\e[0m Введите корректный IPv4 адрес (например, 192.168.1.1)."
+    fi
 done
 
-while [[ -z "$SUBDOMAIN" ]]; do
-    read -p "Введите имя ноды/субдомена (например, node-nl-1): " SUBDOMAIN
+while true; do
+    read -ep "Введите имя ноды/субдомена (например, node-nl-1): " SUBDOMAIN
+    SUBDOMAIN=$(echo "$SUBDOMAIN" | tr -d '[:space:]')
+    if [[ "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]]; then
+        break
+    else
+        echo -e "\e[31m[Ошибка]\e[0m Разрешены только английские буквы, цифры и дефисы (без точек)."
+    fi
 done
 
 while [[ -z "$REMNA_SECRET" ]]; do
-    read -p "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
+    read -ep "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
+    REMNA_SECRET=$(echo "$REMNA_SECRET" | tr -d '[:space:]')
 done
 
 echo -e "\n--- Настройка Cloudflare DNS ---"
-read -p "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
+read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
 if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
     while [[ -z "$CF_API_TOKEN" ]]; do
-        read -p "Введите ваш API Token от Cloudflare (с правами Edit DNS): " CF_API_TOKEN
+        read -ep "Введите ваш API Token от Cloudflare (с правами Edit DNS): " CF_API_TOKEN
+        CF_API_TOKEN=$(echo "$CF_API_TOKEN" | tr -d '[:space:]')
     done
-    read -p "Включить Proxy (Оранжевое облако) для скрытия IP сайта? [y/N]: " CF_PROXY_CHOICE
+    read -ep "Включить Proxy (Оранжевое облако) для скрытия IP сайта? [y/N]: " CF_PROXY_CHOICE
     if [[ "$CF_PROXY_CHOICE" =~ ^[Yy]$ ]]; then
         CF_PROXIED="true"
     else
@@ -48,23 +69,14 @@ if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
     fi
 fi
 
-
 echo -e "\n--- Настройка SSH ---"
-read -p "Настроить беспарольный вход по SSH-ключу для root? [y/N]: " SETUP_SSH
+read -ep "Настроить беспарольный вход по SSH-ключу для root? [y/N]: " SETUP_SSH
 if [[ "$SETUP_SSH" =~ ^[Yy]$ ]]; then
     while [[ -z "$SSH_PUBLIC_KEY" ]]; do
-        read -p "Вставьте ваш публичный SSH-ключ (например, ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
+        read -ep "Вставьте ваш публичный SSH-ключ (например, ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
     done
 fi
 
-echo -e "\n--- Опциональные компоненты ---"
-read -p "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
-read -p "Установить Speedtest CLI (Ookla)? [y/N]: " INSTALL_SPEEDTEST
-
-echo -e "\n--- Дополнительные проверки после установки ---"
-read -p "Запустить проверку железа и сети (bench.sh)? [y/N]: " RUN_BENCH
-read -p "Запустить проверку геобазы IP (ipregion)? [y/N]: " RUN_GEO
-read -p "Запустить проверку разблокировки стримингов (Netflix, ChatGPT)? [y/N]: " RUN_MEDIA
 echo -e "==========================================\n"
 
 FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
@@ -72,7 +84,6 @@ FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
 echo "Начинаем настройку сервера для $FULL_DOMAIN..."
 sleep 2
 
-# Отключаем интерактивные окна apt
 export DEBIAN_FRONTEND=noninteractive
 
 # ==========================================
@@ -81,23 +92,19 @@ export DEBIAN_FRONTEND=noninteractive
 if [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && [[ -n "$SSH_PUBLIC_KEY" ]]; then
     echo "Настройка беспарольного входа по SSH для root..."
     
-    # Создаем директорию и настраиваем права
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
 
-    # Добавляем публичный ключ, если его еще нет в файле
     touch /root/.ssh/authorized_keys
     grep -qF "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys || echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
     chmod 600 /root/.ssh/authorized_keys
 
-    # Изменяем настройки в sshd_config
     sed -i "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
     grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 
     sed -i "s/^[# ]*PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
     grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 
-    # Перезапускаем службу SSH
     systemctl restart ssh || systemctl restart sshd
     echo "SSH-доступ по ключу успешно настроен!"
 else
@@ -151,7 +158,6 @@ fi
 # 3. Настройка GRUB (Отключение IPv6)
 # ==========================================
 echo "Отключение IPv6 в GRUB..."
-# Безопасное добавление ipv6.disable=1, если его там еще нет
 if ! grep -q "ipv6.disable=1" /etc/default/grub; then
     sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' /etc/default/grub
     update-grub
@@ -315,36 +321,41 @@ if [[ "$SETUP_CF" =~ ^[Yy]$ ]] && [[ -n "$CF_API_TOKEN" ]]; then
 fi
 
 # ==========================================
-# 9. Получение SSL сертификата (до применения кастомного конфига Nginx)
+# 9. Получение SSL сертификата
 # ==========================================
 echo "Выпуск SSL сертификата..."
-echo "[ОЖИДАНИЕ] Проверка привязки домена $FULL_DOMAIN к IP сервера..."
-SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
 
-ATTEMPTS=0
-MAX_ATTEMPTS=30
+if [ -d "/etc/letsencrypt/live/$FULL_DOMAIN" ]; then
+    echo -e "-> SSL сертификат для $FULL_DOMAIN уже существует! Пропускаем выпуск Let's Encrypt.\n"
+else
+    echo "[ОЖИДАНИЕ] Проверка привязки домена $FULL_DOMAIN к IP сервера..."
+    SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
 
-while true; do
-    RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1)
+    ATTEMPTS=0
+    MAX_ATTEMPTS=30
+
+    while true; do
+        RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1)
+        
+        if [ "$RESOLVED_IP" == "$SERVER_IP" ]; then
+            echo -e "-> DNS успешно обновлен! Домен указывает на $SERVER_IP\n"
+            break
+        fi
+        
+        ((ATTEMPTS++))
+        echo "Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS еще не обновился (Домен: ${RESOLVED_IP:-ПУСТО}). Ждем 10 сек..."
+        sleep 10
+        
+        if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
+            echo -e "\n[ВНИМАНИЕ] DNS так и не обновился!"
+            echo "Возможно, скрипт запущен за Cloudflare Proxy (Оранжевое облако)."
+            read -p "Нажмите Enter, чтобы продолжить установку сертификата на свой страх и риск, или Ctrl+C для выхода..."
+            break
+        fi
+    done
     
-    if [ "$RESOLVED_IP" == "$SERVER_IP" ]; then
-        echo -e "-> DNS успешно обновлен! Домен указывает на $SERVER_IP\n"
-        break
-    fi
-    
-    ((ATTEMPTS++))
-    echo "Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS еще не обновился (Сервер: $SERVER_IP, Домен: ${RESOLVED_IP:-ПУСТО}). Ждем 10 сек..."
-    sleep 10
-    
-    if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
-        echo -e "\n[ВНИМАНИЕ] Прошло 5 минут, но DNS так и не обновился!"
-        echo "Пожалуйста, проверьте у регистратора, что для $FULL_DOMAIN создана A-запись на IP $SERVER_IP."
-        echo "(Если используете Cloudflare, отключите оранжевое облако на время установки)."
-        read -p "Нажмите Enter, чтобы попробовать еще $MAX_ATTEMPTS раз, или Ctrl+C для прерывания..."
-        ATTEMPTS=0 # Сбрасываем счетчик и пробуем снова
-    fi
-done
-certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive
+    certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive
+fi
 
 # ==========================================
 # 10. Применение кастомного конфига Nginx
