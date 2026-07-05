@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-width=1.0">
+    <title>Linux Cheatsheet | Admin Notes</title>
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-panel: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #38bdf8;
+            --border: #334155;
+            --code-bg: #0b1120;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            display: flex;
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        /* Sidebar Navigation */
+        .sidebar {
+            width: 280px;
+            background-color: var(--bg-panel);
+            border-right: 1px solid var(--border);
+            padding: 2rem 0;
+            display: flex;
+            flex-direction: column;
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
+        }
+
+        .sidebar-header {
+            padding: 0 1.5rem 1.5rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
+        }
+
+        .sidebar-header h1 {
+            font-size: 1.2rem;
+            color: var(--accent);
+            margin-bottom: 0.2rem;
+        }
+
+        .sidebar-header p {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .nav-item {
+            padding: 0.75rem 1.5rem;
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.95rem;
+            transition: all 0.2s;
+            cursor: pointer;
+            border-left: 3px solid transparent;
+        }
+
+        .nav-item:hover {
+            color: var(--text-main);
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .nav-item.active {
+            color: var(--accent);
+            background-color: rgba(56, 189, 248, 0.1);
+            border-left-color: var(--accent);
+            font-weight: 500;
+        }
+
+        /* Main Content Area */
+        .main-content {
+            flex: 1;
+            margin-left: 280px;
+            padding: 3rem 5%;
+            max-width: 900px;
+        }
+
+        .page-section {
+            display: none;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        .page-section.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h2 { font-size: 2rem; margin-bottom: 1.5rem; color: #fff; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+        h3 { font-size: 1.25rem; margin: 2rem 0 1rem 0; color: #e2e8f0; }
+        p { margin-bottom: 1rem; color: var(--text-muted); }
+        
+        ul { margin-bottom: 1.5rem; padding-left: 1.5rem; color: var(--text-muted); }
+        li { margin-bottom: 0.5rem; }
+
+        /* Code Blocks */
+        pre {
+            background-color: var(--code-bg);
+            padding: 1.25rem;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            overflow-x: auto;
+            margin-bottom: 1.5rem;
+        }
+
+        code {
+            font-family: 'Courier New', Courier, monospace;
+            color: #a5b4fc;
+            font-size: 0.9rem;
+        }
+
+        p code, li code {
+            background-color: var(--code-bg);
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            color: #a5b4fc;
+        }
+
+        footer {
+            margin-top: 4rem;
+            padding-top: 2rem;
+            border-top: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-align: center;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            body { flex-direction: column; }
+            .sidebar { width: 100%; position: relative; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+            .main-content { margin-left: 0; padding: 2rem; }
+        }
+    </style>
+</head>
+<body>
+
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <h1>Linux Cheatsheet</h1>
+            <p>Personal reference notes</p>
+        </div>
+        <div class="nav-item active" onclick="switchPage('home', this)">Introduction</div>
+        <div class="nav-item" onclick="switchPage('files', this)">File Management</div>
+        <div class="nav-item" onclick="switchPage('network', this)">Networking & UFW</div>
+        <div class="nav-item" onclick="switchPage('system', this)">System & Processes</div>
+    </nav>
+
+    <main class="main-content">
+        
+        <!-- SECTION: Home -->
+        <section id="home" class="page-section active">
+            <h2>Welcome to my notes</h2>
+            <p>I frequently find myself looking up the same terminal commands when deploying new Ubuntu/Debian servers. To save time, I compiled this quick reference guide.</p>
+            <p>This page acts as a central hub for basic operations ranging from network configuration to process management. It is written purely in HTML/CSS with no external dependencies.</p>
+            
+            <h3>Why Ubuntu?</h3>
+            <p>Most of these commands apply to any Debian-based distribution. Ubuntu Server simply provides a vast repository and excellent community support, making it my default choice for headless environments.</p>
+        </section>
+
+        <!-- SECTION: Files -->
+        <section id="files" class="page-section">
+            <h2>File Management</h2>
+            <p>Basic commands for navigating the file system and managing permissions.</p>
+
+            <h3>Viewing & Finding</h3>
+            <p>List all files, including hidden ones, with human-readable sizes:</p>
+            <pre><code>ls -lah</code></pre>
+
+            <p>Find a file by name starting from the root directory:</p>
+            <pre><code>find / -name "nginx.conf" 2>/dev/null</code></pre>
+
+            <h3>Permissions</h3>
+            <p>Give the owner read/write/execute permissions, and others read/execute:</p>
+            <pre><code>chmod 755 /path/to/script.sh</code></pre>
+
+            <p>Change the owner of a directory recursively:</p>
+            <pre><code>chown -R www-data:www-data /var/www/html</code></pre>
+        </section>
+
+        <!-- SECTION: Network -->
+        <section id="network" class="page-section">
+            <h2>Networking & UFW</h2>
+            <p>Securing the server using the Uncomplicated Firewall (UFW) and checking ports.</p>
+
+            <h3>Basic UFW Setup</h3>
+            <p>A standard configuration that blocks everything except SSH, HTTP, and HTTPS:</p>
+            <pre><code>ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw enable</code></pre>
+
+            <h3>Checking Connections</h3>
+            <p>Check which services are listening on which ports:</p>
+            <pre><code>ss -tulpn</code></pre>
+            
+            <p>Or using the older netstat tool:</p>
+            <pre><code>netstat -plnt</code></pre>
+        </section>
+
+        <!-- SECTION: System -->
+        <section id="system" class="page-section">
+            <h2>System & Processes</h2>
+            <p>Monitoring resource usage and managing system services.</p>
+
+            <h3>Disk and Memory</h3>
+            <p>Check free disk space on mounted drives:</p>
+            <pre><code>df -h</code></pre>
+
+            <p>Check available RAM and Swap:</p>
+            <pre><code>free -m</code></pre>
+
+            <h3>Managing Services (Systemd)</h3>
+            <p>Restart Nginx and check its status:</p>
+            <pre><code>systemctl restart nginx
+systemctl status nginx</code></pre>
+            <p>Enable a service to start automatically on boot:</p>
+            <pre><code>systemctl enable fail2ban</code></pre>
+        </section>
+
+        <footer>
+            <p>&copy; <script>document.write(new Date().getFullYear())</script> Server Documentation. Static HTML setup.</p>
+        </footer>
+
+    </main>
+
+    <script>
+        // Simple script to handle navigation without reloading the page
+        function switchPage(pageId, element) {
+            // Hide all sections
+            const sections = document.querySelectorAll('.page-section');
+            sections.forEach(sec => sec.classList.remove('active'));
+
+            // Remove active class from all nav items
+            const navItems = document.querySelectorAll('.nav-item');
+            navItems.forEach(item => item.classList.remove('active'));
+
+            // Show selected section
+            document.getElementById(pageId).classList.add('active');
+            
+            // Highlight clicked nav item
+            element.classList.add('active');
+            
+            // Scroll to top
+            window.scrollTo(0, 0);
+        }
+    </script>
+</body>
+</html>
