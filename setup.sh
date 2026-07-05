@@ -34,6 +34,21 @@ while [[ -z "$REMNA_SECRET" ]]; do
     read -p "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
 done
 
+echo -e "\n--- Настройка Cloudflare DNS ---"
+read -p "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
+if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
+    while [[ -z "$CF_API_TOKEN" ]]; do
+        read -p "Введите ваш API Token от Cloudflare (с правами Edit DNS): " CF_API_TOKEN
+    done
+    read -p "Включить Proxy (Оранжевое облако) для скрытия IP сайта? [y/N]: " CF_PROXY_CHOICE
+    if [[ "$CF_PROXY_CHOICE" =~ ^[Yy]$ ]]; then
+        CF_PROXIED="true"
+    else
+        CF_PROXIED="false"
+    fi
+fi
+
+
 echo -e "\n--- Настройка SSH ---"
 read -p "Настроить беспарольный вход по SSH-ключу для root? [y/N]: " SETUP_SSH
 if [[ "$SETUP_SSH" =~ ^[Yy]$ ]]; then
@@ -254,6 +269,51 @@ else
     echo "Ошибка загрузки заглушки. Создан запасной файл."
     echo "<html><body><h1>Hello World</h1></body></html>" > /var/www/stub/index.html
 fi
+
+# ==========================================
+# 8.5. Автоматическая привязка DNS в Cloudflare
+# ==========================================
+SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
+
+if [[ "$SETUP_CF" =~ ^[Yy]$ ]] && [[ -n "$CF_API_TOKEN" ]]; then
+    echo -e "\nАвтоматическая настройка DNS в Cloudflare..."
+    
+    # 1. Получаем ID зоны
+    ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+    if [ "$ZONE_ID" == "null" ] || [ -z "$ZONE_ID" ]; then
+        echo "[ВНИМАНИЕ] Не удалось получить Zone ID. Проверьте токен. Переход к ручному режиму..."
+    else
+        # 2. Ищем существующую запись
+        RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$FULL_DOMAIN&type=A" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+        # ВСЕГДА сначала создаем Серое облако (proxied: false) для успешной работы Certbot
+        JSON_DATA_GRAY='{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":false}'
+
+        if [ "$RECORD_ID" != "null" ] && [ -n "$RECORD_ID" ]; then
+            echo "Запись $FULL_DOMAIN существует. Обновляем IP и ставим Серое облако для выпуска SSL..."
+            curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "$JSON_DATA_GRAY" > /dev/null
+        else
+            echo "Создаем новую запись $FULL_DOMAIN (Серое облако)..."
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "$JSON_DATA_GRAY")
+            RECORD_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id')
+        fi
+        
+        echo "DNS запись обновлена! Ждем 15 секунд..."
+        sleep 15
+    fi
+fi
+
 # ==========================================
 # 9. Получение SSL сертификата (до применения кастомного конфига Nginx)
 # ==========================================
@@ -342,6 +402,21 @@ ln -sf /etc/nginx/sites-available/$FULL_DOMAIN /etc/nginx/sites-enabled/
 
 nginx -t
 systemctl restart nginx
+
+# ==========================================
+# 10.5. Включение Proxy Cloudflare (Оранжевое облако)
+# ==========================================
+if [[ "$CF_PROXIED" == "true" ]] && [[ -n "$RECORD_ID" ]] && [[ "$RECORD_ID" != "null" ]]; then
+    echo -e "\nВключение Оранжевого облака Cloudflare для скрытия IP..."
+    JSON_DATA_ORANGE='{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":true}'
+    
+    curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$JSON_DATA_ORANGE" > /dev/null
+        
+    echo "Оранжевое облако успешно включено!"
+fi
 
 # ==========================================
 # 11. Запуск выбранных диагностик
