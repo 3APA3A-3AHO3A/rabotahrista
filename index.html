@@ -1,266 +1,694 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-width=1.0">
-    <title>Linux Cheatsheet | Admin Notes</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Personal infrastructure documentation and snippets.">
+    <title>DevOps Space | Notes</title>
+    
+    <!-- 100% Inline SVG Favicon (Terminal Icon) -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ededed' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 17 10 11 4 5'/%3E%3Cline x1='12' y1='19' x2='20' y2='19'/%3E%3C/svg%3E">
+
     <style>
+        /* 2026 Modern Aesthetic Variables */
         :root {
-            --bg-dark: #0f172a;
-            --bg-panel: #1e293b;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --accent: #38bdf8;
-            --border: #334155;
-            --code-bg: #0b1120;
+            --bg: #000000;
+            --bg-glass: rgba(10, 10, 10, 0.6);
+            --surface: rgba(255, 255, 255, 0.02);
+            --surface-hover: rgba(255, 255, 255, 0.05);
+            --border: rgba(255, 255, 255, 0.08);
+            --border-hover: rgba(255, 255, 255, 0.15);
+            --text-main: #ededed;
+            --text-muted: #a1a1aa;
+            --accent: #ededed;
+            --glow: rgba(255, 255, 255, 0.08);
+            
+            --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            --font-mono: 'Geist Mono', 'JetBrains Mono', 'SF Mono', Consolas, monospace;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
 
         body {
-            font-family: system-ui, -apple-system, sans-serif;
-            background-color: var(--bg-dark);
+            font-family: var(--font-sans);
+            background-color: var(--bg);
             color: var(--text-main);
             display: flex;
             min-height: 100vh;
             line-height: 1.6;
+            font-size: 15px;
+            -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
         }
 
-        /* Sidebar Navigation */
+        /* Ambient glowing background */
+        .ambient-glow {
+            position: fixed;
+            top: -20vh;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80vw;
+            height: 50vh;
+            background: radial-gradient(ellipse at center, rgba(255, 255, 255, 0.07) 0%, transparent 60%);
+            z-index: -1;
+            pointer-events: none;
+        }
+
+        /* Minimal Scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        /* Sleek Sidebar */
         .sidebar {
-            width: 280px;
-            background-color: var(--bg-panel);
+            width: 260px;
+            background: var(--bg-glass);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
             border-right: 1px solid var(--border);
-            padding: 2rem 0;
             display: flex;
             flex-direction: column;
             position: fixed;
             height: 100vh;
+            z-index: 50;
+            transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
             overflow-y: auto;
         }
 
         .sidebar-header {
-            padding: 0 1.5rem 1.5rem 1.5rem;
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 1rem;
+            padding: 2rem 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            position: sticky;
+            top: 0;
+            background: inherit;
+            z-index: 2;
         }
 
-        .sidebar-header h1 {
-            font-size: 1.2rem;
+        .logo-icon {
+            width: 24px;
+            height: 24px;
             color: var(--accent);
-            margin-bottom: 0.2rem;
         }
 
-        .sidebar-header p {
-            font-size: 0.85rem;
-            color: var(--text-muted);
+        .sidebar-header h1 { font-size: 1rem; font-weight: 500; letter-spacing: -0.02em; }
+        .sidebar-header p { font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono); }
+
+        .nav-items {
+            padding: 0 1rem 2rem 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
 
         .nav-item {
-            padding: 0.75rem 1.5rem;
+            padding: 0.6rem 1rem;
             color: var(--text-muted);
             text-decoration: none;
-            font-size: 0.95rem;
-            transition: all 0.2s;
+            font-size: 0.9rem;
+            border-radius: 8px;
+            transition: all 0.2s ease;
             cursor: pointer;
-            border-left: 3px solid transparent;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border: 1px solid transparent;
+        }
+
+        .nav-item svg {
+            width: 16px;
+            height: 16px;
+            opacity: 0.6;
+            transition: opacity 0.2s ease;
         }
 
         .nav-item:hover {
             color: var(--text-main);
-            background-color: rgba(255, 255, 255, 0.05);
+            background: var(--surface);
+            border: 1px solid var(--border);
         }
 
         .nav-item.active {
-            color: var(--accent);
-            background-color: rgba(56, 189, 248, 0.1);
-            border-left-color: var(--accent);
-            font-weight: 500;
+            color: var(--text-main);
+            background: var(--surface-hover);
+            border: 1px solid var(--border);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
         }
 
-        /* Main Content Area */
+        .nav-item.active svg { opacity: 1; color: #fff; }
+        
+        /* Nav group separator */
+        .nav-sep {
+            margin: 1rem 0 0.5rem 1rem;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--border-hover);
+            font-weight: 600;
+        }
+
+        /* Floating Mobile Toggle */
+        .mobile-toggle {
+            display: none;
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: rgba(25, 25, 25, 0.8);
+            backdrop-filter: blur(10px);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            border-radius: 50px;
+            width: 54px;
+            height: 54px;
+            cursor: pointer;
+            z-index: 100;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.2s ease;
+        }
+
+        /* Main Content */
         .main-content {
             flex: 1;
-            margin-left: 280px;
-            padding: 3rem 5%;
-            max-width: 900px;
+            margin-left: 260px;
+            padding: 4rem 2rem;
+            max-width: 1000px;
+            width: 100%;
         }
 
         .page-section {
             display: none;
-            animation: fadeIn 0.3s ease-in-out;
+            animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            opacity: 0;
         }
 
-        .page-section.active {
-            display: block;
-        }
+        .page-section.active { display: block; }
 
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(5px); }
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(15px); }
             to { opacity: 1; transform: translateY(0); }
         }
 
-        h2 { font-size: 2rem; margin-bottom: 1.5rem; color: #fff; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
-        h3 { font-size: 1.25rem; margin: 2rem 0 1rem 0; color: #e2e8f0; }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 4px 10px;
+            border-radius: 99px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            margin-bottom: 1.5rem;
+            letter-spacing: 0.02em;
+        }
+
+        .badge::before {
+            content: ''; width: 6px; height: 6px; background: #fff; border-radius: 50%; box-shadow: 0 0 8px #fff;
+        }
+
+        h2 { 
+            font-size: 2.5rem; 
+            margin-bottom: 0.5rem; 
+            font-weight: 600;
+            letter-spacing: -0.04em;
+            background: linear-gradient(180deg, #fff 0%, #a1a1aa 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .section-desc { font-size: 1.1rem; color: var(--text-muted); margin-bottom: 3rem; }
+
+        /* Bento Box Grid */
+        .bento-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .bento-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .bento-card:hover {
+            border-color: var(--border-hover);
+            background: var(--surface-hover);
+            box-shadow: 0 8px 32px rgba(255, 255, 255, 0.02);
+        }
+
+        h3 { font-size: 1.1rem; margin-bottom: 1rem; font-weight: 500; color: var(--text-main); }
         p { margin-bottom: 1rem; color: var(--text-muted); }
         
-        ul { margin-bottom: 1.5rem; padding-left: 1.5rem; color: var(--text-muted); }
-        li { margin-bottom: 0.5rem; }
-
         /* Code Blocks */
-        pre {
-            background-color: var(--code-bg);
-            padding: 1.25rem;
-            border-radius: 8px;
+        .code-container {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 12px;
             border: 1px solid var(--border);
-            overflow-x: auto;
-            margin-bottom: 1.5rem;
+            margin: 1.2rem 0 0 0;
+            overflow: hidden;
         }
 
-        code {
-            font-family: 'Courier New', Courier, monospace;
-            color: #a5b4fc;
-            font-size: 0.9rem;
+        .code-header {
+            background: rgba(255, 255, 255, 0.02);
+            padding: 0.7rem 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
         }
 
-        p code, li code {
-            background-color: var(--code-bg);
-            padding: 0.2rem 0.4rem;
-            border-radius: 4px;
-            border: 1px solid var(--border);
-            color: #a5b4fc;
+        .code-header::before {
+            content: '';
+            display: inline-block;
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: #ff5f56;
+            box-shadow: 18px 0 0 #ffbd2e, 36px 0 0 #27c93f;
+            margin-right: auto;
         }
 
-        footer {
-            margin-top: 4rem;
-            padding-top: 2rem;
-            border-top: 1px solid var(--border);
+        .copy-btn {
+            background: transparent;
             color: var(--text-muted);
-            font-size: 0.85rem;
-            text-align: center;
+            border: 1px solid transparent;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-family: var(--font-sans);
         }
 
-        /* Responsive */
-        @media (max-width: 768px) {
-            body { flex-direction: column; }
-            .sidebar { width: 100%; position: relative; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
-            .main-content { margin-left: 0; padding: 2rem; }
+        .copy-btn:hover { color: var(--text-main); background: var(--surface); border-color: var(--border); }
+        .copy-btn.copied { color: #10b981; background: rgba(16, 185, 129, 0.1); }
+
+        pre { padding: 1.2rem; overflow-x: auto; }
+        code { font-family: var(--font-mono); color: #d4d4d8; font-size: 0.85rem; line-height: 1.5; }
+        p code { background: var(--surface); padding: 0.2rem 0.4rem; border-radius: 6px; border: 1px solid var(--border); color: #e4e4e7; font-size: 0.85em; }
+
+        .comment { color: #52525b; }
+        .keyword { color: #818cf8; }
+
+        @media (max-width: 800px) {
+            .sidebar { transform: translateX(-100%); width: 100%; background: rgba(0,0,0,0.95); }
+            .sidebar.open { transform: translateX(0); }
+            .main-content { margin-left: 0; padding: 2rem 1.5rem 6rem 1.5rem; }
+            .mobile-toggle { display: flex; }
+            .bento-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
 <body>
 
+    <div class="ambient-glow"></div>
+
     <nav class="sidebar">
         <div class="sidebar-header">
-            <h1>Linux Cheatsheet</h1>
-            <p>Personal reference notes</p>
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" class="logo-icon"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+            <div>
+                <h1>DevOps Space</h1>
+                <p>System Specs v26.1</p>
+            </div>
         </div>
-        <div class="nav-item active" onclick="switchPage('home', this)">Introduction</div>
-        <div class="nav-item" onclick="switchPage('files', this)">File Management</div>
-        <div class="nav-item" onclick="switchPage('network', this)">Networking & UFW</div>
-        <div class="nav-item" onclick="switchPage('system', this)">System & Processes</div>
+        
+        <div class="nav-items">
+            <div class="nav-sep">Core</div>
+            <div class="nav-item active" onclick="switchPage('home', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                Overview
+            </div>
+            <div class="nav-item" onclick="switchPage('files', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+                File Management
+            </div>
+            <div class="nav-item" onclick="switchPage('system', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+                Processes & Logs
+            </div>
+
+            <div class="nav-sep">Infrastructure</div>
+            <div class="nav-item" onclick="switchPage('network', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><circle cx="12" cy="12" r="10"></circle><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path></svg>
+                Network & UFW
+            </div>
+            <div class="nav-item" onclick="switchPage('docker', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+                Docker & Compose
+            </div>
+            <div class="nav-item" onclick="switchPage('nginx', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>
+                Nginx & SSL
+            </div>
+
+            <div class="nav-sep">Data & Code</div>
+            <div class="nav-item" onclick="switchPage('db', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+                Databases
+            </div>
+            <div class="nav-item" onclick="switchPage('git', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><circle cx="6" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><circle cx="18" cy="9" r="3"></circle><line x1="6" y1="9" x2="6" y2="15"></line><path d="M18 12v-3a2 2 0 0 0-2-2h-8"></path></svg>
+                Git Versioning
+            </div>
+            <div class="nav-item" onclick="switchPage('ssh', this)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                Security & SSH
+            </div>
+        </div>
     </nav>
+
+    <button class="mobile-toggle" onclick="toggleMenu()">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" width="20" height="20"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+    </button>
 
     <main class="main-content">
         
         <!-- SECTION: Home -->
         <section id="home" class="page-section active">
-            <h2>Welcome to my notes</h2>
-            <p>I frequently find myself looking up the same terminal commands when deploying new Ubuntu/Debian servers. To save time, I compiled this quick reference guide.</p>
-            <p>This page acts as a central hub for basic operations ranging from network configuration to process management. It is written purely in HTML/CSS with no external dependencies.</p>
+            <span class="badge">Internal Documentation</span>
+            <h2>Infrastructure Hub</h2>
+            <p class="section-desc">Centralized snippets for daily server operations.</p>
             
-            <h3>Why Ubuntu?</h3>
-            <p>Most of these commands apply to any Debian-based distribution. Ubuntu Server simply provides a vast repository and excellent community support, making it my default choice for headless environments.</p>
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>About This Space</h3>
+                    <p>This page acts as an immutable fallback for system administration. Designed to be a single static HTML file with zero external dependencies, ensuring it loads instantly even in restricted network environments.</p>
+                </article>
+                <article class="bento-card">
+                    <h3>Stack Preference</h3>
+                    <p>Most notes here apply to <code>Debian 12+</code> and <code>Ubuntu 24.04 LTS</code> environments. Emphasizing default native tools (systemd, ufw, journalctl, rsync) to minimize dependency footprint.</p>
+                </article>
+            </div>
         </section>
 
         <!-- SECTION: Files -->
         <section id="files" class="page-section">
+            <span class="badge">Cheat Sheet</span>
             <h2>File Management</h2>
-            <p>Basic commands for navigating the file system and managing permissions.</p>
+            <p class="section-desc">Search, compress, sync, and manage permissions.</p>
 
-            <h3>Viewing & Finding</h3>
-            <p>List all files, including hidden ones, with human-readable sizes:</p>
-            <pre><code>ls -lah</code></pre>
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>Searching & Filtering</h3>
+                    <p>Locate config files, ignoring permission denied errors:</p>
+                    <pre><code>find /etc -name "*.conf" 2>/dev/null</code></pre>
+                    <p>Find text inside files recursively:</p>
+                    <pre><code>grep -rnw '/var/www/' -e "database_url"</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Rsync Backup</h3>
+                    <p>Sync a local directory to a remote server securely:</p>
+                    <pre><code>rsync -avzP --delete /local/dir/ user@server:/remote/dir/</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Archiving (Tar)</h3>
+                    <p>Pack an entire directory into a compressed tarball:</p>
+                    <pre><code>tar -czvf backup-2026.tar.gz /var/www/html</code></pre>
+                    <p>Extract to specific directory:</p>
+                    <pre><code>tar -xzvf archive.tar.gz -C /target/path</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Ownership & Chmod</h3>
+                    <p>Standardizing web directory permissions:</p>
+                    <pre><code>chown -R www-data:www-data /var/www
+find /var/www -type d -exec chmod 755 {} \;
+find /var/www -type f -exec chmod 644 {} \;</code></pre>
+                </article>
+            </div>
+        </section>
 
-            <p>Find a file by name starting from the root directory:</p>
-            <pre><code>find / -name "nginx.conf" 2>/dev/null</code></pre>
+        <!-- SECTION: System & Processes -->
+        <section id="system" class="page-section">
+            <span class="badge">Cheat Sheet</span>
+            <h2>Processes & Logs</h2>
+            <p class="section-desc">Monitoring resources, cron jobs, and querying journals.</p>
 
-            <h3>Permissions</h3>
-            <p>Give the owner read/write/execute permissions, and others read/execute:</p>
-            <pre><code>chmod 755 /path/to/script.sh</code></pre>
-
-            <p>Change the owner of a directory recursively:</p>
-            <pre><code>chown -R www-data:www-data /var/www/html</code></pre>
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>Journalctl (Logs)</h3>
+                    <p>Tailing logs for a specific service in real-time:</p>
+                    <pre><code>journalctl -u nginx.service -f --no-pager</code></pre>
+                    <p>Show logs from the current boot, filtered by errors:</p>
+                    <pre><code>journalctl -b -p err</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Systemctl (Daemons)</h3>
+                    <p>Reload daemon after changing unit files:</p>
+                    <pre><code>systemctl daemon-reload
+systemctl enable --now docker</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Resource Monitoring</h3>
+                    <p>View human-readable disk space and memory:</p>
+                    <pre><code>df -hT
+free -mh
+htop # if installed, better than top</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Cron Jobs</h3>
+                    <p>Edit crontab for current user (`crontab -e` format):</p>
+                    <pre><code><span class="comment"># Min Hour Day Month Weekday Command</span>
+0 3 * * * /path/to/backup.sh > /dev/null 2>&1</code></pre>
+                </article>
+            </div>
         </section>
 
         <!-- SECTION: Network -->
         <section id="network" class="page-section">
-            <h2>Networking & UFW</h2>
-            <p>Securing the server using the Uncomplicated Firewall (UFW) and checking ports.</p>
+            <span class="badge">Cheat Sheet</span>
+            <h2>Network & UFW</h2>
+            <p class="section-desc">Firewall rules, port routing, and socket tracking.</p>
 
-            <h3>Basic UFW Setup</h3>
-            <p>A standard configuration that blocks everything except SSH, HTTP, and HTTPS:</p>
-            <pre><code>ufw default deny incoming
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>UFW Hardening</h3>
+                    <p>The standard drop-everything-except-web approach:</p>
+                    <pre><code>ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
+ufw allow 80,443/tcp
 ufw enable</code></pre>
-
-            <h3>Checking Connections</h3>
-            <p>Check which services are listening on which ports:</p>
-            <pre><code>ss -tulpn</code></pre>
-            
-            <p>Or using the older netstat tool:</p>
-            <pre><code>netstat -plnt</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Active Sockets</h3>
+                    <p>View which daemons are currently listening:</p>
+                    <pre><code>ss -tulpn | grep LISTEN</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>DNS & Curl</h3>
+                    <p>Check DNS resolution and headers:</p>
+                    <pre><code>dig +short google.com
+curl -I https://example.com</code></pre>
+                </article>
+            </div>
         </section>
 
-        <!-- SECTION: System -->
-        <section id="system" class="page-section">
-            <h2>System & Processes</h2>
-            <p>Monitoring resource usage and managing system services.</p>
+        <!-- SECTION: Docker -->
+        <section id="docker" class="page-section">
+            <span class="badge">Containers</span>
+            <h2>Docker & Compose</h2>
+            <p class="section-desc">Container lifecycle and environment cleanup.</p>
 
-            <h3>Disk and Memory</h3>
-            <p>Check free disk space on mounted drives:</p>
-            <pre><code>df -h</code></pre>
-
-            <p>Check available RAM and Swap:</p>
-            <pre><code>free -m</code></pre>
-
-            <h3>Managing Services (Systemd)</h3>
-            <p>Restart Nginx and check its status:</p>
-            <pre><code>systemctl restart nginx
-systemctl status nginx</code></pre>
-            <p>Enable a service to start automatically on boot:</p>
-            <pre><code>systemctl enable fail2ban</code></pre>
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>Lifecycle</h3>
+                    <p>Get a bash shell inside a running container:</p>
+                    <pre><code>docker exec -it &lt;container_name&gt; /bin/bash</code></pre>
+                    <p>View container logs:</p>
+                    <pre><code>docker logs -f --tail 100 &lt;container_id&gt;</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Docker Compose</h3>
+                    <p>Start stack detached and rebuild if necessary:</p>
+                    <pre><code>docker-compose up -d --build</code></pre>
+                    <p>Stop and remove networks/volumes:</p>
+                    <pre><code>docker-compose down -v</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Cleanup (Prune)</h3>
+                    <p>Nuke all unused containers, networks, and dangling images:</p>
+                    <pre><code>docker system prune -a --volumes -f</code></pre>
+                </article>
+            </div>
         </section>
 
-        <footer>
-            <p>&copy; <script>document.write(new Date().getFullYear())</script> Server Documentation. Static HTML setup.</p>
-        </footer>
+        <!-- SECTION: Nginx -->
+        <section id="nginx" class="page-section">
+            <span class="badge">Web</span>
+            <h2>Nginx & SSL</h2>
+            <p class="section-desc">Reverse proxy configurations and certbot.</p>
+
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>Reverse Proxy Block</h3>
+                    <p>Standard snippet to pass traffic to a local app (Node/Python):</p>
+                    <pre><code>location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Certbot (Let's Encrypt)</h3>
+                    <p>Issue a new SSL certificate automatically for Nginx:</p>
+                    <pre><code>certbot --nginx -d example.com -d www.example.com</code></pre>
+                    <p>Test auto-renewal process:</p>
+                    <pre><code>certbot renew --dry-run</code></pre>
+                </article>
+            </div>
+        </section>
+
+        <!-- SECTION: DB -->
+        <section id="db" class="page-section">
+            <span class="badge">Data</span>
+            <h2>Databases</h2>
+            <p class="section-desc">PostgreSQL, MySQL, and Redis cheat codes.</p>
+
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>PostgreSQL</h3>
+                    <p>Dump a database to a file:</p>
+                    <pre><code>pg_dump -U username dbname > backup.sql</code></pre>
+                    <p>Restore from a dump:</p>
+                    <pre><code>psql -U username -d dbname < backup.sql</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>MySQL / MariaDB</h3>
+                    <p>Export database with routines and triggers:</p>
+                    <pre><code>mysqldump -u root -p --routines dbname > db.sql</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Redis</h3>
+                    <p>Clear all keys in all Redis databases (danger):</p>
+                    <pre><code>redis-cli FLUSHALL</code></pre>
+                </article>
+            </div>
+        </section>
+
+        <!-- SECTION: Git -->
+        <section id="git" class="page-section">
+            <span class="badge">Code</span>
+            <h2>Git Versioning</h2>
+            <p class="section-desc">Fixing mistakes and managing branches.</p>
+
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>Undoing Mistakes</h3>
+                    <p>Discard all local changes and match the remote exactly:</p>
+                    <pre><code>git fetch origin
+git reset --hard origin/main</code></pre>
+                    <p>Undo the last commit but keep the changes in staging:</p>
+                    <pre><code>git reset --soft HEAD~1</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>History & Cleanup</h3>
+                    <p>Beautiful, colorful Git log tree:</p>
+                    <pre><code>git log --oneline --graph --all</code></pre>
+                    <p>Remove local branches that were deleted on remote:</p>
+                    <pre><code>git fetch -p</code></pre>
+                </article>
+            </div>
+        </section>
+
+        <!-- SECTION: SSH & Security -->
+        <section id="ssh" class="page-section">
+            <span class="badge">Security</span>
+            <h2>Security & SSH</h2>
+            <p class="section-desc">Key management and intrusion prevention.</p>
+
+            <div class="bento-grid">
+                <article class="bento-card">
+                    <h3>Ed25519 Keys</h3>
+                    <p>Generate a modern, highly secure SSH keypair:</p>
+                    <pre><code>ssh-keygen -t ed25519 -a 100 -C "admin@node"
+ssh-copy-id -i ~/.ssh/id_ed25519.pub user@ip</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>sshd_config Defaults</h3>
+                    <p>Mandatory security rules for <code>/etc/ssh/sshd_config</code>:</p>
+                    <pre><code>PermitRootLogin no
+PasswordAuthentication no
+X11Forwarding no
+MaxAuthTries 3</code></pre>
+                </article>
+                <article class="bento-card">
+                    <h3>Fail2Ban</h3>
+                    <p>Check the status of the SSH jail (banned IPs):</p>
+                    <pre><code>fail2ban-client status sshd</code></pre>
+                    <p>Unban an IP manually:</p>
+                    <pre><code>fail2ban-client set sshd unbanip 192.168.1.1</code></pre>
+                </article>
+            </div>
+        </section>
 
     </main>
 
     <script>
-        // Simple script to handle navigation without reloading the page
+        // Smooth Tab Switching
         function switchPage(pageId, element) {
-            // Hide all sections
-            const sections = document.querySelectorAll('.page-section');
-            sections.forEach(sec => sec.classList.remove('active'));
-
-            // Remove active class from all nav items
-            const navItems = document.querySelectorAll('.nav-item');
-            navItems.forEach(item => item.classList.remove('active'));
-
-            // Show selected section
-            document.getElementById(pageId).classList.add('active');
+            document.querySelectorAll('.page-section').forEach(sec => {
+                sec.style.display = 'none';
+                sec.classList.remove('active');
+            });
+            document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('active'));
             
-            // Highlight clicked nav item
+            const target = document.getElementById(pageId);
+            target.style.display = 'block';
+            // Trigger reflow for animation
+            void target.offsetWidth;
+            target.classList.add('active');
+            
             element.classList.add('active');
             
-            // Scroll to top
-            window.scrollTo(0, 0);
+            document.querySelector('.sidebar').classList.remove('open');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
         }
+
+        // Mobile Sidebar
+        function toggleMenu() {
+            document.querySelector('.sidebar').classList.toggle('open');
+        }
+
+        // Auto-wrap Code Blocks with MacOS-style header
+        document.addEventListener('DOMContentLoaded', () => {
+            document.querySelectorAll('pre').forEach(pre => {
+                const container = document.createElement('div');
+                container.className = 'code-container';
+                
+                const header = document.createElement('div');
+                header.className = 'code-header';
+                
+                const btn = document.createElement('button');
+                btn.className = 'copy-btn';
+                btn.innerText = 'Copy';
+                
+                btn.onclick = () => {
+                    // Quick way to get text ignoring HTML tags inside pre/code
+                    const textToCopy = pre.innerText.trim();
+                    navigator.clipboard.writeText(textToCopy).then(() => {
+                        btn.innerText = 'Copied';
+                        btn.classList.add('copied');
+                        setTimeout(() => {
+                            btn.innerText = 'Copy';
+                            btn.classList.remove('copied');
+                        }, 2000);
+                    });
+                };
+                
+                header.appendChild(btn);
+                pre.parentNode.insertBefore(container, pre);
+                container.appendChild(header);
+                container.appendChild(pre);
+            });
+        });
     </script>
 </body>
 </html>
