@@ -114,6 +114,7 @@ SETUP_TG="$SETUP_TG"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 TG_TOPIC_ID="$TG_TOPIC_ID"
+TG_PROXY="$TG_PROXY"
 EOF
     chmod 600 "$INSTALL_STATE"
 }
@@ -121,9 +122,11 @@ EOF
 notify_telegram() {
     [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
     [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]] && return 0
-    local args=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$1")
+    local args=(-s --max-time 15)
+    [[ -n "${TG_PROXY:-}" ]] && args+=(-x "$TG_PROXY")
+    args+=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$1")
     [[ -n "${TG_TOPIC_ID:-}" ]] && args+=(-d "message_thread_id=${TG_TOPIC_ID}")
-    curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" "${args[@]}" >/dev/null 2>&1 || true
+    curl "${args[@]}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
 }
 
 # ##########################################################################
@@ -384,6 +387,7 @@ comp_telegram() {
     [[ -z "$TG_BOT_TOKEN" && -z "$NONINTERACTIVE" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
     [[ -z "$TG_CHAT_ID" && -z "$NONINTERACTIVE" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
     [[ -z "$TG_TOPIC_ID" && -z "$NONINTERACTIVE" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
+    [[ -z "$TG_PROXY" && -z "$NONINTERACTIVE" ]]     && read -ep "Прокси для Telegram, если сервер не достаёт api.telegram.org (Enter — без; напр. socks5h://user:pass@host:port или http://host:port): " TG_PROXY
     echo ">>> Настройка Telegram-уведомлений..."
     local node_ip node_label
     node_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "")
@@ -400,6 +404,7 @@ comp_telegram() {
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 TG_TOPIC_ID="${TG_TOPIC_ID:-}"
+TG_PROXY="${TG_PROXY:-}"
 NODE_LABEL="$node_label"
 NODE_IP="$node_ip"
 EOF
@@ -412,10 +417,12 @@ EOF
 [[ -z "\$TG_BOT_TOKEN" || -z "\$TG_CHAT_ID" ]] && exit 0
 HEADER="🖥 <b>\${NODE_LABEL:-\$(hostname)}</b>"
 [[ -n "\$NODE_IP" ]] && HEADER="\$HEADER  <code>\${NODE_IP}</code>"
-ARGS=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
+ARGS=(-s --max-time 15)
+[[ -n "\$TG_PROXY" ]] && ARGS+=(-x "\$TG_PROXY")
+ARGS+=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
 \$1")
 [[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
-curl -s --max-time 10 -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" "\${ARGS[@]}" >/dev/null 2>&1
+curl "\${ARGS[@]}" -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
 SCRIPT
     chmod 755 /usr/local/bin/rh-notify.sh
 
