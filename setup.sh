@@ -1,23 +1,45 @@
 #!/bin/bash
 
-# Остановка при ошибках и подробное логирование
 set -e
-trap 'echo -e "\n[ОШИБКА] Скрипт прерван из-за непредвиденной ошибки на строке $LINENO. Код: $?" >&2; exit 1' ERR
+trap 'echo -e "\n[ОШИБКА] Скрипт прерван на строке $LINENO. Код: $?. Подробности: $SETUP_LOG" >&2; exit 1' ERR
 
-# === ПЕРЕМЕННЫЕ НАСТРОЙКИ ===
+# === НАСТРОЙКИ ===
 INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/index.html"
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
-# ============================
+SETUP_LOG="/var/log/node-setup.log"
+# =================
 
 if [ "$EUID" -ne 0 ]; then
   echo "Пожалуйста, запустите скрипт с правами root (sudo bash ...)"
   exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
+: > "$SETUP_LOG" 2>/dev/null || SETUP_LOG="/tmp/node-setup.log"
 
 # ##########################################################################
 #  ХЕЛПЕРЫ
 # ##########################################################################
+SUMMARY=()
+# do_step "Метка" функция...  — запускает шаг, пишет результат в сводку (не роняет процесс)
+do_step() {
+    local label="$1"; shift
+    if "$@"; then
+        SUMMARY+=("[ OK ]    $label")
+    else
+        SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
+        echo "  [СБОЙ] $label — подробности в $SETUP_LOG"
+    fi
+    return 0
+}
+skip_step() { SUMMARY+=("[проп.]   $1"); }
+print_summary() {
+    echo -e "\n=========================================="
+    echo "  ИТОГ УСТАНОВКИ   (полный лог: $SETUP_LOG)"
+    echo "=========================================="
+    printf '%s\n' "${SUMMARY[@]}"
+    { echo "=== ИТОГ ($(date)) ==="; printf '%s\n' "${SUMMARY[@]}"; } >> "$SETUP_LOG" 2>&1 || true
+}
+
 ask_domain() {
     DOMAIN=$(echo "${DOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; do
@@ -55,7 +77,7 @@ ask_ssh_key() {
     done
 }
 ask_cf() {
-    [[ -z "$SETUP_CF" ]] && read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
+    [[ -z "$SETUP_CF" && -z "$NONINTERACTIVE" ]] && read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
     if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
         while [[ -z "$CF_API_TOKEN" ]]; do
             read -ep "API Token Cloudflare (Edit DNS): " CF_API_TOKEN
@@ -65,9 +87,13 @@ ask_cf() {
         [[ "$CF_PROXY_CHOICE" =~ ^[Yy]$ ]] && CF_PROXIED="true" || CF_PROXIED="false"
     fi
 }
+ask_telegram() {
+    [[ -z "$TG_BOT_TOKEN" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
+    [[ -z "$TG_CHAT_ID" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
+    [[ -z "$TG_TOPIC_ID" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
+}
 get_server_ip() { SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org); }
 
-# Отправка сообщения в Telegram из самого скрипта (тихо, если токен не задан)
 notify_telegram() {
     [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
     [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]] && return 0
@@ -77,7 +103,7 @@ notify_telegram() {
 }
 
 # ##########################################################################
-#  КОМПОНЕНТЫ
+#  КОМПОНЕНТЫ  (тяжёлый вывод уходит в $SETUP_LOG, на экране — только шаги)
 # ##########################################################################
 comp_ssh() {
     ask_ssh_key
@@ -90,44 +116,48 @@ comp_ssh() {
     grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
     sed -i "s/^[# ]*PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
     grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-    systemctl restart ssh || systemctl restart sshd
-    echo "SSH по ключу настроен."
+    systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1
 }
 
 comp_swap() {
     if [ -z "$(swapon --show)" ]; then
         echo ">>> Создание Swap 2GB..."
-        fallocate -l 2G /swapfile; chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile
+        fallocate -l 2G /swapfile; chmod 600 /swapfile; mkswap /swapfile >>"$SETUP_LOG" 2>&1; swapon /swapfile
         grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        echo "Swap создан."
     else
-        echo "Swap уже есть, пропускаем."
+        echo ">>> Swap уже есть, пропускаем."
     fi
 }
 
 comp_packages() {
-    echo ">>> Обновление системы и установка пакетов..."
-    apt clean; apt update; apt upgrade -y; apt dist-upgrade -y; apt autoremove --purge -y
-    apt install -y curl wget unzip git ufw fail2ban socat jq certbot python3-certbot-nginx nginx dnsutils chrony iperf3 btop ncdu
+    echo ">>> Обновление системы и установка пакетов (в фоне, лог: $SETUP_LOG)..."
+    {
+        apt-get clean
+        apt-get update
+        apt-get -y upgrade
+        apt-get -y dist-upgrade
+        apt-get -y autoremove --purge
+        apt-get -y install curl wget unzip git ufw fail2ban socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu
+    } >>"$SETUP_LOG" 2>&1
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
 }
 
 comp_speedtest() {
     echo ">>> Установка Speedtest CLI..."
-    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash || true
-    if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
-        sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt update
-    fi
-    apt install speedtest -y || echo "Speedtest установить не удалось."
+    {
+        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
+        if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
+            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get update
+        fi
+        apt-get install -y speedtest
+    } >>"$SETUP_LOG" 2>&1 || { echo "  Speedtest не установился (см. $SETUP_LOG)"; return 1; }
 }
 
 comp_ipv6() {
     echo ">>> Отключение IPv6 в GRUB..."
     if ! grep -q "ipv6.disable=1" /etc/default/grub; then
         sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' /etc/default/grub
-        update-grub; echo "IPv6 отключён (применится после ребута)."
-    else
-        echo "IPv6 уже отключён."
+        update-grub >>"$SETUP_LOG" 2>&1
     fi
 }
 
@@ -136,14 +166,16 @@ comp_ufw() {
     echo ">>> Настройка UFW..."
     sed -i 's/IPV6=yes/IPV6=no/' /etc/default/ufw
     sed -i 's|net/ipv4/icmp_echo_ignore_all=0|net/ipv4/icmp_echo_ignore_all=1|' /etc/ufw/sysctl.conf
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw limit 22/tcp comment 'SSH Rate Limit'
-    ufw allow 80/tcp comment 'HTTP'
-    ufw allow 443/tcp comment 'HTTPS'
-    ufw allow from "$PANEL_IP" to any port 2222 proto tcp comment 'API panel'
-    ufw --force enable
+    {
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw limit 22/tcp comment 'SSH Rate Limit'
+        ufw allow 80/tcp comment 'HTTP'
+        ufw allow 443/tcp comment 'HTTPS'
+        ufw allow from "$PANEL_IP" to any port 2222 proto tcp comment 'API panel'
+        ufw --force enable
+    } >>"$SETUP_LOG" 2>&1
 }
 
 comp_sysctl() {
@@ -177,19 +209,18 @@ net.ipv4.tcp_keepalive_probes = 5
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 EOF
-    sysctl --system
+    sysctl --system >>"$SETUP_LOG" 2>&1
 }
 
 comp_docker() {
     echo ">>> Установка Docker..."
     if command -v docker >/dev/null 2>&1; then
-        echo "Docker уже установлен."
-    else
-        curl -fsSL https://get.docker.com | sh
+        echo "  Docker уже установлен."
+        return 0
     fi
+    curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
 }
 
-# Защита от переполнения диска: ротация логов Docker + кап journald
 comp_disk() {
     echo ">>> Защита диска: ротация логов Docker + journald..."
     mkdir -p /etc/docker
@@ -208,20 +239,32 @@ comp_disk() {
 }
 EOF
     fi
-    systemctl restart docker || true
+    systemctl restart docker >>"$SETUP_LOG" 2>&1 || true
     mkdir -p /etc/systemd/journald.conf.d
     cat <<'EOF' > /etc/systemd/journald.conf.d/size.conf
 [Journal]
 SystemMaxUse=200M
 SystemMaxFileSize=50M
 EOF
-    systemctl restart systemd-journald || true
-    echo "Готово. (Docker перезапущен — контейнеры с restart:always поднялись сами.)"
+    systemctl restart systemd-journald >>"$SETUP_LOG" 2>&1 || true
 }
 
 comp_warp() {
     echo ">>> Установка/переустановка Cloudflare WARP..."
-    bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh) || echo "Ошибка установки WARP."
+    bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh) >>"$SETUP_LOG" 2>&1 \
+        || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
+}
+
+node_status() {
+    echo "----- Статус ноды -----"
+    docker inspect -f 'Контейнер: {{.State.Status}} (running={{.State.Running}}, restarts={{.RestartCount}}, oom={{.State.OOMKilled}})' remnanode 2>/dev/null || echo "Контейнер remnanode не найден."
+    if ss -H -ltn 2>/dev/null | grep -q ':2222'; then
+        echo "Порт 2222 (API, к нему подключается панель): СЛУШАЕТ — связь с панелью возможна"
+    else
+        echo "Порт 2222 (API, к нему подключается панель): НЕ слушает — панель НЕ подключится к ноде"
+    fi
+    echo "----- Последние 30 строк логов -----"
+    docker logs --tail=30 remnanode 2>&1 || echo "Логи недоступны."
 }
 
 comp_node() {
@@ -246,32 +289,30 @@ services:
       - NODE_PORT=2222
       - SECRET_KEY="${REMNA_SECRET}"
 EOF
-    cd /opt/remnanode && docker compose up -d
-    docker compose -f /opt/remnanode/docker-compose.yml ps
+    ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1
+    echo "  Ожидание запуска ноды (порт 2222, до 15 сек)..."
+    for i in $(seq 1 15); do
+        if ss -H -ltn 2>/dev/null | grep -q ':2222'; then break; fi
+        sleep 1
+    done
+    node_status
 }
 
 comp_node_update() {
     echo ">>> Обновление ноды Remnanode..."
     if [[ -f /opt/remnanode/docker-compose.yml ]]; then
-        cd /opt/remnanode
-        docker compose pull
-        docker compose up -d
-        docker compose ps
+        ( cd /opt/remnanode && docker compose pull && docker compose up -d ) >>"$SETUP_LOG" 2>&1
+        node_status
         notify_telegram "⬆️ Нода <code>$(hostname)</code> обновлена ($(date '+%H:%M:%S'))"
     else
-        echo "Нода не установлена (/opt/remnanode/docker-compose.yml не найден)."
+        echo "  Нода не установлена (/opt/remnanode/docker-compose.yml не найден)."
+        return 1
     fi
-}
-
-comp_node_logs() {
-    docker compose -f /opt/remnanode/docker-compose.yml ps 2>/dev/null || true
-    echo "----- Последние 50 строк логов -----"
-    docker logs --tail=50 remnanode 2>&1 || echo "Контейнер remnanode не найден."
 }
 
 comp_fail2ban() {
     echo ">>> Настройка fail2ban..."
-    apt install -y fail2ban >/dev/null 2>&1 || true
+    apt-get install -y fail2ban >>"$SETUP_LOG" 2>&1 || true
     cat <<'EOF' > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime  = 1h
@@ -292,13 +333,12 @@ findtime = 1d
 maxretry = 5
 EOF
     systemctl enable fail2ban >/dev/null 2>&1 || true
-    systemctl restart fail2ban
-    echo "fail2ban: sshd + recidive активны."
+    systemctl restart fail2ban >>"$SETUP_LOG" 2>&1
 }
 
 comp_autoupdates() {
-    echo ">>> Автообновления безопасности (unattended-upgrades)..."
-    apt install -y unattended-upgrades >/dev/null 2>&1 || true
+    echo ">>> Автообновления безопасности..."
+    apt-get install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
     cat <<'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -314,15 +354,14 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
     systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
-    echo "Автообновления: только security, авто-ребут ВЫКЛ."
 }
 
-# Telegram: SSH-вход + загрузка сервера + падение ноды
 comp_telegram() {
     [[ -z "$TG_BOT_TOKEN" && -z "$NONINTERACTIVE" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
     [[ -z "$TG_CHAT_ID" && -z "$NONINTERACTIVE" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
     [[ -z "$TG_TOPIC_ID" && -z "$NONINTERACTIVE" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
-    mkdir -p /etc/rabotahrista
+    echo ">>> Настройка Telegram-уведомлений..."
+    mkdir -p "$(dirname "$NOTIFY_ENV")"
     cat <<EOF > "$NOTIFY_ENV"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
@@ -330,18 +369,19 @@ TG_TOPIC_ID="${TG_TOPIC_ID:-}"
 EOF
     chmod 600 "$NOTIFY_ENV"
 
-    # универсальный отправщик
-    cat <<'SCRIPT' > /usr/local/bin/rh-notify.sh
+    # универсальный отправщик (путь к notify.env подставляется из $NOTIFY_ENV,
+    # рантайм-переменные экранированы \$)
+    cat <<SCRIPT > /usr/local/bin/rh-notify.sh
 #!/bin/bash
-[[ -f /etc/rabotahrista/notify.env ]] && source /etc/rabotahrista/notify.env
-[[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && exit 0
-ARGS=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$1")
-[[ -n "$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=${TG_TOPIC_ID}")
-curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" "${ARGS[@]}" >/dev/null 2>&1
+[[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
+[[ -z "\$TG_BOT_TOKEN" || -z "\$TG_CHAT_ID" ]] && exit 0
+ARGS=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\$1")
+[[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
+curl -s --max-time 10 -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" "\${ARGS[@]}" >/dev/null 2>&1
 SCRIPT
     chmod 755 /usr/local/bin/rh-notify.sh
 
-    # 1) SSH-вход (pam_exec)
+    # 1) SSH-вход
     cat <<'SCRIPT' > /usr/local/bin/rh-ssh-login.sh
 #!/bin/bash
 [[ "$PAM_TYPE" != "open_session" ]] && exit 0
@@ -369,21 +409,21 @@ ExecStart=/bin/bash -c '/usr/local/bin/rh-notify.sh "♻️ Сервер <code>$
 [Install]
 WantedBy=multi-user.target
 UNIT
-    systemctl daemon-reload
-    systemctl enable rh-boot-notify.service >/dev/null 2>&1 || true
 
-    # 3) Падение ноды (таймер каждые 2 мин)
+    # 3) Падение ноды / порт 2222 (каждые 2 мин)
     cat <<'SCRIPT' > /usr/local/bin/rh-node-health.sh
 #!/bin/bash
-STATE=$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "missing")
 FLAG=/run/rh-node-down
-if [[ "$STATE" != "true" ]]; then
+RUNNING=$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "false")
+LISTEN=no
+ss -H -ltn 2>/dev/null | grep -q ':2222' && LISTEN=yes
+if [[ "$RUNNING" != "true" || "$LISTEN" != "yes" ]]; then
     if [[ ! -f "$FLAG" ]]; then
-        /usr/local/bin/rh-notify.sh "⚠️ Нода <code>$(hostname)</code>: контейнер remnanode НЕ работает (state=${STATE})"
+        /usr/local/bin/rh-notify.sh "⚠️ Нода <code>$(hostname)</code>: проблема (контейнер running=${RUNNING}, порт2222=${LISTEN}) — панель может не видеть ноду"
         touch "$FLAG"
     fi
 else
-    [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ Нода <code>$(hostname)</code>: remnanode снова работает"; rm -f "$FLAG"; }
+    [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ Нода <code>$(hostname)</code>: снова в норме"; rm -f "$FLAG"; }
 fi
 SCRIPT
     chmod 755 /usr/local/bin/rh-node-health.sh
@@ -403,35 +443,34 @@ OnUnitActiveSec=120
 [Install]
 WantedBy=timers.target
 UNIT
-    systemctl daemon-reload
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+    systemctl enable rh-boot-notify.service >/dev/null 2>&1 || true
     systemctl enable --now rh-node-health.timer >/dev/null 2>&1 || true
 
     /usr/local/bin/rh-notify.sh "✅ Уведомления настроены на <code>$(hostname)</code> (SSH-входы, загрузка, падение ноды)"
-    echo "Telegram-уведомления настроены. Тестовое сообщение отправлено."
+    echo "  Тестовое сообщение отправлено в Telegram."
 }
 
-# Веб: заглушка + DNS в CF + сертификат + nginx fallback + оранжевое облако
 comp_web() {
     ask_domain; ask_subdomain; ask_cf
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
     get_server_ip
 
-    echo ">>> Установка заглушки..."
+    echo ">>> Заглушка сайта..."
     mkdir -p /var/www/stub
     mkdir -p /var/lib/letsencrypt/.well-known/acme-challenge/
     chown -R www-data:www-data /var/lib/letsencrypt/.well-known
     chmod -R 755 /var/lib/letsencrypt/.well-known
-    echo "test" | tee /var/lib/letsencrypt/.well-known/acme-challenge/test.txt >/dev/null
+    echo "test" > /var/lib/letsencrypt/.well-known/acme-challenge/test.txt
     wget -qO /var/www/stub/index.html "$INDEX_URL"
-    if [ -s /var/www/stub/index.html ]; then echo "Заглушка загружена."; else
-        echo "<html><body><h1>Hello World</h1></body></html>" > /var/www/stub/index.html; fi
+    [ -s /var/www/stub/index.html ] || echo "<html><body><h1>Hello World</h1></body></html>" > /var/www/stub/index.html
 
     if [[ "$SETUP_CF" =~ ^[Yy]$ ]] && [[ -n "$CF_API_TOKEN" ]]; then
         echo ">>> DNS в Cloudflare..."
         ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
             -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
         if [ "$ZONE_ID" == "null" ] || [ -z "$ZONE_ID" ]; then
-            echo "[ВНИМАНИЕ] Zone ID не получен. Ручной режим."
+            echo "  [ВНИМАНИЕ] Zone ID не получен. Ручной режим."
         else
             RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$FULL_DOMAIN&type=A" \
                 -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
@@ -444,29 +483,32 @@ comp_web() {
                     -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$JSON_DATA_GRAY")
                 RECORD_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id')
             fi
-            echo "DNS обновлён, ждём 15 сек..."; sleep 15
+            echo "  DNS обновлён, ждём 15 сек..."; sleep 15
         fi
     fi
 
     echo ">>> Выпуск SSL..."
     if [ -d "/etc/letsencrypt/live/$FULL_DOMAIN" ]; then
-        echo "Сертификат уже есть, пропускаем."
+        echo "  Сертификат уже есть, пропускаем."
     else
         ATTEMPTS=0; MAX_ATTEMPTS=30
         while true; do
-            RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1)
-            [ "$RESOLVED_IP" == "$SERVER_IP" ] && { echo "-> DNS указывает на $SERVER_IP"; break; }
+            RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1 || true)
+            [ "$RESOLVED_IP" == "$SERVER_IP" ] && { echo "  DNS указывает на $SERVER_IP"; break; }
             ATTEMPTS=$((ATTEMPTS + 1))
-            echo "Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS ещё не обновился (${RESOLVED_IP:-ПУСТО}). Ждём 10 сек..."
+            echo "  Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS ещё не обновился (${RESOLVED_IP:-ПУСТО}). Ждём 10 сек..."
             sleep 10
             if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
-                echo "[ВНИМАНИЕ] DNS не обновился (возможно, за CF Proxy)."
-                if [[ -n "$NONINTERACTIVE" ]]; then echo "Неинтерактивный режим — продолжаем.";
-                else read -p "Enter — продолжить на свой риск, Ctrl+C — выход..."; fi
+                echo "  [ВНИМАНИЕ] DNS не обновился (возможно, за CF Proxy)."
+                if [[ -n "$NONINTERACTIVE" ]]; then echo "  Неинтерактивный режим — продолжаем.";
+                else read -p "  Enter — продолжить на свой риск, Ctrl+C — выход..."; fi
                 break
             fi
         done
-        certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive
+        if ! certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive >>"$SETUP_LOG" 2>&1; then
+            echo "  [СБОЙ] Certbot не выпустил сертификат (см. $SETUP_LOG)"
+            return 1
+        fi
     fi
 
     echo ">>> Nginx Fallback..."
@@ -517,66 +559,82 @@ server {
 EOF
     rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
     ln -sf /etc/nginx/sites-available/$FULL_DOMAIN /etc/nginx/sites-enabled/
-    nginx -t
-    systemctl restart nginx
+    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"; return 1
+    fi
+    systemctl restart nginx >>"$SETUP_LOG" 2>&1
 
     if [[ "$CF_PROXIED" == "true" ]] && [[ -n "$RECORD_ID" ]] && [[ "$RECORD_ID" != "null" ]]; then
         echo ">>> Оранжевое облако CF..."
         JSON_DATA_ORANGE='{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":true}'
         curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
             -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$JSON_DATA_ORANGE" > /dev/null
-        echo "Оранжевое облако включено."
     fi
 }
 
 run_bench() { echo ">>> bench.sh..."; wget -qO- bench.sh | bash || true; }
 run_geo()   { echo ">>> ipregion.sh..."; bash <(wget -qO- https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh) || true; }
 run_media() { echo ">>> Проверка стримингов..."; bash <(curl -L -s check.unlock.media) || true; }
-comp_diag() {
-    [[ "$RUN_BENCH" =~ ^[Yy]$ ]] && run_bench
-    [[ "$RUN_GEO"   =~ ^[Yy]$ ]] && run_geo
-    [[ "$RUN_MEDIA" =~ ^[Yy]$ ]] && run_media
-    return 0
-}
 
 # ##########################################################################
-#  ПОЛНАЯ УСТАНОВКА (только ядро + базовая безопасность; без вопросов про доп-компоненты)
+#  ПОЛНАЯ УСТАНОВКА
 # ##########################################################################
 full_install() {
     echo -e "\n========== ПОЛНАЯ УСТАНОВКА =========="
+    # --- сбор всех ответов заранее ---
     ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
-    echo -e "\n--- SSH ---"
-    [[ -z "$SETUP_SSH" ]] && read -ep "Настроить вход по SSH-ключу для root? [y/N]: " SETUP_SSH
-    [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && ask_ssh_key
-    # WARP/Speedtest/диагностики в полную установку НЕ входят (ставятся из меню).
-    # В неинтерактивном режиме включаются флагами INSTALL_WARP=y / RUN_BENCH=y и т.п.
-    # Telegram настраивается автоматически, только если в конфиге задан TG_BOT_TOKEN.
+
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        echo -e "\n--- SSH ---"
+        [[ -z "$SETUP_SSH" ]] && read -ep "Настроить вход по SSH-ключу для root? [y/N]: " SETUP_SSH
+        [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && ask_ssh_key
+
+        echo -e "\n--- Доп. компоненты ---"
+        [[ -z "$INSTALL_WARP" ]]      && read -ep "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
+        [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Установить Speedtest CLI? [y/N]: " INSTALL_SPEEDTEST
+
+        echo -e "\n--- Telegram-уведомления ---"
+        [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [y/N]: " SETUP_TG
+        [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && ask_telegram
+    fi
+    [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && TG_ON=1 || TG_ON=""
 
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
-    echo -e "\nНастройка сервера для $FULL_DOMAIN...\n"; sleep 2
+    echo -e "\nСтавлю ноду для $FULL_DOMAIN. Тяжёлый вывод — в $SETUP_LOG\n"; sleep 2
 
-    [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && comp_ssh || echo "Пропуск SSH по ключу..."
-    comp_swap
-    comp_packages
-    comp_fail2ban
-    comp_autoupdates
-    comp_ipv6
-    comp_ufw
-    comp_sysctl
-    comp_docker
-    comp_disk
-    [[ "$INSTALL_SPEEDTEST" =~ ^[Yy]$ ]] && comp_speedtest
-    [[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && comp_warp
-    comp_node
-    comp_web
-    [[ -n "$TG_BOT_TOKEN" ]] && comp_telegram
-    comp_diag
+    # --- выполнение (каждый шаг пишет результат в сводку) ---
+    [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && do_step "SSH по ключу" comp_ssh || skip_step "SSH по ключу"
+    do_step "Swap" comp_swap
+    do_step "Пакеты и обновление системы" comp_packages
+    do_step "fail2ban" comp_fail2ban
+    do_step "Автообновления безопасности" comp_autoupdates
+    do_step "Отключение IPv6 (GRUB)" comp_ipv6
+    do_step "UFW-фаервол" comp_ufw
+    do_step "Sysctl-тюнинг" comp_sysctl
+    do_step "Docker" comp_docker
+    do_step "Защита диска (лог-ротация)" comp_disk
+    [[ "$INSTALL_SPEEDTEST" =~ ^[Yy]$ ]] && do_step "Speedtest CLI" comp_speedtest || skip_step "Speedtest CLI"
+    [[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && do_step "Cloudflare WARP" comp_warp || skip_step "Cloudflare WARP"
+    do_step "Нода Remnanode" comp_node
+    do_step "Веб (заглушка+сертификат+nginx)" comp_web
+    [[ -n "$TG_ON" ]] && do_step "Telegram-уведомления" comp_telegram || skip_step "Telegram-уведомления"
 
-    notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена и готова ($(date '+%H:%M:%S %Z'))"
+    notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена ($(date '+%H:%M:%S %Z'))"
+
+    print_summary
 
     echo -e "\n=========================================="
-    echo "Готово! Перезагрузка через 10 секунд (Ctrl+C — отменить)."
-    echo "=========================================="
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        echo "Отключение IPv6 (GRUB) применится только после перезагрузки."
+        read -ep "Доустановить/переустановить что-то в меню перед ребутом? [y/N]: " ADDC
+        [[ "$ADDC" =~ ^[Yy]$ ]] && components_menu
+        read -ep "Перезагрузить сервер сейчас? [Y/n]: " RB
+        if [[ "$RB" =~ ^[Nn]$ ]]; then
+            echo "Ок. Позже перезагрузи вручную (нужно для IPv6): reboot"
+            return
+        fi
+    fi
+    echo "Перезагрузка через 10 секунд (Ctrl+C — отменить)..."
     sleep 10
     reboot
 }
@@ -585,26 +643,16 @@ full_install() {
 #  МЕНЮ
 # ##########################################################################
 components_menu() {
-    set +e   # компоненты best-effort: ошибка одного не должна ронять меню целиком
+    set +e
     while true; do
         echo -e "\n===== Компоненты (доустановить / переустановить) ====="
-        echo " 1) Cloudflare WARP"
-        echo " 2) Docker"
-        echo " 3) Нода Remnanode (передеплой)"
-        echo " 4) Веб: заглушка + сертификат + Nginx (+DNS)"
-        echo " 5) UFW-фаервол"
-        echo " 6) Sysctl-тюнинг ядра"
-        echo " 7) Swap-файл"
-        echo " 8) SSH по ключу"
-        echo " 9) Speedtest CLI"
-        echo "10) Отключить IPv6 в GRUB"
+        echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
+        echo " 4) Веб (заглушка+серт)    5) UFW             6) Sysctl-тюнинг"
+        echo " 7) Swap                   8) SSH по ключу    9) Speedtest"
+        echo "10) IPv6 off (GRUB)"
         echo "--- Безопасность / обслуживание ---"
-        echo "11) Telegram-уведомления (SSH/ребут/падение ноды)"
-        echo "12) fail2ban (jail.local)"
-        echo "13) Автообновления безопасности"
-        echo "14) Защита диска (лог-ротация Docker + journald)"
-        echo "15) Обновить ноду (compose pull)"
-        echo "16) Логи/статус ноды"
+        echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
+        echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "--- Диагностика ---"
         echo "17) bench.sh   18) ipregion   19) стриминги"
         echo " 0) Назад"
@@ -614,7 +662,7 @@ components_menu() {
             5) comp_ufw ;;    6) comp_sysctl ;;   7) comp_swap ;;   8) comp_ssh ;;
             9) comp_speedtest ;; 10) comp_ipv6 ;;
             11) comp_telegram ;; 12) comp_fail2ban ;; 13) comp_autoupdates ;; 14) comp_disk ;;
-            15) comp_node_update ;; 16) comp_node_logs ;;
+            15) comp_node_update ;; 16) node_status ;;
             17) run_bench ;; 18) run_geo ;; 19) run_media ;;
             0) set -e; return ;;
             *) echo "Нет такого пункта." ;;
