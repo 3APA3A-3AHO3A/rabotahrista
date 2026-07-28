@@ -6,6 +6,7 @@ trap 'echo -e "\n[ОШИБКА] Скрипт прерван на строке $L
 # === НАСТРОЙКИ ===
 INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/index.html"
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
+INSTALL_STATE="/etc/rabotahrista/install.conf"
 SETUP_LOG="/var/log/node-setup.log"
 # =================
 
@@ -93,6 +94,29 @@ ask_telegram() {
     [[ -z "$TG_TOPIC_ID" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
 }
 get_server_ip() { SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org); }
+
+# Сохранение введённых данных для будущих обновлений (chmod 600 — внутри секреты/токены)
+save_state() {
+    mkdir -p "$(dirname "$INSTALL_STATE")"
+    cat <<EOF > "$INSTALL_STATE"
+DOMAIN="$DOMAIN"
+SUBDOMAIN="$SUBDOMAIN"
+PANEL_IP="$PANEL_IP"
+REMNA_SECRET="$REMNA_SECRET"
+SETUP_CF="$SETUP_CF"
+CF_API_TOKEN="$CF_API_TOKEN"
+CF_PROXY_CHOICE="$CF_PROXY_CHOICE"
+SETUP_SSH="$SETUP_SSH"
+SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY"
+INSTALL_WARP="$INSTALL_WARP"
+INSTALL_SPEEDTEST="$INSTALL_SPEEDTEST"
+SETUP_TG="$SETUP_TG"
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+TG_TOPIC_ID="$TG_TOPIC_ID"
+EOF
+    chmod 600 "$INSTALL_STATE"
+}
 
 notify_telegram() {
     [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
@@ -363,7 +387,14 @@ comp_telegram() {
     echo ">>> Настройка Telegram-уведомлений..."
     local node_ip node_label
     node_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "")
-    node_label="${FULL_DOMAIN:-$(hostname)}"
+    if [[ -n "$FULL_DOMAIN" ]]; then
+        node_label="$FULL_DOMAIN"
+    elif [[ -n "$SUBDOMAIN" && -n "$DOMAIN" ]]; then
+        node_label="${SUBDOMAIN}.${DOMAIN}"
+    else
+        node_label=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -vi '^default' | head -1)
+        [[ -z "$node_label" ]] && node_label="$(hostname)"
+    fi
     mkdir -p "$(dirname "$NOTIFY_ENV")"
     cat <<EOF > "$NOTIFY_ENV"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
@@ -613,6 +644,16 @@ run_media() { echo ">>> Проверка стримингов..."; bash <(curl -
 # ##########################################################################
 full_install() {
     echo -e "\n========== ПОЛНАЯ УСТАНОВКА =========="
+    if [[ -n "$STATE_LOADED" && -z "$NONINTERACTIVE" ]]; then
+        echo "Найдены данные прошлой установки: ${SUBDOMAIN}.${DOMAIN}, панель ${PANEL_IP}"
+        read -ep "Обновить с этими данными (без повторного ввода)? [Y/n]: " USE_SAVED
+        if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
+            DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
+            SETUP_CF=""; CF_API_TOKEN=""; CF_PROXY_CHOICE=""
+            SETUP_SSH=""; SSH_PUBLIC_KEY=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
+            SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""
+        fi
+    fi
     # --- сбор всех ответов заранее ---
     ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
 
@@ -631,6 +672,7 @@ full_install() {
     fi
     [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && TG_ON=1 || TG_ON=""
 
+    save_state   # запомнить ответы для будущих обновлений
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
     echo -e "\nСтавлю ноду для $FULL_DOMAIN. Тяжёлый вывод — в $SETUP_LOG\n"; sleep 2
 
@@ -735,5 +777,7 @@ if [[ -n "$NONINTERACTIVE" ]] || { [[ -n "$DOMAIN" ]] && [[ -n "$SUBDOMAIN" ]] &
     NONINTERACTIVE=1
     full_install
 else
+    # интерактив: подхватить сохранённые данные прошлой установки как значения по умолчанию
+    [[ -f "$INSTALL_STATE" ]] && { source "$INSTALL_STATE"; STATE_LOADED=1; }
     main_menu
 fi
