@@ -337,6 +337,20 @@ comp_node_update() {
     fi
 }
 
+comp_os_update() {
+    echo ">>> Полное обновление системы (apt). Вывод — на экран."
+    if apt-get clean && apt-get update && apt-get -y upgrade && apt-get -y dist-upgrade && apt-get -y autoremove --purge; then
+        echo "  Обновление завершено успешно."
+        notify_telegram "🧰 ОС обновлена, ухожу в перезагрузку ($(date '+%H:%M:%S'))"
+        echo "  Перезагрузка через 5 секунд (Ctrl+C — отменить)..."
+        sleep 5
+        reboot
+    else
+        echo "  [СБОЙ] apt-обновление завершилось с ошибкой — перезагрузка отменена."
+        return 1
+    fi
+}
+
 comp_fail2ban() {
     echo ">>> Настройка fail2ban..."
     apt-get install -y fail2ban >>"$SETUP_LOG" 2>&1 || true
@@ -734,6 +748,7 @@ components_menu() {
         echo "--- Безопасность / обслуживание ---"
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
+        echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
         echo "17) bench.sh   18) ipregion   19) проверка блокировок (censorcheck)"
         echo " 0) Назад"
@@ -745,6 +760,7 @@ components_menu() {
             11) comp_telegram ;; 12) comp_fail2ban ;; 13) comp_autoupdates ;; 14) comp_disk ;;
             15) comp_node_update ;; 16) node_status ;;
             17) run_bench ;; 18) run_geo ;; 19) run_censor ;;
+            20) comp_os_update ;;
             0) set -e; return ;;
             *) echo "Нет такого пункта." ;;
         esac
