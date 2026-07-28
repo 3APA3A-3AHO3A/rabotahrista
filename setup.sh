@@ -637,7 +637,7 @@ EOF
 
 run_bench() { echo ">>> bench.sh..."; wget -qO- bench.sh | bash || true; }
 run_geo()   { echo ">>> ipregion.sh..."; bash <(wget -qO- https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh) || true; }
-run_media() { echo ">>> Проверка стримингов..."; bash <(curl -L -s check.unlock.media) || true; }
+run_censor() { echo ">>> Проверка блокировок/DPI/DNS (censorcheck)..."; bash <(wget -qO- https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh) || true; }
 
 # ##########################################################################
 #  ПОЛНАЯ УСТАНОВКА
@@ -728,7 +728,7 @@ components_menu() {
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "--- Диагностика ---"
-        echo "17) bench.sh   18) ipregion   19) стриминги"
+        echo "17) bench.sh   18) ipregion   19) проверка блокировок (censorcheck)"
         echo " 0) Назад"
         read -ep "Выбор: " c
         case "$c" in
@@ -737,7 +737,7 @@ components_menu() {
             9) comp_speedtest ;; 10) comp_ipv6 ;;
             11) comp_telegram ;; 12) comp_fail2ban ;; 13) comp_autoupdates ;; 14) comp_disk ;;
             15) comp_node_update ;; 16) node_status ;;
-            17) run_bench ;; 18) run_geo ;; 19) run_media ;;
+            17) run_bench ;; 18) run_geo ;; 19) run_censor ;;
             0) set -e; return ;;
             *) echo "Нет такого пункта." ;;
         esac
