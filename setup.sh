@@ -361,21 +361,28 @@ comp_telegram() {
     [[ -z "$TG_CHAT_ID" && -z "$NONINTERACTIVE" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
     [[ -z "$TG_TOPIC_ID" && -z "$NONINTERACTIVE" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
     echo ">>> Настройка Telegram-уведомлений..."
+    local node_ip node_label
+    node_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "")
+    node_label="${FULL_DOMAIN:-$(hostname)}"
     mkdir -p "$(dirname "$NOTIFY_ENV")"
     cat <<EOF > "$NOTIFY_ENV"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 TG_TOPIC_ID="${TG_TOPIC_ID:-}"
+NODE_LABEL="$node_label"
+NODE_IP="$node_ip"
 EOF
     chmod 600 "$NOTIFY_ENV"
 
-    # универсальный отправщик (путь к notify.env подставляется из $NOTIFY_ENV,
-    # рантайм-переменные экранированы \$)
+    # универсальный отправщик: добавляет шапку с именем/IP ноды к любому сообщению
     cat <<SCRIPT > /usr/local/bin/rh-notify.sh
 #!/bin/bash
 [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
 [[ -z "\$TG_BOT_TOKEN" || -z "\$TG_CHAT_ID" ]] && exit 0
-ARGS=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\$1")
+HEADER="🖥 <b>\${NODE_LABEL:-\$(hostname)}</b>"
+[[ -n "\$NODE_IP" ]] && HEADER="\$HEADER  <code>\${NODE_IP}</code>"
+ARGS=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
+\$1")
 [[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
 curl -s --max-time 10 -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" "\${ARGS[@]}" >/dev/null 2>&1
 SCRIPT
@@ -385,12 +392,10 @@ SCRIPT
     cat <<'SCRIPT' > /usr/local/bin/rh-ssh-login.sh
 #!/bin/bash
 [[ "$PAM_TYPE" != "open_session" ]] && exit 0
-MSG="🔐 <b>SSH-вход</b>
-Сервер: <code>$(hostname)</code>
+/usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
 Пользователь: <code>${PAM_USER}</code>
-IP: <code>${PAM_RHOST}</code>
-Время: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-/usr/local/bin/rh-notify.sh "$MSG" &
+Откуда IP: <code>${PAM_RHOST}</code>
+Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" &
 exit 0
 SCRIPT
     chmod 755 /usr/local/bin/rh-ssh-login.sh
@@ -405,12 +410,41 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '/usr/local/bin/rh-notify.sh "♻️ Сервер <code>$(hostname)</code> загрузился ($(date "+%H:%M:%S %Z"))"'
+ExecStartPre=/bin/sleep 8
+ExecStart=/bin/bash -c '/usr/local/bin/rh-notify.sh "♻️ Сервер загрузился ($(date "+%H:%M:%S %Z"))"'
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-    # 3) Падение ноды / порт 2222 (каждые 2 мин)
+    # Мгновенный вотчер падения/подъёма ноды через docker events
+    cat <<'SCRIPT' > /usr/local/bin/rh-node-watch.sh
+#!/bin/bash
+FLAG=/run/rh-node-down
+down(){ [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
+up(){ [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
+docker events --filter 'container=remnanode' --filter 'event=start' --filter 'event=die' --filter 'event=stop' --filter 'event=kill' --format '{{.Action}}' 2>/dev/null | \
+while read -r ev; do
+    case "$ev" in
+        start) up ;;
+        die|stop|kill) down "$ev" ;;
+    esac
+done
+SCRIPT
+    chmod 755 /usr/local/bin/rh-node-watch.sh
+    cat <<'UNIT' > /etc/systemd/system/rh-node-watch.service
+[Unit]
+Description=Watch remnanode docker events -> Telegram (instant)
+After=docker.service
+Requires=docker.service
+[Service]
+Restart=always
+RestartSec=5
+ExecStart=/usr/local/bin/rh-node-watch.sh
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    # Страховочный опрос: ловит "контейнер жив, но порт 2222 не слушает" (каждые 2 мин)
     cat <<'SCRIPT' > /usr/local/bin/rh-node-health.sh
 #!/bin/bash
 FLAG=/run/rh-node-down
@@ -418,25 +452,22 @@ RUNNING=$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "
 LISTEN=no
 ss -H -ltn 2>/dev/null | grep -q ':2222' && LISTEN=yes
 if [[ "$RUNNING" != "true" || "$LISTEN" != "yes" ]]; then
-    if [[ ! -f "$FLAG" ]]; then
-        /usr/local/bin/rh-notify.sh "⚠️ Нода <code>$(hostname)</code>: проблема (контейнер running=${RUNNING}, порт2222=${LISTEN}) — панель может не видеть ноду"
-        touch "$FLAG"
-    fi
+    [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Проблема ноды</b>: контейнер running=${RUNNING}, порт2222=${LISTEN} — панель может не видеть ноду"; touch "$FLAG"; }
 else
-    [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ Нода <code>$(hostname)</code>: снова в норме"; rm -f "$FLAG"; }
+    [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода в норме</b>"; rm -f "$FLAG"; }
 fi
 SCRIPT
     chmod 755 /usr/local/bin/rh-node-health.sh
     cat <<'UNIT' > /etc/systemd/system/rh-node-health.service
 [Unit]
-Description=Remnanode health -> Telegram
+Description=Remnanode health (safety net) -> Telegram
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/rh-node-health.sh
 UNIT
     cat <<'UNIT' > /etc/systemd/system/rh-node-health.timer
 [Unit]
-Description=Remnanode healthcheck every 2 min
+Description=Remnanode healthcheck safety-net every 2 min
 [Timer]
 OnBootSec=120
 OnUnitActiveSec=120
@@ -445,9 +476,10 @@ WantedBy=timers.target
 UNIT
     systemctl daemon-reload >>"$SETUP_LOG" 2>&1
     systemctl enable rh-boot-notify.service >/dev/null 2>&1 || true
+    systemctl enable --now rh-node-watch.service >/dev/null 2>&1 || true
     systemctl enable --now rh-node-health.timer >/dev/null 2>&1 || true
 
-    /usr/local/bin/rh-notify.sh "✅ Уведомления настроены на <code>$(hostname)</code> (SSH-входы, загрузка, падение ноды)"
+    /usr/local/bin/rh-notify.sh "✅ Уведомления настроены (SSH-входы, загрузка, мгновенное падение/подъём ноды)"
     echo "  Тестовое сообщение отправлено в Telegram."
 }
 
