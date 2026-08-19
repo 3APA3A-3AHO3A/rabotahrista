@@ -405,14 +405,18 @@ comp_telegram() {
     echo ">>> Настройка Telegram-уведомлений..."
     local node_ip node_label
     node_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "")
-    if [[ -n "$FULL_DOMAIN" ]]; then
-        node_label="$FULL_DOMAIN"
-    elif [[ -n "$SUBDOMAIN" && -n "$DOMAIN" ]]; then
-        node_label="${SUBDOMAIN}.${DOMAIN}"
-    else
-        node_label=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -vi '^default' | head -1)
-        [[ -z "$node_label" ]] && node_label="$(hostname)"
+
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        read -ep "Введите красивое описание сервера (например: NL-1, Main-Node): " USER_NODE_LABEL
     fi
+    if [[ -n "$USER_NODE_LABEL" ]]; then
+        node_label="$USER_NODE_LABEL"
+    elif [[ -n "$FULL_DOMAIN" ]]; then
+        node_label="$FULL_DOMAIN"
+    else
+        node_label=$(hostname)
+    fi
+    
     mkdir -p "$(dirname "$NOTIFY_ENV")"
     cat <<EOF > "$NOTIFY_ENV"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
