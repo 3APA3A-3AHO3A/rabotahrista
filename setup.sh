@@ -278,8 +278,21 @@ EOF
 
 comp_warp() {
     echo ">>> Установка/переустановка Cloudflare WARP..."
-    bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh) >>"$SETUP_LOG" 2>&1 \
-        || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
+    {
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
+
+        apt-get update
+        apt-get install -y cloudflare-warp
+
+        warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
+
+        WARP_PORT=6000
+        warp-cli --accept-tos mode proxy || warp-cli mode proxy
+        warp-cli --accept-tos proxy port $WARP_PORT || warp-cli proxy port $WARP_PORT
+
+        warp-cli --accept-tos connect || warp-cli connect
+    } >>"$SETUP_LOG" 2>&1 || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
 }
 
 node_status() {
