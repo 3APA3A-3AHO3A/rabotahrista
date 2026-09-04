@@ -8,7 +8,7 @@ INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/ind
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
 INSTALL_STATE="/etc/rabotahrista/install.conf"
 SETUP_LOG="/var/log/node-setup.log"
-SSH_PORT="${SSH_PORT:-2222}"
+SSH_PORT="${SSH_PORT:-8422}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 # =================
 
@@ -110,6 +110,9 @@ CF_API_TOKEN="$CF_API_TOKEN"
 CF_PROXY_CHOICE="$CF_PROXY_CHOICE"
 SETUP_SSH="$SETUP_SSH"
 SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY"
+SSH_PORT="$SSH_PORT"
+ADMIN_USER="$ADMIN_USER"
+USER_NODE_LABEL="$USER_NODE_LABEL"
 INSTALL_WARP="$INSTALL_WARP"
 INSTALL_SPEEDTEST="$INSTALL_SPEEDTEST"
 SETUP_TG="$SETUP_TG"
@@ -135,6 +138,9 @@ notify_telegram() {
 #  КОМПОНЕНТЫ  (тяжёлый вывод уходит в $SETUP_LOG, на экране — только шаги)
 # ##########################################################################
 comp_user() {
+    if [[ -z "$SSH_PUBLIC_KEY" && -n "$NONINTERACTIVE" ]]; then
+        echo "  [СБОЙ] SSH_PUBLIC_KEY не задан в конфиге"; return 1
+    fi
     ask_ssh_key
     echo ">>> Пользователь $ADMIN_USER..."
     if ! id "$ADMIN_USER" &>/dev/null; then
@@ -156,12 +162,17 @@ comp_user() {
     chmod 600 "$H/.ssh/authorized_keys"
     chown -R "$ADMIN_USER:$ADMIN_USER" "$H/.ssh"
 
-    [[ -s "$H/.ssh/authorized_keys" ]] || { echo "authorized_keys пуст — прерываю"; exit 1; }
+    [[ -s "$H/.ssh/authorized_keys" ]] || { echo "  [СБОЙ] authorized_keys пуст"; return 1; }
     echo "Пользователь готов."
 }
 
 comp_ssh() {
     echo ">>> Харденинг SSH: порт $SSH_PORT, root закрыт..."
+    local H; H=$(getent passwd "$ADMIN_USER" 2>/dev/null | cut -d: -f6)
+    if [[ -z "$H" || ! -s "$H/.ssh/authorized_keys" ]]; then
+        echo "  [СБОЙ] У $ADMIN_USER нет SSH-ключа — харденинг отменён, иначе потеряете доступ."
+        return 1
+    fi
     mkdir -p /etc/ssh/sshd_config.d
     cat > /etc/ssh/sshd_config.d/01-hardening.conf <<EOF
 Port $SSH_PORT
@@ -175,7 +186,7 @@ EOF
     sed -i 's/^PasswordAuthentication/#PasswordAuthentication/' \
         /etc/ssh/sshd_config.d/*cloudimg*.conf 2>/dev/null || true
 
-    sshd -t
+    sshd -t || { echo "  [СБОЙ] sshd -t не прошёл, SSH не перезапускаю"; return 1; }
 
     # socket-активация игнорирует Port из конфига
     if systemctl is-enabled ssh.socket &>/dev/null; then
@@ -738,8 +749,8 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         echo -e "\n--- SSH ---"
-        [[ -z "$SETUP_SSH" ]] && read -ep "Настроить вход по SSH-ключу для root? [y/N]: " SETUP_SSH
-        [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && ask_ssh_key
+        echo "Будет создан $ADMIN_USER, порт $SSH_PORT, root и пароли отключены."
+        ask_ssh_key
 
         echo -e "\n--- Доп. компоненты ---"
         [[ -z "$INSTALL_WARP" ]]      && read -ep "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
@@ -756,9 +767,10 @@ full_install() {
     echo -e "\nСтавлю ноду для $FULL_DOMAIN. Тяжёлый вывод — в $SETUP_LOG\n"; sleep 2
 
     # --- выполнение (каждый шаг пишет результат в сводку) ---
-    [[ "$SETUP_SSH" =~ ^[Yy]$ ]] && do_step "SSH по ключу" comp_ssh || skip_step "SSH по ключу"
     do_step "Swap" comp_swap
     do_step "Пакеты и обновление системы" comp_packages
+    do_step "Пользователь $ADMIN_USER" comp_user
+    do_step "Харденинг SSH" comp_ssh
     do_step "fail2ban" comp_fail2ban
     do_step "Автообновления безопасности" comp_autoupdates
     do_step "Отключение IPv6 (GRUB)" comp_ipv6
@@ -801,7 +813,7 @@ components_menu() {
         echo -e "\n===== Компоненты (доустановить / переустановить) ====="
         echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
         echo " 4) Веб (заглушка+серт)    5) UFW             6) Sysctl-тюнинг"
-        echo " 7) Swap                   8) SSH по ключу    9) Speedtest"
+        echo " 7) Swap                   8) Юзер + SSH-харденинг   9) Speedtest"
         echo "10) IPv6 off (GRUB)"
         echo "--- Безопасность / обслуживание ---"
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
@@ -813,7 +825,7 @@ components_menu() {
         read -ep "Выбор: " c
         case "$c" in
             1) comp_warp ;;   2) comp_docker ;;   3) comp_node ;;   4) comp_web ;;
-            5) comp_ufw ;;    6) comp_sysctl ;;   7) comp_swap ;;   8) comp_ssh ;;
+            5) comp_ufw ;;    6) comp_sysctl ;;   7) comp_swap ;;   8) comp_user && comp_ssh ;;
             9) comp_speedtest ;; 10) comp_ipv6 ;;
             11) comp_telegram ;; 12) comp_fail2ban ;; 13) comp_autoupdates ;; 14) comp_disk ;;
             15) comp_node_update ;; 16) node_status ;;
