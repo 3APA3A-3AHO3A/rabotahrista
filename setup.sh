@@ -8,6 +8,8 @@ INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/ind
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
 INSTALL_STATE="/etc/rabotahrista/install.conf"
 SETUP_LOG="/var/log/node-setup.log"
+SSH_PORT="${SSH_PORT:-2222}"
+ADMIN_USER="${ADMIN_USER:-admin}"
 # =================
 
 if [ "$EUID" -ne 0 ]; then
@@ -132,18 +134,57 @@ notify_telegram() {
 # ##########################################################################
 #  КОМПОНЕНТЫ  (тяжёлый вывод уходит в $SETUP_LOG, на экране — только шаги)
 # ##########################################################################
-comp_ssh() {
+comp_user() {
     ask_ssh_key
-    echo ">>> Настройка входа по SSH-ключу для root..."
-    mkdir -p /root/.ssh; chmod 700 /root/.ssh
-    touch /root/.ssh/authorized_keys
-    grep -qF "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys || echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    sed -i "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
-    grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-    sed -i "s/^[# ]*PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
-    grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-    systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1
+    echo ">>> Пользователь $ADMIN_USER..."
+    if ! id "$ADMIN_USER" &>/dev/null; then
+        adduser --disabled-password --gecos "" "$ADMIN_USER"
+        PASS=$(openssl rand -base64 18)
+        echo "$ADMIN_USER:$PASS" | chpasswd
+        echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $PASS"
+    fi
+    usermod -aG sudo "$ADMIN_USER"
+
+    echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$ADMIN_USER"
+    chmod 440 "/etc/sudoers.d/90-$ADMIN_USER"
+    visudo -c >/dev/null
+
+    local H; H=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+    install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$H/.ssh"
+    touch "$H/.ssh/authorized_keys"
+    grep -qxF "$SSH_PUBLIC_KEY" "$H/.ssh/authorized_keys" || echo "$SSH_PUBLIC_KEY" >> "$H/.ssh/authorized_keys"
+    chmod 600 "$H/.ssh/authorized_keys"
+    chown -R "$ADMIN_USER:$ADMIN_USER" "$H/.ssh"
+
+    [[ -s "$H/.ssh/authorized_keys" ]] || { echo "authorized_keys пуст — прерываю"; exit 1; }
+    echo "Пользователь готов."
+}
+
+comp_ssh() {
+    echo ">>> Харденинг SSH: порт $SSH_PORT, root закрыт..."
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/01-hardening.conf <<EOF
+Port $SSH_PORT
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM yes
+EOF
+    chmod 644 /etc/ssh/sshd_config.d/01-hardening.conf
+    sed -i 's/^PasswordAuthentication/#PasswordAuthentication/' \
+        /etc/ssh/sshd_config.d/*cloudimg*.conf 2>/dev/null || true
+
+    sshd -t
+
+    # socket-активация игнорирует Port из конфига
+    if systemctl is-enabled ssh.socket &>/dev/null; then
+        systemctl disable --now ssh.socket
+        systemctl enable --now ssh
+    else
+        systemctl restart ssh || systemctl restart sshd
+    fi
+    echo "SSH настроен, порт применится окончательно после ребута."
 }
 
 comp_swap() {
@@ -164,7 +205,7 @@ comp_packages() {
         apt-get -y upgrade
         apt-get -y dist-upgrade
         apt-get -y autoremove --purge
-        apt-get -y install curl wget unzip git ufw fail2ban socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu
+        apt-get -y install sudo curl wget unzip git ufw fail2ban socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu
     } >>"$SETUP_LOG" 2>&1
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
 }
@@ -197,7 +238,7 @@ comp_ufw() {
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-        ufw limit 22/tcp comment 'SSH Rate Limit'
+        ufw limit "$SSH_PORT/tcp" comment 'SSH Rate Limit'
         ufw allow 80/tcp comment 'HTTP'
         ufw allow 443/tcp comment 'HTTPS'
         ufw allow from "$PANEL_IP" to any port 2222 proto tcp comment 'API panel'
@@ -367,7 +408,7 @@ comp_os_update() {
 comp_fail2ban() {
     echo ">>> Настройка fail2ban..."
     apt-get install -y fail2ban >>"$SETUP_LOG" 2>&1 || true
-    cat <<'EOF' > /etc/fail2ban/jail.local
+    cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
@@ -376,7 +417,7 @@ maxretry = 5
 [sshd]
 enabled  = true
 backend  = systemd
-port     = 22
+port     = $SSH_PORT
 maxretry = 4
 bantime  = 24h
 
