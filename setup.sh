@@ -8,8 +8,12 @@ INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/ind
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
 INSTALL_STATE="/etc/rabotahrista/install.conf"
 SETUP_LOG="/var/log/node-setup.log"
+REPORT_FILE="/root/node-install-report.txt"
 SSH_PORT="${SSH_PORT:-8422}"
 ADMIN_USER="${ADMIN_USER:-admin}"
+NODE_PORT="2222"
+# Пакеты из apt — один список на установку и на отчёт о версиях
+APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
 
 if [ "$EUID" -ne 0 ]; then
@@ -17,6 +21,8 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
+# Без UTF-8 локали bash считает длину строк в байтах — колонки отчёта разъезжаются
+if locale -a 2>/dev/null | grep -qix 'C\.UTF-*8'; then export LC_ALL=C.UTF-8; fi
 : > "$SETUP_LOG" 2>/dev/null || SETUP_LOG="/tmp/node-setup.log"
 
 # ##########################################################################
@@ -35,12 +41,96 @@ do_step() {
     return 0
 }
 skip_step() { SUMMARY+=("[проп.]   $1"); }
+
+# Строка отчёта ровной колонкой ("метка" дополняется пробелами до 21 символа)
+row() {
+    local label="$1"; shift
+    local n=$(( 21 - ${#label} )); (( n < 1 )) && n=1
+    local pad; printf -v pad '%*s' "$n" ''
+    printf '  %s%s%s\n' "$label" "$pad" "$*"
+}
+
+# Версии всего, что поставили: пакеты apt + то, что ставится мимо apt
+collect_versions() {
+    local p v
+    for p in $APT_PACKAGES; do
+        v=$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || true)
+        row "$p" "${v:-НЕ УСТАНОВЛЕН}"
+    done
+    if command -v docker >/dev/null 2>&1; then
+        row "docker" "$(docker --version 2>/dev/null | sed 's/^Docker version //' || echo '?')"
+        row "docker compose" "$(docker compose version --short 2>/dev/null || echo '?')"
+    else
+        row "docker" "НЕ УСТАНОВЛЕН"
+    fi
+    if command -v speedtest >/dev/null 2>&1; then
+        row "speedtest" "$(speedtest --version 2>/dev/null | head -1 || echo '?')"
+    fi
+    if command -v warp-cli >/dev/null 2>&1; then
+        row "warp-cli" "$(warp-cli --version 2>/dev/null | head -1 || echo '?')"
+    fi
+    return 0
+}
+
+# Финальный отчёт: чистит экран и печатает всё одним куском + кладёт в файл
 print_summary() {
-    echo -e "\n=========================================="
-    echo "  ИТОГ УСТАНОВКИ   (полный лог: $SETUP_LOG)"
-    echo "=========================================="
-    printf '%s\n' "${SUMMARY[@]}"
-    { echo "=== ИТОГ ($(date)) ==="; printf '%s\n' "${SUMMARY[@]}"; } >> "$SETUP_LOG" 2>&1 || true
+    local out node_state
+    node_state=$(docker inspect -f '{{.State.Status}} (restarts={{.RestartCount}})' remnanode 2>/dev/null || echo "контейнер не найден")
+    out=$(
+        echo "=========================================="
+        echo "  УСТАНОВКА ЗАВЕРШЕНА — $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "=========================================="
+        echo
+        echo "--- ДОСТУП ПО SSH ---"
+        row "Команда входа:" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+        row "Учётка:" "$ADMIN_USER (sudo без пароля)"
+        case "$ADMIN_PASS_SOURCE" in
+            manual)    row "Пароль учётки:" "задан вами вручную (в отчёт не пишу)" ;;
+            kept)      row "Пароль учётки:" "не менялся — пользователь уже существовал" ;;
+            *)         row "Пароль учётки:" "${ADMIN_PASS:-—}"
+                       row "" "(сгенерирован; нужен только для аварийной консоли хостера)" ;;
+        esac
+        row "Root по SSH:" "запрещён"
+        row "Вход по паролю:" "запрещён"
+        if [[ -n "$SSH_PENDING_REBOOT" ]]; then
+            row "ВНИМАНИЕ:" "порт $SSH_PORT заработает ТОЛЬКО ПОСЛЕ ПЕРЕЗАГРУЗКИ"
+            row "" "до неё заходи по старому порту — он открыт в UFW (см. ниже)"
+        elif [[ -z "$SSH_HARDENED" ]]; then
+            row "ВНИМАНИЕ:" "харденинг SSH не применился — смотри шаги ниже"
+        fi
+        echo
+        echo "--- НОДА ---"
+        row "Домен:" "${FULL_DOMAIN:-—}"
+        row "IP сервера:" "${SERVER_IP:-—}"
+        row "Контейнер:" "$node_state"
+        row "Порт для панели:" "$NODE_PORT (открыт только для ${PANEL_IP:-—})"
+        echo
+        echo "--- ФАЕРВОЛ (UFW) ---"
+        row "Открыто:" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80/tcp, 443/tcp"
+        row "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
+        echo
+        echo "--- ШАГИ УСТАНОВКИ ---"
+        printf '%s\n' "${SUMMARY[@]}"
+        echo
+        echo "--- УСТАНОВЛЕННЫЕ ПАКЕТЫ И ВЕРСИИ ---"
+        collect_versions
+        echo
+        echo "--- ГДЕ ЧТО ЛЕЖИТ ---"
+        row "Этот отчёт:" "$REPORT_FILE"
+        row "Полный лог:" "$SETUP_LOG"
+        row "Ответы установки:" "$INSTALL_STATE"
+        row "Compose ноды:" "/opt/remnanode/docker-compose.yml"
+        row "Конфиг nginx:" "/etc/nginx/sites-available/${FULL_DOMAIN:-—}"
+        [[ -f "$NOTIFY_ENV" ]] && row "Telegram:" "$NOTIFY_ENV"
+        echo "=========================================="
+    )
+    printf '%s\n' "$out" > "$REPORT_FILE" 2>/dev/null || true
+    chmod 600 "$REPORT_FILE" 2>/dev/null || true
+    # чистим экран от простыни установки — всё важное уже в $out и в файле
+    if [[ -t 1 ]]; then clear || true; fi
+    printf '%s\n' "$out"
+    { echo; echo "=== ОТЧЁТ ($(date)) ==="; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
+    return 0
 }
 
 ask_domain() {
@@ -78,6 +168,108 @@ ask_ssh_key() {
     while [[ -z "$SSH_PUBLIC_KEY" ]]; do
         read -ep "Публичный SSH-ключ (ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
     done
+}
+
+# --- Имя админ-учётки и порт SSH -------------------------------------------
+# Проверка значений, пришедших из окружения/конфига (неинтерактивный режим).
+validate_ssh_params() {
+    ADMIN_USER=$(echo "${ADMIN_USER:-}" | tr -d '[:space:]')
+    if [[ ! "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || [[ "$ADMIN_USER" == "root" ]] || (( ${#ADMIN_USER} > 32 )); then
+        [[ -n "$ADMIN_USER" ]] && echo "  [ВНИМАНИЕ] Некорректное ADMIN_USER='$ADMIN_USER' — использую 'admin'."
+        ADMIN_USER="admin"
+    fi
+    SSH_PORT=$(echo "${SSH_PORT:-}" | tr -d '[:space:]')
+    if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
+        [[ -n "$SSH_PORT" ]] && echo "  [ВНИМАНИЕ] Некорректный SSH_PORT='$SSH_PORT' — использую 8422."
+        SSH_PORT="8422"
+    fi
+}
+
+ask_admin_user() {
+    local input yn
+    while true; do
+        read -ep "Имя администраторской учётки [$ADMIN_USER]: " input
+        input=$(echo "$input" | tr -d '[:space:]')
+        [[ -z "$input" ]] && break                      # Enter — оставить как есть
+        if [[ ! "$input" =~ ^[a-z_][a-z0-9_-]*$ ]] || (( ${#input} > 32 )); then
+            echo -e "\e[31m[Ошибка]\e[0m Строчные латинские буквы, цифры, _ и -; первым символом буква или _ (до 32 символов)."
+            continue
+        fi
+        if [[ "$input" == "root" ]]; then
+            echo -e "\e[31m[Ошибка]\e[0m root не подходит — скрипт как раз закрывает вход под root."
+            continue
+        fi
+        if id "$input" &>/dev/null; then
+            read -ep "  Пользователь '$input' в системе уже есть. Использовать его (добавлю ключ и sudo)? [y/N]: " yn
+            [[ "$yn" =~ ^[Yy]$ ]] || continue
+        fi
+        ADMIN_USER="$input"
+        break
+    done
+}
+
+ask_ssh_port() {
+    local input
+    while true; do
+        read -ep "Порт SSH [$SSH_PORT]: " input
+        input=$(echo "$input" | tr -d '[:space:]')
+        [[ -z "$input" ]] && break                      # Enter — оставить как есть
+        if [[ ! "$input" =~ ^[0-9]+$ ]] || (( input < 1 || input > 65535 )); then
+            echo -e "\e[31m[Ошибка]\e[0m Порт — целое число от 1 до 65535."
+            continue
+        fi
+        if [[ " 80 443 2222 6000 " == *" $input "* ]]; then
+            echo -e "\e[31m[Ошибка]\e[0m Порт $input занят другими компонентами (80/443 — веб, 2222 — API ноды, 6000 — WARP)."
+            continue
+        fi
+        if (( input < 1024 )) && [[ "$input" != "22" ]]; then
+            echo -e "\e[33m[Внимание]\e[0m $input — системный порт (<1024), его могут занять другие сервисы."
+        fi
+        if [[ "$input" != "22" ]] && ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$input"; then
+            echo -e "\e[33m[Внимание]\e[0m Порт $input уже кто-то слушает. Если это не ваш sshd — SSH не поднимется."
+        fi
+        SSH_PORT="$input"
+        break
+    done
+}
+
+ask_admin_password() {
+    local p1 p2
+    while true; do
+        read -s -p "Пароль для учётки $ADMIN_USER (Enter — сгенерировать случайный): " p1; echo
+        if [[ -z "$p1" ]]; then
+            ADMIN_PASS=""; ADMIN_PASS_SOURCE="generated"
+            echo "  Пароль будет сгенерирован и показан в итоговом отчёте."
+            return 0
+        fi
+        if (( ${#p1} < 8 )); then
+            echo -e "\e[31m[Ошибка]\e[0m Минимум 8 символов."
+            continue
+        fi
+        read -s -p "Повторите пароль: " p2; echo
+        if [[ "$p1" != "$p2" ]]; then
+            echo -e "\e[31m[Ошибка]\e[0m Пароли не совпали, ещё раз."
+            continue
+        fi
+        ADMIN_PASS="$p1"; ADMIN_PASS_SOURCE="manual"
+        break
+    done
+}
+
+# Спрашивает параметры один раз за запуск; в неинтерактиве только проверяет.
+ask_ssh_params() {
+    [[ -n "$SSH_PARAMS_ASKED" ]] && return 0
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        validate_ssh_params
+        echo "Enter — оставить значение, указанное в квадратных скобках."
+        ask_admin_user
+        ask_admin_password
+        ask_ssh_port
+    else
+        [[ -n "$ADMIN_PASS" ]] && ADMIN_PASS_SOURCE="manual" || ADMIN_PASS_SOURCE="generated"
+    fi
+    validate_ssh_params
+    SSH_PARAMS_ASKED=1
 }
 ask_cf() {
     [[ -z "$SETUP_CF" && -z "$NONINTERACTIVE" ]] && read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
@@ -141,13 +333,33 @@ comp_user() {
     if [[ -z "$SSH_PUBLIC_KEY" && -n "$NONINTERACTIVE" ]]; then
         echo "  [СБОЙ] SSH_PUBLIC_KEY не задан в конфиге"; return 1
     fi
+    ask_ssh_params
     ask_ssh_key
     echo ">>> Пользователь $ADMIN_USER..."
     if ! id "$ADMIN_USER" &>/dev/null; then
         adduser --disabled-password --gecos "" "$ADMIN_USER"
-        PASS=$(openssl rand -base64 18)
-        echo "$ADMIN_USER:$PASS" | chpasswd
-        echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $PASS"
+        if [[ -z "$ADMIN_PASS" ]]; then
+            ADMIN_PASS=$(openssl rand -base64 18); ADMIN_PASS_SOURCE="generated"
+        fi
+        echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
+        [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
+            echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $ADMIN_PASS  (повторю в итоговом отчёте)"
+    else
+        # Существующей учётке пароль молча не меняем — только если явно попросили
+        if [[ "$ADMIN_PASS_SOURCE" == "manual" && -n "$ADMIN_PASS" ]]; then
+            local yn="y"
+            [[ -z "$NONINTERACTIVE" ]] && read -ep "  Пользователь $ADMIN_USER уже есть. Сменить ему пароль на введённый? [y/N]: " yn
+            if [[ "$yn" =~ ^[Yy]$ ]]; then
+                echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
+                echo "  Пароль изменён."
+            else
+                ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
+                echo "  Пароль оставлен прежним."
+            fi
+        else
+            ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
+            echo "  Пользователь $ADMIN_USER уже существует — пароль не трогаю."
+        fi
     fi
     usermod -aG sudo "$ADMIN_USER"
 
@@ -167,12 +379,21 @@ comp_user() {
 }
 
 comp_ssh() {
+    ask_ssh_params
     echo ">>> Харденинг SSH: порт $SSH_PORT, root закрыт..."
     local H; H=$(getent passwd "$ADMIN_USER" 2>/dev/null | cut -d: -f6)
     if [[ -z "$H" || ! -s "$H/.ssh/authorized_keys" ]]; then
         echo "  [СБОЙ] У $ADMIN_USER нет SSH-ключа — харденинг отменён, иначе потеряете доступ."
         return 1
     fi
+    # Без этой строки основной sshd_config вообще не читает каталог sshd_config.d:
+    # наш файл лёг бы «в стол», sshd -t прошёл бы, а порт и root остались бы прежними.
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config; then
+        echo "  В sshd_config нет Include для sshd_config.d — добавляю первой строкой (бэкап рядом)."
+        cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+        sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+    fi
+
     mkdir -p /etc/ssh/sshd_config.d
     cat > /etc/ssh/sshd_config.d/01-hardening.conf <<EOF
 Port $SSH_PORT
@@ -183,19 +404,59 @@ PubkeyAuthentication yes
 UsePAM yes
 EOF
     chmod 644 /etc/ssh/sshd_config.d/01-hardening.conf
+    # Облачные образы включают вход по паролю своими дроп-инами. Наш файл сортируется
+    # первым и всё равно выигрывает, но глушим и их — на случай нестандартных имён.
     sed -i 's/^PasswordAuthentication/#PasswordAuthentication/' \
-        /etc/ssh/sshd_config.d/*cloudimg*.conf 2>/dev/null || true
+        /etc/ssh/sshd_config.d/*cloudimg*.conf /etc/ssh/sshd_config.d/*cloud-init*.conf 2>/dev/null || true
 
-    sshd -t || { echo "  [СБОЙ] sshd -t не прошёл, SSH не перезапускаю"; return 1; }
+    sshd -t || {
+        echo "  [СБОЙ] sshd -t не прошёл — убираю свой файл, SSH не трогаю"
+        rm -f /etc/ssh/sshd_config.d/01-hardening.conf
+        return 1
+    }
 
-    # socket-активация игнорирует Port из конфига
-    if systemctl is-enabled ssh.socket &>/dev/null; then
-        systemctl disable --now ssh.socket
-        systemctl enable --now ssh
-    else
-        systemctl restart ssh || systemctl restart sshd
+    # Какой порт sshd возьмёт из конфига при следующем старте (читает файлы, не демон)
+    local want_port
+    want_port=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
+
+    # Socket-активация (Ubuntu 22.10+): порт держит systemd через ssh.socket,
+    # sshd его вообще не открывает, и строка Port в конфиге игнорируется.
+    if systemctl cat ssh.socket >/dev/null 2>&1; then
+        systemctl disable --now ssh.socket >>"$SETUP_LOG" 2>&1 || true
     fi
-    echo "SSH настроен, порт применится окончательно после ребута."
+    systemctl enable ssh >>"$SETUP_LOG" 2>&1 || systemctl enable sshd >>"$SETUP_LOG" 2>&1 || true
+    # Именно restart: "enable --now" НЕ перезапускает уже запущенный демон,
+    # поэтому старый порт продолжал жить до перезагрузки.
+    systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1 || true
+
+    # Проверяем фактом, а не надеждой: слушает ли кто-то новый порт
+    local i ok=""
+    for i in $(seq 1 10); do
+        if ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$SSH_PORT"; then ok=1; break; fi
+        sleep 1
+    done
+
+    if [[ -n "$ok" ]]; then
+        SSH_HARDENED=1; SSH_PENDING_REBOOT=""
+        echo "  Проверено: sshd слушает порт $SSH_PORT прямо сейчас. Текущая сессия не разорвётся."
+        return 0
+    fi
+
+    if [[ "$want_port" == "$SSH_PORT" ]]; then
+        # Конфиг принят, но демон не перебиндился. Не откатываем — применится на ребуте,
+        # а UFW ниже оставит открытым и старый порт, чтобы не потерять доступ.
+        SSH_HARDENED=1; SSH_PENDING_REBOOT=1
+        echo "  [ВНИМАНИЕ] sshd принял конфиг (sshd -T показывает порт $SSH_PORT), но пока слушает старый порт."
+        echo "             Новый порт заработает после перезагрузки. Старый порт останется открыт в UFW."
+        return 0
+    fi
+
+    echo "  [СБОЙ] sshd не видит порт $SSH_PORT в своём конфиге (sshd -T показывает '${want_port:-?}')."
+    echo "         Значит файл харденинга не читается. Откатываю, чтобы не потерять доступ."
+    rm -f /etc/ssh/sshd_config.d/01-hardening.conf
+    systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1 || true
+    SSH_HARDENED=""; SSH_PENDING_REBOOT=""
+    return 1
 }
 
 comp_swap() {
@@ -216,7 +477,7 @@ comp_packages() {
         apt-get -y upgrade
         apt-get -y dist-upgrade
         apt-get -y autoremove --purge
-        apt-get -y install sudo curl wget unzip git ufw fail2ban socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu
+        apt-get -y install $APT_PACKAGES
     } >>"$SETUP_LOG" 2>&1
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
 }
@@ -243,16 +504,28 @@ comp_ipv6() {
 comp_ufw() {
     ask_panel_ip
     echo ">>> Настройка UFW..."
+    # Открываем целевой порт + все, на которых SSH может быть прямо сейчас.
+    # Иначе при отложенном применении порта фаервол запер бы нас снаружи.
+    local ssh_ports p listening
+    listening=$(ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un || true)
+    ssh_ports="$SSH_PORT"                                   # куда переезжаем
+    for p in $(sshd -T 2>/dev/null | awk '/^port /{print $2}'); do ssh_ports+=" $p"; done
+    grep -qx 22 <<< "$listening" && ssh_ports+=" 22"        # на 22 ещё кто-то слушает — значит не переехали
+    ssh_ports=$(printf '%s\n' $ssh_ports | sort -un)
+    UFW_SSH_PORTS=""
+    for p in $ssh_ports; do UFW_SSH_PORTS+="${UFW_SSH_PORTS:+, }$p/tcp"; done
+    echo "  SSH-порты в правилах: $UFW_SSH_PORTS"
+
     sed -i 's/IPV6=yes/IPV6=no/' /etc/default/ufw
     sed -i 's|net/ipv4/icmp_echo_ignore_all=0|net/ipv4/icmp_echo_ignore_all=1|' /etc/ufw/sysctl.conf
     {
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-        ufw limit "$SSH_PORT/tcp" comment 'SSH Rate Limit'
+        for p in $ssh_ports; do ufw limit "$p/tcp" comment 'SSH Rate Limit'; done
         ufw allow 80/tcp comment 'HTTP'
         ufw allow 443/tcp comment 'HTTPS'
-        ufw allow from "$PANEL_IP" to any port 2222 proto tcp comment 'API panel'
+        ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'API panel'
         ufw --force enable
     } >>"$SETUP_LOG" 2>&1
 }
@@ -283,11 +556,20 @@ net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
+EOF
+    # Ключи ipv6 существуют, только пока стек ipv6 в ядре жив. После ipv6.disable=1
+    # из GRUB их нет, и sysctl --system падает с ошибкой на пустом месте.
+    if [[ -d /proc/sys/net/ipv6 ]]; then
+        cat <<EOF >> /etc/sysctl.d/99-vpn-tune.conf
 
 # Отключаем ipv6
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 EOF
+    else
+        echo -e "\n# ipv6 уже отключён в ядре (ipv6.disable=1 в GRUB) — ключи sysctl не нужны" \
+            >> /etc/sysctl.d/99-vpn-tune.conf
+    fi
     sysctl --system >>"$SETUP_LOG" 2>&1
 }
 
@@ -350,10 +632,10 @@ comp_warp() {
 node_status() {
     echo "----- Статус ноды -----"
     docker inspect -f 'Контейнер: {{.State.Status}} (running={{.State.Running}}, restarts={{.RestartCount}}, oom={{.State.OOMKilled}})' remnanode 2>/dev/null || echo "Контейнер remnanode не найден."
-    if ss -H -ltn 2>/dev/null | grep -q ':2222'; then
-        echo "Порт 2222 (API, к нему подключается панель): СЛУШАЕТ — связь с панелью возможна"
+    if ss -H -ltn 2>/dev/null | grep -q ":$NODE_PORT"; then
+        echo "Порт $NODE_PORT (API, к нему подключается панель): СЛУШАЕТ — связь с панелью возможна"
     else
-        echo "Порт 2222 (API, к нему подключается панель): НЕ слушает — панель НЕ подключится к ноде"
+        echo "Порт $NODE_PORT (API, к нему подключается панель): НЕ слушает — панель НЕ подключится к ноде"
     fi
     echo "----- Последние 30 строк логов -----"
     docker logs --tail=30 remnanode 2>&1 || echo "Логи недоступны."
@@ -378,13 +660,13 @@ services:
         soft: 1048576
         hard: 1048576
     environment:
-      - NODE_PORT=2222
+      - NODE_PORT=$NODE_PORT
       - SECRET_KEY="${REMNA_SECRET}"
 EOF
     ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1
-    echo "  Ожидание запуска ноды (порт 2222, до 15 сек)..."
+    echo "  Ожидание запуска ноды (порт $NODE_PORT, до 15 сек)..."
     for i in $(seq 1 15); do
-        if ss -H -ltn 2>/dev/null | grep -q ':2222'; then break; fi
+        if ss -H -ltn 2>/dev/null | grep -q ":$NODE_PORT"; then break; fi
         sleep 1
     done
     node_status
@@ -418,7 +700,8 @@ comp_os_update() {
 
 comp_fail2ban() {
     echo ">>> Настройка fail2ban..."
-    apt-get install -y fail2ban >>"$SETUP_LOG" 2>&1 || true
+    # python3-systemd нужен для backend=systemd ниже; без него джейл sshd молча не стартует
+    apt-get install -y fail2ban python3-systemd >>"$SETUP_LOG" 2>&1 || true
     cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime  = 1h
@@ -440,6 +723,10 @@ maxretry = 5
 EOF
     systemctl enable fail2ban >/dev/null 2>&1 || true
     systemctl restart fail2ban >>"$SETUP_LOG" 2>&1
+    sleep 2
+    if ! fail2ban-client status sshd >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] джейл sshd в fail2ban не поднялся (см. $SETUP_LOG)"; return 1
+    fi
 }
 
 comp_autoupdates() {
@@ -735,21 +1022,24 @@ run_censor() { echo ">>> Проверка блокировок/DPI/DNS (censorch
 full_install() {
     echo -e "\n========== ПОЛНАЯ УСТАНОВКА =========="
     if [[ -n "$STATE_LOADED" && -z "$NONINTERACTIVE" ]]; then
-        echo "Найдены данные прошлой установки: ${SUBDOMAIN}.${DOMAIN}, панель ${PANEL_IP}"
+        echo "Найдены данные прошлой установки: ${SUBDOMAIN}.${DOMAIN}, панель ${PANEL_IP}, учётка ${ADMIN_USER}, порт SSH ${SSH_PORT}"
         read -ep "Обновить с этими данными (без повторного ввода)? [Y/n]: " USE_SAVED
         if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
             DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
             SETUP_CF=""; CF_API_TOKEN=""; CF_PROXY_CHOICE=""
             SETUP_SSH=""; SSH_PUBLIC_KEY=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
+            SSH_PORT="8422"; ADMIN_USER="admin"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""
         fi
     fi
     # --- сбор всех ответов заранее ---
     ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
 
+    echo -e "\n--- SSH ---"
+    ask_ssh_params
+    echo "Итого: учётка «$ADMIN_USER», порт SSH $SSH_PORT. Вход под root и вход по паролю будут отключены."
+
     if [[ -z "$NONINTERACTIVE" ]]; then
-        echo -e "\n--- SSH ---"
-        echo "Будет создан $ADMIN_USER, порт $SSH_PORT, root и пароли отключены."
         ask_ssh_key
 
         echo -e "\n--- Доп. компоненты ---"
@@ -788,8 +1078,9 @@ full_install() {
 
     print_summary
 
-    echo -e "\n=========================================="
     if [[ -z "$NONINTERACTIVE" ]]; then
+        echo
+        echo "Отчёт выше сохранён в $REPORT_FILE (в нём же пароль учётки)."
         echo "Отключение IPv6 (GRUB) применится только после перезагрузки."
         read -ep "Доустановить/переустановить что-то в меню перед ребутом? [y/N]: " ADDC
         [[ "$ADDC" =~ ^[Yy]$ ]] && components_menu
@@ -864,6 +1155,7 @@ if [[ -n "$1" && -f "$1" ]]; then
     # shellcheck disable=SC1090
     source "$1"
     NONINTERACTIVE=1
+    validate_ssh_params
 fi
 
 if [[ -n "$NONINTERACTIVE" ]] || { [[ -n "$DOMAIN" ]] && [[ -n "$SUBDOMAIN" ]] && [[ -n "$REMNA_SECRET" ]]; }; then
@@ -871,6 +1163,6 @@ if [[ -n "$NONINTERACTIVE" ]] || { [[ -n "$DOMAIN" ]] && [[ -n "$SUBDOMAIN" ]] &
     full_install
 else
     # интерактив: подхватить сохранённые данные прошлой установки как значения по умолчанию
-    [[ -f "$INSTALL_STATE" ]] && { source "$INSTALL_STATE"; STATE_LOADED=1; }
+    [[ -f "$INSTALL_STATE" ]] && { source "$INSTALL_STATE"; STATE_LOADED=1; validate_ssh_params; }
     main_menu
 fi
