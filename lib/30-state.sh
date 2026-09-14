@@ -27,17 +27,40 @@ get_server_ip() {
 detect_existing_setup() {
     local v
 
-    # Домен — из выпущенного сертификата, иначе из включённого конфига nginx
+    # Домен ноды.
+    #
+    # Раньше здесь стояло "первый сертификат по алфавиту". На ноде, где живёт
+    # ещё один сайт, это выбирало ЧУЖОЙ домен: gateway.example.com сортируется
+    # раньше node-nl-1.example.com. Дальше починка переписывала конфиг соседа
+    # шаблоном ноды и снимала с публикации настоящий конфиг ноды.
+    #
+    # Поэтому теперь: берём только то, что можно доказать, а при неоднозначности
+    # честно ничего не выбираем и говорим об этом.
+    DOMAIN_AMBIGUOUS=""
     if [[ -z "${DOMAIN:-}${SUBDOMAIN:-}" ]]; then
-        v=$(ls -d /etc/letsencrypt/live/*/ 2>/dev/null | head -1)
-        [[ -n "$v" ]] && v=$(basename "$v")
-        if [[ -z "$v" ]]; then
-            v=$(find /etc/nginx/sites-enabled -maxdepth 1 \( -type l -o -type f \) \
-                -printf '%f\n' 2>/dev/null | grep -v '^default$' | head -1)
+        local cand=() f b
+        # Кандидат первого сорта: включённый конфиг nginx, у которого есть
+        # собственный сертификат. Это и есть работающий сайт.
+        for f in "$NGINX_ENABLED"/*; do
+            [[ -e "$f" ]] || continue
+            b=$(basename "$f")
+            [[ "$b" == "default" || "$b" == "00-acme" ]] && continue
+            [[ "$b" == *.*.* && -d "$LE_LIVE/$b" ]] || continue
+            cand+=("$b")
+        done
+        # Ничего не включено — смотрим на выпущенные сертификаты.
+        if [[ ${#cand[@]} -eq 0 ]]; then
+            for f in "$LE_LIVE"/*/; do
+                [[ -d "$f" ]] || continue
+                b=$(basename "$f")
+                [[ "$b" == *.*.* ]] && cand+=("$b")
+            done
         fi
-        if [[ "$v" == *.*.* ]]; then
-            SUBDOMAIN="${v%%.*}"
-            DOMAIN="${v#*.}"
+        if [[ ${#cand[@]} -eq 1 ]]; then
+            SUBDOMAIN="${cand[0]%%.*}"
+            DOMAIN="${cand[0]#*.}"
+        elif [[ ${#cand[@]} -gt 1 ]]; then
+            DOMAIN_AMBIGUOUS="${cand[*]}"
         fi
     fi
 

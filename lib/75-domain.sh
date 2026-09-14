@@ -34,17 +34,16 @@ comp_change_domain() {
     get_server_ip || true
 
     # --- сертификат для нового домена ---
-    if [[ -d "/etc/letsencrypt/live/$FULL_DOMAIN" ]]; then
+    if [[ -d "$LE_LIVE/$FULL_DOMAIN" ]]; then
         echo "  Сертификат для $FULL_DOMAIN уже есть, выпускать не нужно."
     else
-        acme_serve_start || return 1
         if ! acme_reachable; then
             echo "  [ВНИМАНИЕ] ACME-проверка не дошла до сервера."
-            echo "    Проверьте A-запись $FULL_DOMAIN и что порт 80 открыт."
+            echo "    Проверьте A-запись $FULL_DOMAIN, порт 80 и отдачу"
+            echo "    /.well-known/acme-challenge/ в nginx для нового домена."
             if [[ -z "$NONINTERACTIVE" ]]; then
                 read -ep "  Пробовать выпустить сертификат всё равно? [y/N]: " TRY || TRY=""
                 if [[ ! "$TRY" =~ ^[Yy]$ ]]; then
-                    acme_serve_stop
                     echo "  [СБОЙ] Смена домена отменена, ничего не изменено."
                     return 1
                 fi
@@ -53,20 +52,28 @@ comp_change_domain() {
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \
                 --keep-until-expiring >>"$SETUP_LOG" 2>&1; then
-            acme_serve_stop
             echo "  [СБОЙ] Certbot не выпустил сертификат для $FULL_DOMAIN (см. $SETUP_LOG)"
             echo "         Нода осталась на прежнем домене, ничего не сломано."
             return 1
         fi
-        acme_serve_stop
     fi
 
-    # --- конфиг nginx (тот же шаблон, что при установке) ---
-    if ! write_nginx_site "$FULL_DOMAIN"; then
+    # --- конфиг nginx: показываем и ждём подтверждения ---
+    nginx_advise "$FULL_DOMAIN"
+    local APPLY=""
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        read -ep "  Записать конфиг нового домена и перезапустить nginx? [y/N]: " APPLY || APPLY=""
+    fi
+    if [[ ! "$APPLY" =~ ^[Yy]$ ]]; then
+        echo "  Конфиг nginx не тронут. Сертификат для $FULL_DOMAIN уже выпущен —"
+        echo "  допишите конфиг сами по образцу выше, нода останется на прежнем домене до этого."
+        return 0
+    fi
+    if ! nginx_apply_site "$FULL_DOMAIN"; then
         echo "  [СБОЙ] nginx не принял конфиг нового домена."
-        if [[ -n "$old_domain" && -f "/etc/nginx/sites-available/$old_domain" ]]; then
+        if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" ]]; then
             echo "  Возвращаю прежний домен, чтобы нода не осталась без веба..."
-            write_nginx_site "$old_domain" || echo "  [СБОЙ] и прежний конфиг не поднялся — смотрите $SETUP_LOG"
+            nginx_apply_site "$old_domain" || echo "  [СБОЙ] и прежний конфиг не поднялся — смотрите $SETUP_LOG"
             FULL_DOMAIN="$old_domain"
             SUBDOMAIN="${old_domain%%.*}"; DOMAIN="${old_domain#*.}"
         fi
@@ -84,7 +91,7 @@ comp_change_domain() {
     fi
 
     # --- старый сертификат: удаляем только с явного согласия ---
-    if [[ -n "$old_domain" && -d "/etc/letsencrypt/live/$old_domain" && -z "$NONINTERACTIVE" ]]; then
+    if [[ -n "$old_domain" && -d "$LE_LIVE/$old_domain" && -z "$NONINTERACTIVE" ]]; then
         echo
         echo "  Остался сертификат старого домена $old_domain."
         echo "  Его можно удалить, но если планируете вернуться — оставьте."
@@ -97,10 +104,10 @@ comp_change_domain() {
             echo "  Сертификат $old_domain оставлен."
         fi
     fi
-    if [[ -n "$old_domain" && -f "/etc/nginx/sites-available/$old_domain" && -z "$NONINTERACTIVE" ]]; then
-        read -ep "  Удалить старый конфиг nginx /etc/nginx/sites-available/$old_domain? [y/N]: " DELCONF || DELCONF=""
+    if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" && -z "$NONINTERACTIVE" ]]; then
+        read -ep "  Удалить старый конфиг nginx $NGINX_AVAIL/$old_domain? [y/N]: " DELCONF || DELCONF=""
         if [[ "$DELCONF" =~ ^[Yy]$ ]]; then
-            rm -f "/etc/nginx/sites-available/$old_domain"
+            rm -f "$NGINX_AVAIL/$old_domain"
             echo "  Старый конфиг удалён."
         else
             echo "  Старый конфиг оставлен (он отключён и ни на что не влияет)."

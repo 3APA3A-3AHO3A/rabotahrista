@@ -45,6 +45,16 @@ SETUP_LOG="/var/log/node-setup.log"
 REPORT_FILE="/root/node-install-report.txt"
 SSH_PORT="${SSH_PORT:-8422}"
 ADMIN_USER="${ADMIN_USER:-admin}"
+# Каталоги nginx и Let's Encrypt — переменными, чтобы тесты могли подставить
+# временное дерево и проверить логику выбора домена, ничего не трогая в системе.
+NGINX_AVAIL="/etc/nginx/sites-available"
+NGINX_ENABLED="/etc/nginx/sites-enabled"
+LE_LIVE="/etc/letsencrypt/live"
+LE_RENEWAL="/etc/letsencrypt/renewal"
+# Метка «этот конфиг nginx писали мы». По ней установщик отличает свой файл от
+# чужого сайта, живущего на той же ноде: чужой не перезаписывается без копии и
+# никогда не снимается с публикации.
+NGINX_MARK="# rabotahrista: конфиг ноды, перезаписывается установщиком"
 # Наш дроп-ин с харденингом SSH. Имя начинается с 01, чтобы читаться раньше
 # большинства чужих файлов; переменной — чтобы путь был в одном месте и чтобы
 # тесты могли подставить свой каталог, не трогая настоящий sshd.

@@ -256,6 +256,16 @@ rh_check() {
         else
             rhc_bad "порт $rhc_np не слушает — панель ноду не увидит"
         fi
+        # На нодах, где Docker стоял раньше установщика, учётка оставалась вне
+        # группы docker: команды работали только через sudo.
+        if [[ -n "${ADMIN_USER:-}" ]] && id "$ADMIN_USER" &>/dev/null; then
+            if id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+                rhc_ok "$ADMIN_USER в группе docker — docker ps работает без sudo"
+            else
+                rhc_warn "$ADMIN_USER не в группе docker — docker ps ответит permission denied"
+                rhc_fix "docker: меню, пункт 4 (починка); применится в новой сессии SSH"
+            fi
+        fi
     else
         rhc_bad "docker не установлен"
     fi
@@ -265,7 +275,7 @@ rh_check() {
     # ----------------------------------------------------------------------
     local rhc_full rhc_certdir rhc_cn rhc_end rhc_days rhc_ngx rhc_auth rhc_enabled
     rhc_full="${SUBDOMAIN:-}${SUBDOMAIN:+.}${DOMAIN:-}"
-    rhc_certdir=$(ls -d /etc/letsencrypt/live/*/ 2>/dev/null | head -1)
+    rhc_certdir=$(ls -d "$LE_LIVE"/*/ 2>/dev/null | head -1)
     if [[ -n "$rhc_certdir" ]]; then
         rhc_cn=$(basename "$rhc_certdir")
         rhc_end=$(openssl x509 -enddate -noout -in "$rhc_certdir/fullchain.pem" 2>/dev/null | cut -d= -f2)
@@ -278,7 +288,7 @@ rh_check() {
             rhc_bad "сертификат $rhc_cn ПРОСРОЧЕН"
         fi
 
-        rhc_ngx="/etc/nginx/sites-available/${rhc_full:-$rhc_cn}"
+        rhc_ngx="$NGINX_AVAIL/${rhc_full:-$rhc_cn}"
         if [[ -f "$rhc_ngx" ]]; then
             if awk '/listen .*8443/,0' "$rhc_ngx" | grep -q 'acme-challenge'; then
                 rhc_ok "в TLS-блоке nginx есть путь для ACME — продление по HTTPS пройдёт"
@@ -288,8 +298,19 @@ rh_check() {
                 rhc_fix "сертификат: меню, пункт 4 (починка) — перезапишет конфиг nginx правильно"
             fi
         fi
-        rhc_auth=$(grep -h '^authenticator' /etc/letsencrypt/renewal/*.conf 2>/dev/null | head -1 | awk '{print $3}')
-        rhc_info "способ продления: ${rhc_auth:-неизвестен}"
+        rhc_auth=$(awk -F= '/^authenticator/{gsub(/ /,"",$2); print $2; exit}' \
+                   "$LE_RENEWAL/$rhc_cn.conf" 2>/dev/null)
+        if [[ "$rhc_auth" == "webroot" ]]; then
+            rhc_ok "продление через webroot — конфиг nginx при этом не трогается"
+        elif [[ -z "$rhc_auth" ]]; then
+            rhc_warn "не нашёл настройки продления ($LE_RENEWAL/$rhc_cn.conf)"
+        else
+            rhc_warn "продление настроено через «$rhc_auth», а не webroot"
+            rhc_info "так делали ранние версии установщика: плагин nginx на время проверки"
+            rhc_info "сам правит конфиг, а за «Always Use HTTPS» в Cloudflare может не сработать"
+            rhc_fix "продление: проверьте пунктом 5 меню (настоящий dry-run), и если красный —"
+            rhc_fix "  sudo certbot certonly --webroot -w /var/lib/letsencrypt --cert-name $rhc_cn -d $rhc_cn --keep-until-expiring"
+        fi
     else
         rhc_warn "сертификатов Let's Encrypt не найдено"
     fi
@@ -300,10 +321,52 @@ rh_check() {
         else
             rhc_bad "nginx работает, но конфиг невалиден (nginx -t)"
         fi
-        rhc_enabled=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | wc -l)
-        [[ "$rhc_enabled" -gt 1 ]] && rhc_warn "в sites-enabled $rhc_enabled конфигов — возможен конфликт default_server"
     else
         rhc_bad "nginx не запущен"
+    fi
+
+    # Сайты перечисляем поимённо и отмечаем свои. На ноде может жить ещё один
+    # сайт — установщик его не трогает, но знать о нём полезно: именно из-за
+    # соседнего домена он однажды выбрал не тот конфиг.
+    local rhc_site rhc_name rhc_defs=""
+    rhc_enabled=0
+    for rhc_site in "$NGINX_ENABLED"/*; do
+        [[ -e "$rhc_site" ]] || continue
+        rhc_name=$(basename "$rhc_site")
+        rhc_enabled=$((rhc_enabled+1))
+        if grep -qF "$NGINX_MARK" "$rhc_site" 2>/dev/null; then
+            rhc_info "сайт $rhc_name — наш (конфиг ноды)"
+        else
+            rhc_info "сайт $rhc_name — не наш, установщик его не трогает"
+        fi
+        grep -qE 'listen[^;]*8443[^;]*default_server' "$rhc_site" 2>/dev/null \
+            && rhc_defs+=" $rhc_name"
+    done
+    if [[ "$rhc_enabled" -eq 0 ]]; then
+        rhc_bad "в sites-enabled пусто — nginx ничего не обслуживает"
+    fi
+    # Их может быть только один на весь nginx, иначе nginx -t падает на duplicate
+    if [[ $(wc -w <<< "$rhc_defs") -gt 1 ]]; then
+        rhc_bad "default_server на 8443 объявлен больше одного раза:$rhc_defs"
+        rhc_fix "nginx: оставить default_server ровно в одном конфиге"
+    fi
+    # Сертификатов больше одного — значит на ноде живёт ещё домен. Сам по себе
+    # это не сбой, но установщик в такой ситуации не должен угадывать.
+    local rhc_certs=""
+    for rhc_site in "$LE_LIVE"/*/; do
+        [[ -d "$rhc_site" ]] && rhc_certs+=" $(basename "$rhc_site")"
+    done
+    if [[ $(wc -w <<< "$rhc_certs") -gt 1 ]]; then
+        rhc_info "сертификатов на ноде несколько: $rhc_certs"
+        rhc_info "домен ноды берётся из install.conf — проверьте, что там правильный"
+    fi
+    if [[ -n "$rhc_full" ]]; then
+        if [[ -e "$NGINX_ENABLED/$rhc_full" ]]; then
+            rhc_ok "конфиг ноды $rhc_full опубликован"
+        else
+            rhc_bad "конфиг ноды $rhc_full НЕ опубликован (нет ссылки в sites-enabled)"
+            rhc_fix "nginx: ln -sf ${NGINX_AVAIL}/$rhc_full ${NGINX_ENABLED}/"
+        fi
     fi
 
     if [[ -n "$rhc_deep" ]] && command -v certbot >/dev/null 2>&1 && [[ -n "$rhc_certdir" ]]; then

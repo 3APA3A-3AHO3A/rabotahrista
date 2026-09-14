@@ -9,13 +9,36 @@ port_is_listening() {
     ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$1"
 }
 
+# Без группы docker обычный пользователь получает "permission denied" на
+# /var/run/docker.sock и вынужден писать sudo перед каждой командой. Прав это
+# не добавляет: у админ-учётки и так sudo без пароля — только удобство.
+# Вынесено отдельно, потому что на старых нодах Docker уже стоит, и раньше
+# comp_docker в этом случае выходил сразу, не дойдя до usermod.
+docker_group_member() {
+    if [[ -z "${ADMIN_USER:-}" ]] || ! id "$ADMIN_USER" &>/dev/null; then
+        return 0
+    fi
+    if ! getent group docker >/dev/null 2>&1; then
+        echo "  Группы docker нет — пропускаю."
+        return 0
+    fi
+    if id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        echo "  $ADMIN_USER уже в группе docker."
+        return 0
+    fi
+    usermod -aG docker "$ADMIN_USER"
+    echo "  $ADMIN_USER добавлен в группу docker — подхватится в НОВОЙ сессии SSH."
+    return 0
+}
+
 comp_docker() {
     echo ">>> Установка Docker..."
     if command -v docker >/dev/null 2>&1; then
         echo "  Docker уже установлен."
-        return 0
+    else
+        curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
     fi
-    curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
+    docker_group_member
 }
 
 node_status() {

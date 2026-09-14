@@ -527,7 +527,305 @@ else
 fi
 
 # --------------------------------------------------------------------------
-head_ "19. shellcheck (если установлен)"
+head_ "19. Домен ноды не угадывается по алфавиту"
+# --------------------------------------------------------------------------
+# Настоящая авария: на ноде, кроме самой ноды, жил сайт gateway.example.com.
+# Домен определялся как «первый сертификат по алфавиту» — и установщик решил,
+# что нода это gateway. Дальше он переписал конфиг соседа своим шаблоном и снял
+# с публикации настоящий конфиг ноды. Nginx на двух серверах чинили руками.
+mk_tree() {                       # $1 — каталог; создаёт пустое дерево nginx/LE
+    mkdir -p "$1/avail" "$1/enabled" "$1/le"
+}
+domain_of() {                     # $1 — каталог дерева; печатает, что определилось
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        NGINX_AVAIL="'"$1"'/avail"; NGINX_ENABLED="'"$1"'/enabled"; LE_LIVE="'"$1"'/le"
+        DOMAIN=""; SUBDOMAIN=""
+        ufw() { :; }; sshd() { :; }; find() { :; }
+        detect_existing_setup >/dev/null 2>&1
+        echo "DOMAIN=${SUBDOMAIN:-}${SUBDOMAIN:+.}${DOMAIN:-} AMBIG=${DOMAIN_AMBIGUOUS:-}"
+    ' 2>&1 || true
+}
+
+T=$(mktemp -d); mk_tree "$T"
+mkdir -p "$T/le/gateway.gugutamd.org" "$T/le/node-nl-1.gugutamd.org"
+: > "$T/avail/node-nl-1.gugutamd.org"
+ln -sf "$T/avail/node-nl-1.gugutamd.org" "$T/enabled/"
+R=$(domain_of "$T")
+if grep -q "DOMAIN=node-nl-1.gugutamd.org" <<< "$R"; then
+    ok "при двух сертификатах домен берётся из включённого конфига, а не по алфавиту"
+else
+    bad "выбран не тот домен: $R"
+fi
+
+# Ничего не включено, сертификатов два — доказательств нет, гадать нельзя
+rm -f "$T/enabled"/*
+R=$(domain_of "$T")
+if grep -q "DOMAIN= " <<< "$R " && grep -q "AMBIG=.*gateway.*node-nl-1" <<< "$R"; then
+    ok "при неоднозначности домен не выбирается, а называются кандидаты"
+else
+    bad "установщик всё равно что-то выбрал: $R"
+fi
+
+# Обычная нода с одним сертификатом должна определяться как раньше
+rm -rf "$T/le/gateway.gugutamd.org"
+R=$(domain_of "$T")
+if grep -q "DOMAIN=node-nl-1.gugutamd.org" <<< "$R"; then
+    ok "с единственным сертификатом домен определяется как прежде"
+else
+    bad "обычный случай сломан: $R"
+fi
+rm -rf "$T"
+
+# --------------------------------------------------------------------------
+head_ "20. Скрипт не правит чужой nginx"
+# --------------------------------------------------------------------------
+# Вторая половина той же аварии: ради единственного default_server на 8443
+# установщик УДАЛЯЛ из sites-enabled всё, где встречалось proxy_protocol.
+# Под это попадал рабочий сайт, к ноде отношения не имеющий. Правило теперь
+# простое: сам, без человека, конфиг пишется только там, где в nginx пусто.
+FOREIGN_CONF='server {
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+server {
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+    server_name gateway.gugutamd.org;
+    root /var/www/gateway;
+}'
+
+in_tree() {   # $1 — каталог дерева, $2 — код на bash
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        NGINX_AVAIL="'"$1"'/avail"; NGINX_ENABLED="'"$1"'/enabled"; LE_LIVE="'"$1"'/le"
+        SETUP_LOG=/dev/null
+        nginx() { return 0; }
+        systemctl() { return 0; }
+        '"$2"'
+    ' 2>&1 || true
+}
+
+# --- чистый сервер: писать можно, ломать нечего ---
+T=$(mktemp -d); mk_tree "$T"
+R=$(in_tree "$T" 'nginx_auto_site "node-nl-1.gugutamd.org"')
+if [[ -s "$T/avail/node-nl-1.gugutamd.org" && -e "$T/enabled/node-nl-1.gugutamd.org" ]]; then
+    ok "на чистом сервере конфиг пишется сам"
+else
+    bad "на чистом сервере конфиг не записан:"; sed 's/^/      /' <<< "$R"
+fi
+rm -rf "$T"
+
+# --- рядом живёт чужой сайт: не трогаем ничего, только советуем ---
+T=$(mktemp -d); mk_tree "$T"
+printf '%s\n' "$FOREIGN_CONF" > "$T/avail/gateway.gugutamd.org"
+ln -sf "$T/avail/gateway.gugutamd.org" "$T/enabled/"
+cp "$T/avail/gateway.gugutamd.org" "$T/before"
+R=$(in_tree "$T" 'nginx_auto_site "node-nl-1.gugutamd.org" || true')
+if [[ -e "$T/enabled/gateway.gugutamd.org" ]] && cmp -s "$T/avail/gateway.gugutamd.org" "$T/before"; then
+    ok "чужой сайт остался на месте и не изменён"
+else
+    bad "установщик тронул чужой сайт:"; sed 's/^/      /' <<< "$R"
+fi
+if [[ ! -e "$T/avail/node-nl-1.gugutamd.org" ]]; then
+    ok "свой конфиг не записан молча — выдана рекомендация"
+else
+    bad "конфиг ноды записан без спроса на сервере с чужим сайтом"
+fi
+if grep -q "КОНФИГ NGINX — РЕКОМЕНДАЦИЯ" <<< "$R"; then
+    ok "напечатан готовый конфиг с командами"
+else
+    bad "рекомендации не было:"; sed 's/^/      /' <<< "$R"
+fi
+# Заглушку default_server держит сосед — свою в рекомендации добавлять нельзя
+R=$(in_tree "$T" 'nginx_render_site "node-nl-1.gugutamd.org"')
+if ! grep -q 'default_server' <<< "$R"; then
+    ok "в рекомендуемом конфиге заглушка не задвоилась"
+else
+    bad "вторая заглушка default_server — nginx такой конфиг не примет"
+fi
+rm -rf "$T"
+
+# --- рекомендация обязана быть только чтением ---
+T=$(mktemp -d); mk_tree "$T"
+printf '%s\n' "$FOREIGN_CONF" > "$T/avail/node-nl-1.gugutamd.org"
+ln -sf "$T/avail/node-nl-1.gugutamd.org" "$T/enabled/"
+BEFORE=$(find "$T" | sort; md5sum "$T"/avail/* 2>/dev/null)
+in_tree "$T" 'nginx_advise "node-nl-1.gugutamd.org"' >/dev/null
+AFTER=$(find "$T" | sort; md5sum "$T"/avail/* 2>/dev/null)
+if [[ "$BEFORE" == "$AFTER" ]]; then
+    ok "рекомендация не меняет ни одного файла"
+else
+    bad "nginx_advise что-то изменил"
+fi
+rm -rf "$T"
+
+# --- починка к nginx не прикасается вовсе ---
+REP=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/dev/null; NONINTERACTIVE=1
+    SUBDOMAIN="node-nl-1"; DOMAIN="gugutamd.org"
+    SUMMARY=()
+    repair_perms() { return 0; }
+    repair_ssh_hardening() { return 0; }
+    repair_verify() { return 0; }
+    comp_telegram() { return 0; }
+    comp_panel_watch() { return 0; }
+    save_state() { return 0; }
+    nginx_apply_site() { echo "ПИСАЛ КОНФИГ"; }
+    comp_web() { echo "ПИСАЛ КОНФИГ"; }
+    run_repair
+' 2>&1 || true)
+if grep -q "ПИСАЛ КОНФИГ" <<< "$REP"; then
+    bad "автоматическая починка правит nginx:"; sed 's/^/      /' <<< "$REP"
+elif grep -q "КОНФИГ NGINX — РЕКОМЕНДАЦИЯ" <<< "$REP" && grep -q "ИТОГ ПОЧИНКИ" <<< "$REP"; then
+    ok "починка nginx не трогает, печатает рекомендацию и доходит до конца"
+else
+    bad "починка ни рекомендации, ни правки:"; sed 's/^/      /' <<< "$REP"
+fi
+
+# --- ручная правка спрашивает подтверждение ---
+T=$(mktemp -d); mk_tree "$T"
+ASK=$(printf 'n\n' | RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    NGINX_AVAIL="'"$T"'/avail"; NGINX_ENABLED="'"$T"'/enabled"; LE_LIVE="'"$T"'/le"
+    SETUP_LOG=/dev/null; NONINTERACTIVE=""
+    FULL_DOMAIN="node-nl-1.gugutamd.org"
+    nginx() { return 0; }; systemctl() { return 0; }
+    comp_web_nginx
+' 2>&1 || true)
+if [[ -e "$T/avail/node-nl-1.gugutamd.org" ]]; then
+    bad "ручная правка записала конфиг, хотя ответили «нет»:"; sed 's/^/      /' <<< "$ASK"
+elif grep -q "Ничего не изменено" <<< "$ASK"; then
+    ok "на «нет» ручная правка ничего не пишет"
+else
+    bad "ручная правка не спросила:"; sed 's/^/      /' <<< "$ASK"
+fi
+ASK=$(printf 'y\n' | RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    NGINX_AVAIL="'"$T"'/avail"; NGINX_ENABLED="'"$T"'/enabled"; LE_LIVE="'"$T"'/le"
+    SETUP_LOG=/dev/null; NONINTERACTIVE=""
+    FULL_DOMAIN="node-nl-1.gugutamd.org"
+    nginx() { return 0; }; systemctl() { return 0; }
+    comp_web_nginx
+' 2>&1 || true)
+if [[ -s "$T/avail/node-nl-1.gugutamd.org" ]]; then
+    ok "на «да» конфиг записывается"
+else
+    bad "подтверждение не применило конфиг:"; sed 's/^/      /' <<< "$ASK"
+fi
+rm -rf "$T"
+
+# --- файл без нашей метки копируется перед перезаписью ---
+T=$(mktemp -d); mk_tree "$T"
+echo "чужой конфиг, написанный руками" > "$T/avail/node-nl-1.gugutamd.org"
+in_tree "$T" 'nginx_apply_site "node-nl-1.gugutamd.org"' >/dev/null
+if grep -qr "чужой конфиг, написанный руками" "$T/avail"/*.bak.* 2>/dev/null; then
+    ok "перед перезаписью остаётся копия"
+else
+    bad "конфиг затёрт без копии"
+fi
+BAKS=$(ls "$T/avail"/*.bak.* 2>/dev/null | wc -l)
+in_tree "$T" 'nginx_apply_site "node-nl-1.gugutamd.org"' >/dev/null
+if [[ "$(ls "$T/avail"/*.bak.* 2>/dev/null | wc -l)" -eq "$BAKS" ]]; then
+    ok "свой конфиг перезаписывается без лишних копий"
+else
+    bad "копии плодятся при каждом запуске"
+fi
+rm -rf "$T"
+
+# --- сертификат не выпускается, пока ACME-путь не отдаётся ---
+CERT=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/dev/null; NONINTERACTIVE=1
+    DOMAIN="gugutamd.org"; SUBDOMAIN="node-nl-1"; SETUP_CF="n"
+    SERVER_IP="1.2.3.4"
+    get_server_ip() { return 0; }
+    wget() { return 0; }; mkdir() { return 0; }
+    nginx_write_safety() { echo "foreign"; }
+    acme_reachable() { return 1; }
+    certbot() { echo "ВЫПУСКАЛ СЕРТИФИКАТ"; }
+    nginx_advise() { echo "(рекомендация)"; }
+    cf_restore_proxy() { return 0; }
+    comp_web || true
+' 2>&1 || true)
+if grep -q "ВЫПУСКАЛ СЕРТИФИКАТ" <<< "$CERT"; then
+    bad "certbot зовётся, хотя ACME-путь не отдаётся:"; sed 's/^/      /' <<< "$CERT"
+else
+    ok "без рабочего ACME-пути сертификат не выпускается"
+fi
+
+# Временного конфига 00-acme больше нет: раньше он вешал на 80 порт
+# default_server и снимал ссылку на default — то есть правил чужой nginx.
+if grep -q 'acme_serve_start\|acme_serve_stop' lib/*.sh; then
+    bad "вернулся временный ACME-конфиг, который правит nginx ради выпуска"
+else
+    ok "выпуск сертификата обходится без правки nginx"
+fi
+
+# --------------------------------------------------------------------------
+head_ "21. Группа docker у админ-учётки"
+# --------------------------------------------------------------------------
+# На ноде, где Docker стоял ДО установщика, comp_docker выходил сразу после
+# "Docker уже установлен" и не доходил до usermod. Пользователь получал
+# permission denied на /var/run/docker.sock, а диагностика молчала.
+dg() {   # $1 — группы пользователя; печатает, что сделала функция
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        ADMIN_USER="vadim"
+        id() { [[ "$1" == "-nG" ]] && echo "'"$1"'"; return 0; }
+        getent() { return 0; }
+        usermod() { echo "USERMOD: $*"; }
+        docker_group_member
+    ' 2>&1 || true
+}
+R=$(dg "vadim sudo")
+if grep -q "USERMOD: -aG docker vadim" <<< "$R"; then
+    ok "учётку без группы docker добавляют в группу"
+else
+    bad "в группу docker не добавили: $R"
+fi
+R=$(dg "vadim sudo docker")
+if grep -q "USERMOD" <<< "$R"; then
+    bad "usermod зовётся повторно, хотя пользователь уже в группе: $R"
+else
+    ok "повторно в группу не добавляют"
+fi
+
+# Docker уже установлен — это НЕ повод пропустить группу
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/dev/null
+    command() { [[ "${2:-}" == "docker" ]] && return 0; return 1; }
+    docker_group_member() { echo "ГРУППА ПРОВЕРЕНА"; }
+    comp_docker
+' 2>&1 || true)
+if grep -q "ГРУППА ПРОВЕРЕНА" <<< "$R"; then
+    ok "при уже установленном Docker группа всё равно проверяется"
+else
+    bad "comp_docker выходит, не проверив группу:"; sed 's/^/      /' <<< "$R"
+fi
+
+# И починка обязана это чинить: на старых нодах это типовая находка
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/dev/null; NONINTERACTIVE=1
+    SUBDOMAIN="n1"; DOMAIN="example.com"; SUMMARY=()
+    repair_perms() { return 0; }; repair_ssh_hardening() { return 0; }
+    repair_verify() { return 0; }; comp_telegram() { return 0; }
+    comp_panel_watch() { return 0; }; save_state() { return 0; }
+    nginx_advise() { return 0; }
+    docker_group_member() { echo "ЧИНИЛ ГРУППУ"; }
+    run_repair
+' 2>&1 || true)
+if grep -q "ЧИНИЛ ГРУППУ" <<< "$R"; then
+    ok "починка проверяет группу docker"
+else
+    bad "починка не трогает группу docker"
+fi
+
+# --------------------------------------------------------------------------
+head_ "22. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then

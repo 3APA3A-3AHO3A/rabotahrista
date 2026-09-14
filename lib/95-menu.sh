@@ -57,7 +57,8 @@ components_menu() {
     while true; do
         echo -e "\n===== Компоненты (доустановить / переустановить) ====="
         echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
-        echo " 4) Веб (заглушка+серт)    5) UFW             6) Sysctl-тюнинг"
+        echo " 4) Веб: серт + конфиг nginx (покажет и спросит)"
+        echo " 5) UFW                    6) Sysctl-тюнинг"
         echo " 7) Swap                   8) Юзер + SSH-харденинг   9) Speedtest"
         echo "10) IPv6 off (GRUB)"
         echo "--- Безопасность / обслуживание ---"
@@ -74,7 +75,7 @@ components_menu() {
              1) menu_step "Cloudflare WARP"      comp_warp ;;
              2) menu_step "Docker"               comp_docker ;;
              3) menu_step "Нода (передеплой)"    comp_node ;;
-             4) menu_step "Веб (заглушка+серт)"  comp_web ;;
+             4) menu_step "Веб (серт + конфиг nginx)" comp_web_menu ;;
              5) menu_step "UFW"                  comp_ufw ;;
              6) menu_step "Sysctl-тюнинг"        comp_sysctl ;;
              7) menu_step "Swap"                 comp_swap ;;

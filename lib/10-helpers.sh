@@ -95,7 +95,7 @@ print_summary() {
         row "Полный лог:" "$SETUP_LOG"
         row "Ответы установки:" "$INSTALL_STATE"
         row "Compose ноды:" "/opt/remnanode/docker-compose.yml"
-        row "Конфиг nginx:" "/etc/nginx/sites-available/${FULL_DOMAIN:-—}"
+        row "Конфиг nginx:" "$NGINX_AVAIL/${FULL_DOMAIN:-—}"
         [[ -f "$NOTIFY_ENV" ]] && row "Telegram:" "$NOTIFY_ENV"
         echo "=========================================="
     )

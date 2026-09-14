@@ -51,6 +51,16 @@ SETUP_LOG="/var/log/node-setup.log"
 REPORT_FILE="/root/node-install-report.txt"
 SSH_PORT="${SSH_PORT:-8422}"
 ADMIN_USER="${ADMIN_USER:-admin}"
+# Каталоги nginx и Let's Encrypt — переменными, чтобы тесты могли подставить
+# временное дерево и проверить логику выбора домена, ничего не трогая в системе.
+NGINX_AVAIL="/etc/nginx/sites-available"
+NGINX_ENABLED="/etc/nginx/sites-enabled"
+LE_LIVE="/etc/letsencrypt/live"
+LE_RENEWAL="/etc/letsencrypt/renewal"
+# Метка «этот конфиг nginx писали мы». По ней установщик отличает свой файл от
+# чужого сайта, живущего на той же ноде: чужой не перезаписывается без копии и
+# никогда не снимается с публикации.
+NGINX_MARK="# rabotahrista: конфиг ноды, перезаписывается установщиком"
 # Наш дроп-ин с харденингом SSH. Имя начинается с 01, чтобы читаться раньше
 # большинства чужих файлов; переменной — чтобы путь был в одном месте и чтобы
 # тесты могли подставить свой каталог, не трогая настоящий sshd.
@@ -184,7 +194,7 @@ print_summary() {
         row "Полный лог:" "$SETUP_LOG"
         row "Ответы установки:" "$INSTALL_STATE"
         row "Compose ноды:" "/opt/remnanode/docker-compose.yml"
-        row "Конфиг nginx:" "/etc/nginx/sites-available/${FULL_DOMAIN:-—}"
+        row "Конфиг nginx:" "$NGINX_AVAIL/${FULL_DOMAIN:-—}"
         [[ -f "$NOTIFY_ENV" ]] && row "Telegram:" "$NOTIFY_ENV"
         echo "=========================================="
     )
@@ -473,17 +483,40 @@ get_server_ip() {
 detect_existing_setup() {
     local v
 
-    # Домен — из выпущенного сертификата, иначе из включённого конфига nginx
+    # Домен ноды.
+    #
+    # Раньше здесь стояло "первый сертификат по алфавиту". На ноде, где живёт
+    # ещё один сайт, это выбирало ЧУЖОЙ домен: gateway.example.com сортируется
+    # раньше node-nl-1.example.com. Дальше починка переписывала конфиг соседа
+    # шаблоном ноды и снимала с публикации настоящий конфиг ноды.
+    #
+    # Поэтому теперь: берём только то, что можно доказать, а при неоднозначности
+    # честно ничего не выбираем и говорим об этом.
+    DOMAIN_AMBIGUOUS=""
     if [[ -z "${DOMAIN:-}${SUBDOMAIN:-}" ]]; then
-        v=$(ls -d /etc/letsencrypt/live/*/ 2>/dev/null | head -1)
-        [[ -n "$v" ]] && v=$(basename "$v")
-        if [[ -z "$v" ]]; then
-            v=$(find /etc/nginx/sites-enabled -maxdepth 1 \( -type l -o -type f \) \
-                -printf '%f\n' 2>/dev/null | grep -v '^default$' | head -1)
+        local cand=() f b
+        # Кандидат первого сорта: включённый конфиг nginx, у которого есть
+        # собственный сертификат. Это и есть работающий сайт.
+        for f in "$NGINX_ENABLED"/*; do
+            [[ -e "$f" ]] || continue
+            b=$(basename "$f")
+            [[ "$b" == "default" || "$b" == "00-acme" ]] && continue
+            [[ "$b" == *.*.* && -d "$LE_LIVE/$b" ]] || continue
+            cand+=("$b")
+        done
+        # Ничего не включено — смотрим на выпущенные сертификаты.
+        if [[ ${#cand[@]} -eq 0 ]]; then
+            for f in "$LE_LIVE"/*/; do
+                [[ -d "$f" ]] || continue
+                b=$(basename "$f")
+                [[ "$b" == *.*.* ]] && cand+=("$b")
+            done
         fi
-        if [[ "$v" == *.*.* ]]; then
-            SUBDOMAIN="${v%%.*}"
-            DOMAIN="${v#*.}"
+        if [[ ${#cand[@]} -eq 1 ]]; then
+            SUBDOMAIN="${cand[0]%%.*}"
+            DOMAIN="${cand[0]#*.}"
+        elif [[ ${#cand[@]} -gt 1 ]]; then
+            DOMAIN_AMBIGUOUS="${cand[*]}"
         fi
     fi
 
@@ -1080,13 +1113,36 @@ port_is_listening() {
     ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$1"
 }
 
+# Без группы docker обычный пользователь получает "permission denied" на
+# /var/run/docker.sock и вынужден писать sudo перед каждой командой. Прав это
+# не добавляет: у админ-учётки и так sudo без пароля — только удобство.
+# Вынесено отдельно, потому что на старых нодах Docker уже стоит, и раньше
+# comp_docker в этом случае выходил сразу, не дойдя до usermod.
+docker_group_member() {
+    if [[ -z "${ADMIN_USER:-}" ]] || ! id "$ADMIN_USER" &>/dev/null; then
+        return 0
+    fi
+    if ! getent group docker >/dev/null 2>&1; then
+        echo "  Группы docker нет — пропускаю."
+        return 0
+    fi
+    if id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        echo "  $ADMIN_USER уже в группе docker."
+        return 0
+    fi
+    usermod -aG docker "$ADMIN_USER"
+    echo "  $ADMIN_USER добавлен в группу docker — подхватится в НОВОЙ сессии SSH."
+    return 0
+}
+
 comp_docker() {
     echo ">>> Установка Docker..."
     if command -v docker >/dev/null 2>&1; then
         echo "  Docker уже установлен."
-        return 0
+    else
+        curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
     fi
-    curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
+    docker_group_member
 }
 
 node_status() {
@@ -1194,41 +1250,37 @@ cf_restore_proxy() {
     return 0
 }
 
-# Временный конфиг nginx, который отдаёт только ACME-челлендж
-ACME_SITE="/etc/nginx/sites-available/00-acme"
+# ##########################################################################
+#  NGINX — ПРАВИЛА ИГРЫ
+#
+#  Установщик считает nginx чужой территорией. Поводом стала авария: он
+#  неверно определил домен ноды, переписал конфиг соседнего сайта своим
+#  шаблоном и снял с публикации настоящий конфиг ноды. Чинили руками.
+#
+#  Теперь так:
+#    * автоматическая починка (--repair, пункт 4 меню) nginx НЕ ТРОГАЕТ
+#      вообще — только печатает, что и как поправить;
+#    * ручная правка (пункт 2 -> 4 меню, смена домена) сначала показывает
+#      готовый конфиг целиком и спрашивает подтверждение;
+#    * сам, без спроса, конфиг пишется в одном случае — когда в nginx для
+#      этого домена ещё ничего нет и других сайтов тоже нет. Ломать нечего.
+# ##########################################################################
 
-acme_serve_start() {
+# Каталог, из которого отдаётся ACME-челлендж. Файлы сюда кладёт certbot,
+# а отдаёт их nginx — той самой location, которую мы рекомендуем прописать.
+acme_prepare_webroot() {
     mkdir -p /var/lib/letsencrypt/.well-known/acme-challenge
     chown -R www-data:www-data /var/lib/letsencrypt/.well-known 2>/dev/null || true
     chmod -R 755 /var/lib/letsencrypt/.well-known
-    cat > "$ACME_SITE" <<'EOF'
-server {
-    listen 80 default_server;
-    server_name _;
-    location /.well-known/acme-challenge/ {
-        root /var/lib/letsencrypt/;
-        default_type "text/plain";
-    }
-    location / { return 404; }
+    return 0
 }
-EOF
-    rm -f /etc/nginx/sites-enabled/default
-    ln -sf "$ACME_SITE" /etc/nginx/sites-enabled/00-acme
-    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
-        echo "  [СБОЙ] временный ACME-конфиг nginx не прошёл проверку (см. $SETUP_LOG)"
-        rm -f /etc/nginx/sites-enabled/00-acme
-        return 1
-    fi
-    systemctl restart nginx >>"$SETUP_LOG" 2>&1
-}
-
-acme_serve_stop() { rm -f /etc/nginx/sites-enabled/00-acme "$ACME_SITE"; }
 
 # Проверяем не «совпадает ли IP», а то, что реально нужно Let's Encrypt:
 # доходит ли запрос к /.well-known/acme-challenge/ до ЭТОГО сервера.
 # За оранжевым облаком Cloudflare IP никогда не совпадёт — и это нормально.
 acme_reachable() {
     local token file url got i
+    acme_prepare_webroot
     token="rh-$(date +%s)-$RANDOM"
     file="/var/lib/letsencrypt/.well-known/acme-challenge/$token"
     echo "$token" > "$file"; chmod 644 "$file"
@@ -1253,38 +1305,100 @@ acme_reachable() {
     return 1
 }
 
-# Пишет конфиг nginx для домена, включает его и перезапускает nginx.
-# Вынесено в функцию, потому что этим же занимается смена домена (lib/75-domain.sh):
-# две копии шаблона рано или поздно разъедутся.
-write_nginx_site() {
-    local dom="$1"
-    echo ">>> Конфиг nginx для $dom..."
-    cat <<EOF > "/etc/nginx/sites-available/$dom"
+# Наш ли это конфиг. Метку добавили не сразу, поэтому файлы прежних версий
+# узнаём по двум приметам шаблона: заглушка ssl_reject_handshake и корень
+# /var/www/stub. Всё остальное — чужое, и мы к нему не прикасаемся.
+rh_owns_nginx_site() {
+    local f="$1"
+    grep -qF "$NGINX_MARK" "$f" 2>/dev/null && return 0
+    grep -q 'ssl_reject_handshake' "$f" 2>/dev/null \
+        && grep -q '/var/www/stub' "$f" 2>/dev/null && return 0
+    return 1
+}
+
+# Кто, кроме конфига $1, объявляет заглушку default_server на 8443.
+# Она в nginx может быть только одна: вторая — и nginx -t падает на duplicate.
+nginx_other_default() {
+    local dom="$1" link base
+    for link in "$NGINX_ENABLED"/*; do
+        [[ -e "$link" ]] || continue
+        base=$(basename "$link")
+        if [[ "$base" == "$dom" ]]; then continue; fi
+        if grep -qE 'listen[^;]*8443[^;]*default_server' "$link" 2>/dev/null; then
+            echo "$base"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Насколько безопасно писать конфиг самим, без человека:
+#   clean   — файла для домена нет и других сайтов нет: ломать нечего
+#   ours    — файл наш, перезапись его же шаблоном сюрпризом не будет
+#   foreign — файл или соседний сайт чужие: только показываем и советуем
+nginx_write_safety() {
+    local dom="$1" link base
+    local site="$NGINX_AVAIL/$dom"
+    if [[ -f "$site" ]]; then
+        if rh_owns_nginx_site "$site"; then echo "ours"; else echo "foreign"; fi
+        return 0
+    fi
+    for link in "$NGINX_ENABLED"/*; do
+        [[ -e "$link" ]] || continue
+        base=$(basename "$link")
+        if [[ "$base" == "default" ]]; then continue; fi
+        echo "foreign"
+        return 0
+    done
+    echo "clean"
+    return 0
+}
+
+# Единственное место, где живёт шаблон конфига. Печатает его в stdout и
+# ничего не трогает: из этой же функции берётся и текст рекомендации.
+# $2 = http-only — только блок на 80 порту. Он нужен ДО выпуска сертификата:
+# TLS-блок ссылается на файлы, которых ещё нет, и nginx -t на них упадёт.
+nginx_render_site() {
+    local dom="$1" mode="${2:-full}"
+    echo "$NGINX_MARK"
+    cat <<EOF
 server {
     listen 80;
     server_name $dom;
 
     location /.well-known/acme-challenge/ {
         root /var/lib/letsencrypt/;
+        default_type "text/plain";
     }
 
     location / {
         return 301 https://\$host\$request_uri;
     }
 }
+EOF
+    if [[ "$mode" == "http-only" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$(nginx_other_default "$dom")" ]]; then
+        cat <<'EOF'
 
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
     server_name _;
     ssl_reject_handshake on;
 }
+EOF
+    fi
+
+    cat <<EOF
 
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name $dom;
 
-    ssl_certificate /etc/letsencrypt/live/$dom/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$dom/privkey.pem;
+    ssl_certificate ${LE_LIVE}/$dom/fullchain.pem;
+    ssl_certificate_key ${LE_LIVE}/$dom/privkey.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
@@ -1311,26 +1425,128 @@ server {
     }
 }
 EOF
-    rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    # Конфиг прошлой ноды (другой субдомен) содержит такой же default_server на
-    # 127.0.0.1:8443 — nginx -t упадёт на duplicate. Снимаем всё лишнее.
-    local link
-    for link in /etc/nginx/sites-enabled/*; do
-        [[ -e "$link" ]] || continue
-        [[ "$(basename "$link")" == "$dom" ]] && continue
-        grep -q 'proxy_protocol' "$link" 2>/dev/null && rm -f "$link"
-    done
-    ln -sf "/etc/nginx/sites-available/$dom" /etc/nginx/sites-enabled/
-    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
-        echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"
-        return 1
+    return 0
+}
+
+# Что сейчас с конфигом этого домена. Только читает.
+nginx_report_state() {
+    local dom="$1" other
+    local site="$NGINX_AVAIL/$dom"
+    echo "  Домен ноды:  $dom"
+    if [[ ! -f "$site" ]]; then
+        echo "  Конфиг:      $site — НЕТ"
+    elif rh_owns_nginx_site "$site"; then
+        echo "  Конфиг:      $site — есть, наш"
+    else
+        echo "  Конфиг:      $site — есть, писали НЕ мы (трогать не буду)"
     fi
-    systemctl restart nginx >>"$SETUP_LOG" 2>&1
-    if ! systemctl is-active --quiet nginx; then
-        echo "  [СБОЙ] nginx не запустился (см. $SETUP_LOG)"
-        return 1
+    if [[ -e "$NGINX_ENABLED/$dom" ]]; then
+        echo "  Публикация:  включён"
+    else
+        echo "  Публикация:  ВЫКЛЮЧЕН (ссылки в sites-enabled нет)"
+    fi
+    if [[ -f "$site" ]] && ! awk '/listen .*8443/,0' "$site" 2>/dev/null | grep -q 'acme-challenge'; then
+        echo "  ACME в TLS:  НЕТ — продление за «Always Use HTTPS» провалится"
+    fi
+    other=$(nginx_other_default "$dom")
+    if [[ -n "$other" ]]; then
+        echo "  Заглушка:    default_server на 8443 держит $other — свою не добавляю"
     fi
     return 0
+}
+
+# Рекомендация вместо правки. Ничего не меняет — это её единственная задача.
+nginx_advise() {
+    local dom="$1" tmp
+    echo
+    echo "=========================================="
+    echo "  КОНФИГ NGINX — РЕКОМЕНДАЦИЯ"
+    echo "=========================================="
+    nginx_report_state "$dom"
+    echo
+    echo "  Ничего не изменено. Ниже — конфиг, который скрипт считает правильным."
+    echo "  Сверьте со своим и перенесите то, чего не хватает."
+    echo
+    echo "------ $NGINX_AVAIL/$dom ------"
+    nginx_render_site "$dom"
+    echo "------ конец конфига ------"
+    echo
+    tmp=$(mktemp) && nginx_render_site "$dom" > "$tmp" 2>/dev/null || tmp=""
+    if [[ -n "$tmp" && -f "$NGINX_AVAIL/$dom" ]]; then
+        if diff -u "$NGINX_AVAIL/$dom" "$tmp" >/dev/null 2>&1; then
+            echo "  Ваш конфиг уже совпадает с рекомендуемым — править нечего."
+        else
+            echo "  Отличия от того, что лежит сейчас (- ваше, + рекомендуемое):"
+            diff -u "$NGINX_AVAIL/$dom" "$tmp" 2>/dev/null | tail -n +3 | sed 's/^/    /'
+        fi
+        echo
+    fi
+    if [[ -n "$tmp" ]]; then rm -f "$tmp"; fi
+    echo "  Применить руками:"
+    echo "    sudo nano $NGINX_AVAIL/$dom"
+    echo "    sudo ln -sf $NGINX_AVAIL/$dom $NGINX_ENABLED/"
+    echo "    sudo nginx -t && sudo systemctl reload nginx"
+    echo
+    echo "  Либо дать это сделать скрипту: меню, пункт 2 -> 4 (спросит подтверждение)."
+    echo "=========================================="
+    return 0
+}
+
+# Собственно запись. Зовётся только там, где человек этого явно захотел,
+# либо на сервере, где в nginx ещё ничего нет.
+nginx_apply_site() {
+    local dom="$1" mode="${2:-full}"
+    local site="$NGINX_AVAIL/$dom" backup=""
+    echo ">>> Пишу конфиг nginx для $dom..."
+
+    if [[ -f "$site" ]] && ! grep -qF "$NGINX_MARK" "$site" 2>/dev/null; then
+        backup="$site.bak.$(date +%Y%m%d%H%M%S)"
+        cp -a "$site" "$backup"
+        echo "  Конфиг без нашей метки — сохранил копию: $(basename "$backup")"
+    fi
+
+    nginx_render_site "$dom" "$mode" > "$site"
+    ln -sf "$site" "$NGINX_ENABLED"/
+    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"
+        if [[ -n "$backup" ]]; then
+            cp -a "$backup" "$site"
+            echo "  Вернул прежний конфиг $dom из копии."
+        else
+            rm -f "$NGINX_ENABLED/$dom"
+            echo "  Снял свой конфиг с публикации, чтобы nginx остался рабочим."
+        fi
+        nginx -t >>"$SETUP_LOG" 2>&1 \
+            || echo "  [ВНИМАНИЕ] nginx -t не проходит и после отката — конфиг был сломан ещё до нас."
+        return 1
+    fi
+    systemctl reload nginx >>"$SETUP_LOG" 2>&1 || systemctl restart nginx >>"$SETUP_LOG" 2>&1 || true
+    if ! systemctl is-active --quiet nginx; then
+        echo "  [СБОЙ] nginx не работает после применения (см. $SETUP_LOG)"
+        return 1
+    fi
+    echo "  Готово: конфиг записан и опубликован."
+    return 0
+}
+
+# Что делает полная установка. Вопросов не задаёт — их задают заранее.
+nginx_auto_site() {
+    local dom="$1" safety
+    if [[ -n "${NGINX_MENU:-}" ]]; then
+        return 0                      # в меню конфиг показывают и спрашивают отдельно
+    fi
+    safety=$(nginx_write_safety "$dom")
+    case "$safety" in
+        clean|ours)
+            nginx_apply_site "$dom"
+            return $?
+            ;;
+        *)
+            echo "  В nginx уже есть конфиги, написанные не нами — не трогаю."
+            nginx_advise "$dom"
+            return 1
+            ;;
+    esac
 }
 
 comp_web() {
@@ -1380,40 +1596,68 @@ comp_web() {
     fi
 
     echo ">>> Выпуск SSL..."
-    if [ -d "/etc/letsencrypt/live/$FULL_DOMAIN" ]; then
+    if [ -d "$LE_LIVE/$FULL_DOMAIN" ]; then
         echo "  Сертификат уже есть, пропускаем."
     else
-        acme_serve_start || return 1
+        # Раньше на время выпуска подкладывался временный конфиг с
+        # "listen 80 default_server" и снималась ссылка на default — то есть
+        # ради сертификата правился чужой nginx. Больше так не делаем:
+        # HTTP-часть своего конфига публикуется только на чистом сервере.
+        if [[ "$(nginx_write_safety "$FULL_DOMAIN")" == "clean" ]]; then
+            nginx_apply_site "$FULL_DOMAIN" http-only || { cf_restore_proxy; return 1; }
+        fi
         if ! acme_reachable; then
-            echo "  [ВНИМАНИЕ] ACME-проверка не дошла до сервера. Возможные причины:"
-            echo "    - A-запись $FULL_DOMAIN ведёт на другой сервер (сейчас: ${ACME_RESOLVED:-ПУСТО}, здесь: $SERVER_IP)"
-            echo "    - порт 80 закрыт (проверь: ufw status | grep 80)"
-            echo "    - в Cloudflare включено правило, ломающее /.well-known/acme-challenge/"
-            # Спросить заранее нельзя — ответ зависит от результата проверки,
-            # а останавливать установку вопросом мы не имеем права. Поэтому
-            # пробуем: проверка бывает ложноотрицательной (сервер не всегда
-            # достаёт собственный внешний адрес), а неудачная попытка certbot
-            # ничего не ломает — шаг просто пометится сбоем.
-            echo "  Пробую выпустить сертификат несмотря на это."
+            echo "  [СБОЙ] ACME-путь снаружи не отдаётся — сертификат не выпускаю."
+            echo "         Причины: A-запись ведёт на другой сервер (сейчас ${ACME_RESOLVED:-ПУСТО}, здесь ${SERVER_IP:-?}),"
+            echo "         закрыт порт 80, или в nginx нет отдачи /.well-known/acme-challenge/."
+            echo "         Нужный кусок конфига — ниже."
+            nginx_advise "$FULL_DOMAIN"
+            cf_restore_proxy
+            return 1
         fi
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \
                 --keep-until-expiring >>"$SETUP_LOG" 2>&1; then
-            acme_serve_stop
             echo "  [СБОЙ] Certbot не выпустил сертификат (см. $SETUP_LOG)"
             cf_restore_proxy
             return 1
         fi
-        acme_serve_stop
     fi
 
-    if ! write_nginx_site "$FULL_DOMAIN"; then
+    if ! nginx_auto_site "$FULL_DOMAIN"; then
         cf_restore_proxy
         return 1
     fi
 
     cf_restore_proxy
     return 0
+}
+
+# Пункт меню «Веб». Из full_install не вызывается, поэтому здесь можно и нужно
+# спрашивать: показываем готовый конфиг, отличия от текущего — и ждём "y".
+comp_web_nginx() {
+    local dom="${FULL_DOMAIN:-}" ans
+    if [[ -z "$dom" ]]; then
+        ask_domain; ask_subdomain
+        dom="${SUBDOMAIN}.${DOMAIN}"
+    fi
+    nginx_advise "$dom"
+    if [[ -n "$NONINTERACTIVE" ]]; then
+        echo "  Автоматический режим — конфиг не трогаю."
+        return 0
+    fi
+    read -ep "  Записать этот конфиг и перезапустить nginx? [y/N]: " ans || ans=""
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo "  Ничего не изменено."
+        return 0
+    fi
+    nginx_apply_site "$dom"
+}
+
+comp_web_menu() {
+    local NGINX_MENU=1
+    comp_web || echo "  (шаг сертификата завершился с ошибкой — конфиг всё равно покажу)"
+    comp_web_nginx
 }
 
 # ===== lib/75-domain.sh ================================================
@@ -1453,17 +1697,16 @@ comp_change_domain() {
     get_server_ip || true
 
     # --- сертификат для нового домена ---
-    if [[ -d "/etc/letsencrypt/live/$FULL_DOMAIN" ]]; then
+    if [[ -d "$LE_LIVE/$FULL_DOMAIN" ]]; then
         echo "  Сертификат для $FULL_DOMAIN уже есть, выпускать не нужно."
     else
-        acme_serve_start || return 1
         if ! acme_reachable; then
             echo "  [ВНИМАНИЕ] ACME-проверка не дошла до сервера."
-            echo "    Проверьте A-запись $FULL_DOMAIN и что порт 80 открыт."
+            echo "    Проверьте A-запись $FULL_DOMAIN, порт 80 и отдачу"
+            echo "    /.well-known/acme-challenge/ в nginx для нового домена."
             if [[ -z "$NONINTERACTIVE" ]]; then
                 read -ep "  Пробовать выпустить сертификат всё равно? [y/N]: " TRY || TRY=""
                 if [[ ! "$TRY" =~ ^[Yy]$ ]]; then
-                    acme_serve_stop
                     echo "  [СБОЙ] Смена домена отменена, ничего не изменено."
                     return 1
                 fi
@@ -1472,20 +1715,28 @@ comp_change_domain() {
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \
                 --keep-until-expiring >>"$SETUP_LOG" 2>&1; then
-            acme_serve_stop
             echo "  [СБОЙ] Certbot не выпустил сертификат для $FULL_DOMAIN (см. $SETUP_LOG)"
             echo "         Нода осталась на прежнем домене, ничего не сломано."
             return 1
         fi
-        acme_serve_stop
     fi
 
-    # --- конфиг nginx (тот же шаблон, что при установке) ---
-    if ! write_nginx_site "$FULL_DOMAIN"; then
+    # --- конфиг nginx: показываем и ждём подтверждения ---
+    nginx_advise "$FULL_DOMAIN"
+    local APPLY=""
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        read -ep "  Записать конфиг нового домена и перезапустить nginx? [y/N]: " APPLY || APPLY=""
+    fi
+    if [[ ! "$APPLY" =~ ^[Yy]$ ]]; then
+        echo "  Конфиг nginx не тронут. Сертификат для $FULL_DOMAIN уже выпущен —"
+        echo "  допишите конфиг сами по образцу выше, нода останется на прежнем домене до этого."
+        return 0
+    fi
+    if ! nginx_apply_site "$FULL_DOMAIN"; then
         echo "  [СБОЙ] nginx не принял конфиг нового домена."
-        if [[ -n "$old_domain" && -f "/etc/nginx/sites-available/$old_domain" ]]; then
+        if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" ]]; then
             echo "  Возвращаю прежний домен, чтобы нода не осталась без веба..."
-            write_nginx_site "$old_domain" || echo "  [СБОЙ] и прежний конфиг не поднялся — смотрите $SETUP_LOG"
+            nginx_apply_site "$old_domain" || echo "  [СБОЙ] и прежний конфиг не поднялся — смотрите $SETUP_LOG"
             FULL_DOMAIN="$old_domain"
             SUBDOMAIN="${old_domain%%.*}"; DOMAIN="${old_domain#*.}"
         fi
@@ -1503,7 +1754,7 @@ comp_change_domain() {
     fi
 
     # --- старый сертификат: удаляем только с явного согласия ---
-    if [[ -n "$old_domain" && -d "/etc/letsencrypt/live/$old_domain" && -z "$NONINTERACTIVE" ]]; then
+    if [[ -n "$old_domain" && -d "$LE_LIVE/$old_domain" && -z "$NONINTERACTIVE" ]]; then
         echo
         echo "  Остался сертификат старого домена $old_domain."
         echo "  Его можно удалить, но если планируете вернуться — оставьте."
@@ -1516,10 +1767,10 @@ comp_change_domain() {
             echo "  Сертификат $old_domain оставлен."
         fi
     fi
-    if [[ -n "$old_domain" && -f "/etc/nginx/sites-available/$old_domain" && -z "$NONINTERACTIVE" ]]; then
-        read -ep "  Удалить старый конфиг nginx /etc/nginx/sites-available/$old_domain? [y/N]: " DELCONF || DELCONF=""
+    if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" && -z "$NONINTERACTIVE" ]]; then
+        read -ep "  Удалить старый конфиг nginx $NGINX_AVAIL/$old_domain? [y/N]: " DELCONF || DELCONF=""
         if [[ "$DELCONF" =~ ^[Yy]$ ]]; then
-            rm -f "/etc/nginx/sites-available/$old_domain"
+            rm -f "$NGINX_AVAIL/$old_domain"
             echo "  Старый конфиг удалён."
         else
             echo "  Старый конфиг оставлен (он отключён и ни на что не влияет)."
@@ -2079,8 +2330,9 @@ run_repair() {
     echo "=========================================="
     echo "  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ"
     echo "=========================================="
-    echo "  Фаервол, контейнер и пакеты не трогаются, перезагрузки не будет."
+    echo "  Фаервол, контейнер, пакеты и nginx не трогаются, перезагрузки не будет."
     echo "  SSH правится, только если харденинг фактически слетел."
+    echo "  По nginx будет только рекомендация — правки там делаете вы."
     echo
 
     FULL_DOMAIN=""
@@ -2093,11 +2345,20 @@ run_repair() {
 
     do_step "Права на файлы с секретами" repair_perms
     do_step "Харденинг SSH (root и пароли)" repair_ssh_hardening
+    do_step "Группа docker у ${ADMIN_USER:-админа}" docker_group_member
 
-    if [[ -n "$FULL_DOMAIN" ]]; then
-        do_step "Конфиг nginx (путь для ACME)" comp_web
+    # nginx автоматическая починка НЕ ТРОГАЕТ. Человек не видит, что именно
+    # правится, а на сервере рядом с нодой может жить чужой сайт — однажды
+    # починка переписала его конфиг и сняла с публикации конфиг ноды.
+    if [[ -n "${DOMAIN_AMBIGUOUS:-}" ]]; then
+        echo "  На ноде несколько доменов: $DOMAIN_AMBIGUOUS"
+        echo "  Какой из них принадлежит ноде — решать вам."
+        skip_step "Конфиг nginx — доменов несколько, разбирайтесь вручную (пункт 2 -> 4)"
+    elif [[ -n "$FULL_DOMAIN" ]]; then
+        nginx_advise "$FULL_DOMAIN" || true
+        skip_step "Конфиг nginx — только рекомендация, ничего не изменено"
     else
-        skip_step "Конфиг nginx — домен не определён, почините через меню (пункт 2 -> 4)"
+        skip_step "Конфиг nginx — домен не определён"
     fi
 
     if [[ -f "$NOTIFY_ENV" ]]; then
@@ -2388,6 +2649,16 @@ rh_check() {
         else
             rhc_bad "порт $rhc_np не слушает — панель ноду не увидит"
         fi
+        # На нодах, где Docker стоял раньше установщика, учётка оставалась вне
+        # группы docker: команды работали только через sudo.
+        if [[ -n "${ADMIN_USER:-}" ]] && id "$ADMIN_USER" &>/dev/null; then
+            if id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+                rhc_ok "$ADMIN_USER в группе docker — docker ps работает без sudo"
+            else
+                rhc_warn "$ADMIN_USER не в группе docker — docker ps ответит permission denied"
+                rhc_fix "docker: меню, пункт 4 (починка); применится в новой сессии SSH"
+            fi
+        fi
     else
         rhc_bad "docker не установлен"
     fi
@@ -2397,7 +2668,7 @@ rh_check() {
     # ----------------------------------------------------------------------
     local rhc_full rhc_certdir rhc_cn rhc_end rhc_days rhc_ngx rhc_auth rhc_enabled
     rhc_full="${SUBDOMAIN:-}${SUBDOMAIN:+.}${DOMAIN:-}"
-    rhc_certdir=$(ls -d /etc/letsencrypt/live/*/ 2>/dev/null | head -1)
+    rhc_certdir=$(ls -d "$LE_LIVE"/*/ 2>/dev/null | head -1)
     if [[ -n "$rhc_certdir" ]]; then
         rhc_cn=$(basename "$rhc_certdir")
         rhc_end=$(openssl x509 -enddate -noout -in "$rhc_certdir/fullchain.pem" 2>/dev/null | cut -d= -f2)
@@ -2410,7 +2681,7 @@ rh_check() {
             rhc_bad "сертификат $rhc_cn ПРОСРОЧЕН"
         fi
 
-        rhc_ngx="/etc/nginx/sites-available/${rhc_full:-$rhc_cn}"
+        rhc_ngx="$NGINX_AVAIL/${rhc_full:-$rhc_cn}"
         if [[ -f "$rhc_ngx" ]]; then
             if awk '/listen .*8443/,0' "$rhc_ngx" | grep -q 'acme-challenge'; then
                 rhc_ok "в TLS-блоке nginx есть путь для ACME — продление по HTTPS пройдёт"
@@ -2420,8 +2691,19 @@ rh_check() {
                 rhc_fix "сертификат: меню, пункт 4 (починка) — перезапишет конфиг nginx правильно"
             fi
         fi
-        rhc_auth=$(grep -h '^authenticator' /etc/letsencrypt/renewal/*.conf 2>/dev/null | head -1 | awk '{print $3}')
-        rhc_info "способ продления: ${rhc_auth:-неизвестен}"
+        rhc_auth=$(awk -F= '/^authenticator/{gsub(/ /,"",$2); print $2; exit}' \
+                   "$LE_RENEWAL/$rhc_cn.conf" 2>/dev/null)
+        if [[ "$rhc_auth" == "webroot" ]]; then
+            rhc_ok "продление через webroot — конфиг nginx при этом не трогается"
+        elif [[ -z "$rhc_auth" ]]; then
+            rhc_warn "не нашёл настройки продления ($LE_RENEWAL/$rhc_cn.conf)"
+        else
+            rhc_warn "продление настроено через «$rhc_auth», а не webroot"
+            rhc_info "так делали ранние версии установщика: плагин nginx на время проверки"
+            rhc_info "сам правит конфиг, а за «Always Use HTTPS» в Cloudflare может не сработать"
+            rhc_fix "продление: проверьте пунктом 5 меню (настоящий dry-run), и если красный —"
+            rhc_fix "  sudo certbot certonly --webroot -w /var/lib/letsencrypt --cert-name $rhc_cn -d $rhc_cn --keep-until-expiring"
+        fi
     else
         rhc_warn "сертификатов Let's Encrypt не найдено"
     fi
@@ -2432,10 +2714,52 @@ rh_check() {
         else
             rhc_bad "nginx работает, но конфиг невалиден (nginx -t)"
         fi
-        rhc_enabled=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | wc -l)
-        [[ "$rhc_enabled" -gt 1 ]] && rhc_warn "в sites-enabled $rhc_enabled конфигов — возможен конфликт default_server"
     else
         rhc_bad "nginx не запущен"
+    fi
+
+    # Сайты перечисляем поимённо и отмечаем свои. На ноде может жить ещё один
+    # сайт — установщик его не трогает, но знать о нём полезно: именно из-за
+    # соседнего домена он однажды выбрал не тот конфиг.
+    local rhc_site rhc_name rhc_defs=""
+    rhc_enabled=0
+    for rhc_site in "$NGINX_ENABLED"/*; do
+        [[ -e "$rhc_site" ]] || continue
+        rhc_name=$(basename "$rhc_site")
+        rhc_enabled=$((rhc_enabled+1))
+        if grep -qF "$NGINX_MARK" "$rhc_site" 2>/dev/null; then
+            rhc_info "сайт $rhc_name — наш (конфиг ноды)"
+        else
+            rhc_info "сайт $rhc_name — не наш, установщик его не трогает"
+        fi
+        grep -qE 'listen[^;]*8443[^;]*default_server' "$rhc_site" 2>/dev/null \
+            && rhc_defs+=" $rhc_name"
+    done
+    if [[ "$rhc_enabled" -eq 0 ]]; then
+        rhc_bad "в sites-enabled пусто — nginx ничего не обслуживает"
+    fi
+    # Их может быть только один на весь nginx, иначе nginx -t падает на duplicate
+    if [[ $(wc -w <<< "$rhc_defs") -gt 1 ]]; then
+        rhc_bad "default_server на 8443 объявлен больше одного раза:$rhc_defs"
+        rhc_fix "nginx: оставить default_server ровно в одном конфиге"
+    fi
+    # Сертификатов больше одного — значит на ноде живёт ещё домен. Сам по себе
+    # это не сбой, но установщик в такой ситуации не должен угадывать.
+    local rhc_certs=""
+    for rhc_site in "$LE_LIVE"/*/; do
+        [[ -d "$rhc_site" ]] && rhc_certs+=" $(basename "$rhc_site")"
+    done
+    if [[ $(wc -w <<< "$rhc_certs") -gt 1 ]]; then
+        rhc_info "сертификатов на ноде несколько: $rhc_certs"
+        rhc_info "домен ноды берётся из install.conf — проверьте, что там правильный"
+    fi
+    if [[ -n "$rhc_full" ]]; then
+        if [[ -e "$NGINX_ENABLED/$rhc_full" ]]; then
+            rhc_ok "конфиг ноды $rhc_full опубликован"
+        else
+            rhc_bad "конфиг ноды $rhc_full НЕ опубликован (нет ссылки в sites-enabled)"
+            rhc_fix "nginx: ln -sf ${NGINX_AVAIL}/$rhc_full ${NGINX_ENABLED}/"
+        fi
     fi
 
     if [[ -n "$rhc_deep" ]] && command -v certbot >/dev/null 2>&1 && [[ -n "$rhc_certdir" ]]; then
@@ -2615,7 +2939,8 @@ components_menu() {
     while true; do
         echo -e "\n===== Компоненты (доустановить / переустановить) ====="
         echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
-        echo " 4) Веб (заглушка+серт)    5) UFW             6) Sysctl-тюнинг"
+        echo " 4) Веб: серт + конфиг nginx (покажет и спросит)"
+        echo " 5) UFW                    6) Sysctl-тюнинг"
         echo " 7) Swap                   8) Юзер + SSH-харденинг   9) Speedtest"
         echo "10) IPv6 off (GRUB)"
         echo "--- Безопасность / обслуживание ---"
@@ -2632,7 +2957,7 @@ components_menu() {
              1) menu_step "Cloudflare WARP"      comp_warp ;;
              2) menu_step "Docker"               comp_docker ;;
              3) menu_step "Нода (передеплой)"    comp_node ;;
-             4) menu_step "Веб (заглушка+серт)"  comp_web ;;
+             4) menu_step "Веб (серт + конфиг nginx)" comp_web_menu ;;
              5) menu_step "UFW"                  comp_ufw ;;
              6) menu_step "Sysctl-тюнинг"        comp_sysctl ;;
              7) menu_step "Swap"                 comp_swap ;;
