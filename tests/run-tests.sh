@@ -55,9 +55,9 @@ head_ "2. Сборка"
 # пересобираем. Если собрать первым, проверка сравнит файл сам с собой и
 # будет проходить всегда — именно так она и работала вхолостую.
 if "$PY" build.py --check >/dev/null 2>&1; then
-    ok "setup.sh собран из текущего lib/"
+    ok "setup.sh и check.sh собраны из текущего lib/"
 else
-    bad "setup.sh устарел — соберите его заново (python build.py) и закоммитьте"
+    bad "собранные файлы устарели — пересоберите (python build.py) и закоммитьте"
 fi
 if "$PY" build.py >/dev/null 2>&1; then ok "build.py отработал"; else bad "build.py упал"; fi
 if bash -n setup.sh 2>/dev/null; then ok "bash -n setup.sh"; else bad "bash -n setup.sh"; bash -n setup.sh; fi
@@ -413,7 +413,121 @@ else
 fi
 
 # --------------------------------------------------------------------------
-head_ "16. shellcheck (если установлен)"
+head_ "16. Диагностика в меню и в check.sh — один и тот же код"
+# --------------------------------------------------------------------------
+# Смысл всей затеи: человек качает ОДИН скрипт и тыкает меню. Если бы
+# диагностика жила в двух файлах, копии разошлись бы, и «проверил одним,
+# починил другим» перестало бы работать.
+BODY_A=$(awk '/^rh_check\(\) \{/,/^\}/' setup.sh | md5sum | cut -d' ' -f1)
+BODY_B=$(awk '/^rh_check\(\) \{/,/^\}/' check.sh | md5sum | cut -d' ' -f1)
+if [[ -n "$BODY_A" && "$BODY_A" == "$BODY_B" ]]; then
+    ok "rh_check в setup.sh и check.sh совпадают байт в байт"
+else
+    bad "rh_check разъехался между setup.sh и check.sh (пересоберите: python build.py)"
+fi
+
+# --------------------------------------------------------------------------
+head_ "17. Диагностика не ломает установщик"
+# --------------------------------------------------------------------------
+# rh_check снимает себе set -e и ERR-трап: без этого половина её проверок,
+# штатно возвращающих ненулевой код, роняла бы установщик. Поэтому её
+# ОБЯЗАНЫ звать в подоболочке — иначе она разоружит обработчик ошибок
+# на весь оставшийся сеанс, и следующая настоящая авария пройдёт молча.
+DIAG=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/tmp/rh-test.log
+    rh_check() { set +e; trap - ERR; echo "диагностика"; return 1; }
+    menu_check >/dev/null 2>&1
+    echo "МЕНЮ ВЫЖИЛО"
+    broken() { ls /definitely-no-such-path-here; }
+    broken
+' 2>&1 || true)
+if grep -q "МЕНЮ ВЫЖИЛО" <<< "$DIAG" && grep -q "ОШИБКА — установка прервана" <<< "$DIAG"; then
+    ok "диагностика не роняет меню и не разоружает обработчик ошибок"
+else
+    bad "диагностика зовётся не в подоболочке:"; sed 's/^/      /' <<< "$DIAG"
+fi
+
+# --------------------------------------------------------------------------
+head_ "18. Починка трогает SSH только когда харденинг слетел"
+# --------------------------------------------------------------------------
+# Хостер переписывает конфиг sshd своим дроп-ином, root и пароли снова
+# открыты. Починка обязана это заметить и вернуть харденинг — но на здоровой
+# ноде не перезапускать sshd впустую, а на ноде без харденинга не накатывать
+# его молча (он отключает вход по паролю и требует проверенный ключ).
+SSHREP=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    TMPD=$(mktemp -d)
+    SSH_HARDEN_FILE="$TMPD/01-hardening.conf"
+    SSH_PORT=8422
+    sshd_listens_on() { return 0; }
+    comp_ssh() { echo "ЧИНИТ"; return 0; }
+
+    echo "== без файла харденинга"
+    sshd() { printf "port 22\npermitrootlogin yes\npasswordauthentication yes\n"; }
+    repair_ssh_hardening
+
+    echo "Port 8422" > "$SSH_HARDEN_FILE"
+    echo "== харденинг на месте"
+    sshd() { printf "port 8422\npermitrootlogin no\npasswordauthentication no\n"; }
+    repair_ssh_hardening
+
+    echo "== харденинг слетел"
+    sshd() { printf "port 8422\npermitrootlogin yes\npasswordauthentication no\n"; }
+    repair_ssh_hardening
+    rm -rf "$TMPD"
+' 2>&1 || true)
+S1=$(sed -n '/== без файла/,/== харденинг на месте/p' <<< "$SSHREP")
+S2=$(sed -n '/== харденинг на месте/,/== харденинг слетел/p' <<< "$SSHREP")
+S3=$(sed -n '/== харденинг слетел/,$p' <<< "$SSHREP")
+if grep -q "ЧИНИТ" <<< "$S1"; then
+    bad "починка молча накатывает харденинг на ноду, где его не было:"; sed 's/^/      /' <<< "$SSHREP"
+elif grep -q "ЧИНИТ" <<< "$S2"; then
+    bad "починка дёргает sshd на здоровой ноде:"; sed 's/^/      /' <<< "$SSHREP"
+elif ! grep -q "ЧИНИТ" <<< "$S3"; then
+    bad "починка НЕ заметила, что харденинг слетел:"; sed 's/^/      /' <<< "$SSHREP"
+else
+    ok "SSH чинится ровно тогда, когда сломан"
+fi
+
+# Порт для восстановления берётся из НАШЕГО файла харденинга, а не из sshd -T:
+# чужой дроп-ин, читающийся раньше, перебивает Port — и починка закрепила бы
+# чужой порт вместо того, чтобы вернуть свой.
+PORTSRC=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    TMPD=$(mktemp -d)
+    SSH_HARDEN_FILE="$TMPD/01-hardening.conf"; echo "Port 8422" > "$SSH_HARDEN_FILE"
+    sshd() { printf "port 22\n"; }          # чужой дроп-ин перебил наш Port
+    ufw() { :; }; find() { :; }; ls() { :; }
+    detect_existing_setup >/dev/null 2>&1
+    echo "SSH_PORT=$SSH_PORT"
+    rm -rf "$TMPD"
+' 2>&1 || true)
+if grep -q "SSH_PORT=8422" <<< "$PORTSRC"; then
+    ok "порт для восстановления берётся из файла харденинга, а не из чужого дроп-ина"
+else
+    bad "починка взяла чужой порт: $PORTSRC"
+fi
+
+# А на ноде, где харденинга никогда не было, файла нет — и чтение порта не
+# должно ронять скрипт. Ровно так и было: awk без файла возвращает 2, set -e
+# убивал установщик ещё до показа меню.
+NOFILE=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SSH_HARDEN_FILE="/nonexistent/01-hardening.conf"
+    sshd() { printf "port 2222\n"; }
+    ufw() { :; }; find() { :; }; ls() { :; }
+    detect_existing_setup >/dev/null 2>&1
+    echo "ДОШЛИ: SSH_PORT=$SSH_PORT"
+' 2>&1 || true)
+if grep -q "ДОШЛИ: SSH_PORT=2222" <<< "$NOFILE"; then
+    ok "без файла харденинга чтение порта не роняет установщик"
+else
+    bad "чтение порта падает, когда файла харденинга нет:"; sed 's/^/      /' <<< "$NOFILE"
+fi
+
+# --------------------------------------------------------------------------
+head_ "19. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then

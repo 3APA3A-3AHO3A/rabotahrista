@@ -9,6 +9,17 @@ if [[ -n "${RH_LIB_ONLY:-}" ]]; then
     return 0 2>/dev/null || exit 0
 fi
 
+# Диагностика без меню: тот же код, что в пункте 3. Ничего не меняет.
+if [[ "${1:-}" == "--check" ]]; then
+    if [[ -f "$INSTALL_STATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$INSTALL_STATE"
+    fi
+    # Через "if": rh_check штатно возвращает 1, когда нашла проблемы, и без
+    # этого set -e с ERR-трапом напечатали бы поверх отчёта аварийную простыню.
+    if ( rh_check "${2:-}" ); then exit 0; else exit 1; fi
+fi
+
 # Починка уже настроенной ноды: без вопросов, без переустановки
 if [[ "${1:-}" == "--repair" ]]; then
     NONINTERACTIVE=1

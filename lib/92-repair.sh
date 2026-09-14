@@ -11,6 +11,41 @@
 # Режим ничего не переустанавливает: не трогает ufw, не пересоздаёт контейнер,
 # не перезагружает сервер. Все ответы берутся с самой ноды.
 
+# Хостеры после ремонта сервера кладут свои дроп-ины в /etc/ssh/sshd_config.d/.
+# Имена вида 00-*.conf сортируются раньше нашего 01-hardening.conf, а sshd
+# берёт ПЕРВОЕ встреченное значение — и root с паролями снова открыты, хотя
+# файл харденинга на месте и порт правильный. Проверяем фактом (sshd -T) и
+# трогаем конфиг ТОЛЬКО если он действительно разъехался.
+repair_ssh_hardening() {
+    local eff_root eff_pass eff_port
+
+    # Впервые харденинг не накатываем: он отключает вход по паролю и требует
+    # проверенный SSH-ключ, а это разговор с человеком. Только восстанавливаем.
+    if [[ ! -f "$SSH_HARDEN_FILE" ]]; then
+        echo "  Харденинг на этой ноде не применялся — пропускаю."
+        echo "  Первичная настройка спросит ключ: меню, пункт 2 -> 8."
+        return 0
+    fi
+
+    eff_root=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
+    eff_pass=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
+    eff_port=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+    if [[ -z "$eff_root$eff_pass" ]]; then
+        echo "  [СБОЙ] sshd не отвечает на sshd -T — вслепую чинить SSH опасно."
+        return 1
+    fi
+
+    if [[ "$eff_root" == "no" && "$eff_pass" == "no" ]] && sshd_listens_on "$SSH_PORT"; then
+        echo "  Харденинг на месте: порт $SSH_PORT, root и вход по паролю закрыты. Не трогаю."
+        return 0
+    fi
+
+    echo "  Харденинг разъехался: root=$eff_root, пароли=$eff_pass, порт в конфиге=${eff_port:-?}"
+    echo "  Восстанавливаю на порт $SSH_PORT. Бэкапы конфигов останутся рядом,"
+    echo "  при неудаче харденинг откатится, пока текущая сессия жива."
+    comp_ssh
+}
+
 repair_perms() {
     local rc=0 f
     if [[ -d /opt/remnanode ]]; then
@@ -48,6 +83,7 @@ run_repair() {
     echo "  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ"
     echo "=========================================="
     echo "  Фаервол, контейнер и пакеты не трогаются, перезагрузки не будет."
+    echo "  SSH правится, только если харденинг фактически слетел."
     echo
 
     FULL_DOMAIN=""
@@ -59,17 +95,18 @@ run_repair() {
     echo
 
     do_step "Права на файлы с секретами" repair_perms
+    do_step "Харденинг SSH (root и пароли)" repair_ssh_hardening
 
     if [[ -n "$FULL_DOMAIN" ]]; then
         do_step "Конфиг nginx (путь для ACME)" comp_web
     else
-        skip_step "Конфиг nginx — домен не определён, почините через меню (пункт 4)"
+        skip_step "Конфиг nginx — домен не определён, почините через меню (пункт 2 -> 4)"
     fi
 
     if [[ -f "$NOTIFY_ENV" ]]; then
         do_step "Скрипты уведомлений и юниты" comp_telegram
     else
-        skip_step "Уведомления — Telegram на этой ноде не настроен (пункт 11)"
+        skip_step "Уведомления — Telegram на этой ноде не настроен (пункт 2 -> 11)"
     fi
 
     if [[ -f "$PANEL_ENV" ]]; then
@@ -90,7 +127,7 @@ run_repair() {
     echo "=========================================="
     echo
     echo "Ответы ноды сохранены в $INSTALL_STATE"
-    echo "Проверьте результат:  sudo bash /tmp/check.sh"
+    echo "Проверьте результат:   sudo bash /tmp/setup.sh --check"
     echo "Продление сертификата: sudo certbot renew --dry-run"
     return 0
 }

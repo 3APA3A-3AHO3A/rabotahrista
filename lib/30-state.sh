@@ -55,7 +55,17 @@ detect_existing_setup() {
 
     # Порт SSH и админ-учётка — из живой конфигурации
     if [[ -z "${SSH_PORT_DETECTED:-}" ]]; then
-        v=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+        # Источник истины — наш файл харденинга, а не sshd -T. Чужой дроп-ин с
+        # именем раньше по алфавиту (00-*.conf от хостера) перебивает Port, и
+        # sshd -T покажет ЕГО порт. Взяв это значение, починка закрепила бы
+        # чужие настройки вместо того, чтобы вернуть свои.
+        # Именно через if: без файла awk вернёт 2, и set -e убьёт весь скрипт
+        # ещё до меню — а файла нет ровно на тех нодах, где харденинга не было.
+        v=""
+        if [[ -f "$SSH_HARDEN_FILE" ]]; then
+            v=$(awk '/^[[:space:]]*Port[[:space:]]/{print $2; exit}' "$SSH_HARDEN_FILE" 2>/dev/null || true)
+        fi
+        [[ "$v" =~ ^[0-9]+$ ]] || v=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
         [[ "$v" =~ ^[0-9]+$ ]] && SSH_PORT="$v"
         SSH_PORT_DETECTED=1
     fi

@@ -45,6 +45,10 @@ SETUP_LOG="/var/log/node-setup.log"
 REPORT_FILE="/root/node-install-report.txt"
 SSH_PORT="${SSH_PORT:-8422}"
 ADMIN_USER="${ADMIN_USER:-admin}"
+# Наш дроп-ин с харденингом SSH. Имя начинается с 01, чтобы читаться раньше
+# большинства чужих файлов; переменной — чтобы путь был в одном месте и чтобы
+# тесты могли подставить свой каталог, не трогая настоящий sshd.
+SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/01-hardening.conf"
 NODE_PORT="2222"        # порт, на который к ноде ходит панель
 WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
 # Пакеты из apt — один список на установку и на отчёт о версиях
@@ -67,7 +71,8 @@ export DEBIAN_FRONTEND=noninteractive
 # Без UTF-8 локали bash считает длину строк в байтах — колонки отчёта разъезжаются
 if locale -a 2>/dev/null | grep -qix 'C\.UTF-*8'; then export LC_ALL=C.UTF-8; fi
 
-if [[ -z "${RH_LIB_ONLY:-}" ]]; then
+# Диагностика ничего не меняет — значит и лог прошлой установки не затирает
+if [[ -z "${RH_LIB_ONLY:-}" && "${1:-}" != "--check" ]]; then
     : > "$SETUP_LOG" 2>/dev/null || SETUP_LOG="/tmp/node-setup.log"
     # В лог попадает итоговый отчёт вместе с паролем учётки — 0644 тут не годится
     chmod 600 "$SETUP_LOG" 2>/dev/null || true

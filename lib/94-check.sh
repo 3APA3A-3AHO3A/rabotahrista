@@ -1,60 +1,3 @@
-#!/bin/bash
-# ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
-# Правки вносятся в lib/, затем: python3 build.py
-# Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh (блок настроек), 94-check.sh
-
-# ##########################################################################
-#  ДИАГНОСТИКА НОДЫ rabotahrista
-#
-#  Скрипт НИЧЕГО НЕ МЕНЯЕТ. Только читает и рассказывает, что нашёл.
-#  Это сознательное ограничение: его безопасно запускать на живой ноде
-#  в любой момент, он не трогает ни конфиги, ни сервисы, ни фаервол.
-#
-#      curl -fsSL .../check.sh -o /tmp/check.sh
-#      sudo bash /tmp/check.sh            быстрая проверка
-#      sudo bash /tmp/check.sh --deep     + тест продления сертификата
-#
-#  То же самое есть в самом установщике: меню -> пункт 3. Код один и тот же,
-#  этот файл собирается из lib/94-check.sh.
-# ##########################################################################
-
-set -o pipefail
-
-# === НАСТРОЙКИ ===
-INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/index.html"
-NOTIFY_ENV="/etc/rabotahrista/notify.env"
-INSTALL_STATE="/etc/rabotahrista/install.conf"
-PANEL_ENV="/etc/rabotahrista/panel.env"
-# Пути к генерируемым скриптам — переменными, чтобы тесты могли подставить
-# временный каталог и проверить логику, ничего не устанавливая в систему
-NOTIFY_BIN="/usr/local/bin/rh-notify.sh"
-PANEL_WATCH_BIN="/usr/local/bin/rh-panel-watch.sh"
-SETUP_LOG="/var/log/node-setup.log"
-REPORT_FILE="/root/node-install-report.txt"
-SSH_PORT="${SSH_PORT:-8422}"
-ADMIN_USER="${ADMIN_USER:-admin}"
-# Наш дроп-ин с харденингом SSH. Имя начинается с 01, чтобы читаться раньше
-# большинства чужих файлов; переменной — чтобы путь был в одном месте и чтобы
-# тесты могли подставить свой каталог, не трогая настоящий sshd.
-SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/01-hardening.conf"
-NODE_PORT="2222"        # порт, на который к ноде ходит панель
-WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
-# Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
-# =================
-
-if locale -a 2>/dev/null | grep -qix 'C\.UTF-*8'; then export LC_ALL=C.UTF-8; fi
-if [[ "$EUID" -ne 0 ]]; then
-    # "sudo bash <(curl ...)" не работает: sudo закрывает лишние дескрипторы
-    echo "Нужны права root. Запускать так:"
-    echo
-    echo "  curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/check.sh -o /tmp/check.sh"
-    echo "  sudo bash /tmp/check.sh"
-    echo
-    exit 1
-fi
-
 # ##########################################################################
 #  ДИАГНОСТИКА НОДЫ
 #
@@ -479,5 +422,3 @@ rh_check() {
     [[ "$rhc_problems" -eq 0 ]] && return 0
     return 1
 }
-
-rh_check "$@"

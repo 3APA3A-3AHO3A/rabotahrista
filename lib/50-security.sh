@@ -101,7 +101,7 @@ ssh_neutralize_conflicts() {
     for f in /etc/ssh/sshd_config.d/*.conf; do
         [[ -e "$f" ]] || continue
         base=$(basename "$f")
-        [[ "$base" < "01-hardening.conf" ]] || continue
+        [[ "$base" < "$(basename "$SSH_HARDEN_FILE")" ]] || continue
         grep -qE '^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]' "$f" || continue
         cp -a "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
         sed -i -E 's|^([[:space:]]*(PermitRootLogin\|PasswordAuthentication\|KbdInteractiveAuthentication\|ChallengeResponseAuthentication)[[:space:]])|# отключено харденингом rabotahrista: \1|' "$f"
@@ -127,7 +127,7 @@ comp_ssh() {
     fi
 
     mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/01-hardening.conf <<EOF
+    cat > "$SSH_HARDEN_FILE" <<EOF
 Port $SSH_PORT
 PermitRootLogin no
 PasswordAuthentication no
@@ -135,7 +135,7 @@ KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 UsePAM yes
 EOF
-    chmod 644 /etc/ssh/sshd_config.d/01-hardening.conf
+    chmod 644 "$SSH_HARDEN_FILE"
     # Облачные образы включают вход по паролю своими дроп-инами. Наш файл сортируется
     # первым и всё равно выигрывает, но глушим и их — на случай нестандартных имён.
     sed -i 's/^PasswordAuthentication/#PasswordAuthentication/' \
@@ -145,7 +145,7 @@ EOF
 
     sshd -t || {
         echo "  [СБОЙ] sshd -t не прошёл — убираю свой файл, SSH не трогаю"
-        rm -f /etc/ssh/sshd_config.d/01-hardening.conf
+        rm -f "$SSH_HARDEN_FILE"
         return 1
     }
 
@@ -193,7 +193,7 @@ EOF
     # Демон не работает вообще — это авария, откатываемся немедленно
     if ! ssh_daemon_active; then
         echo "  [СБОЙ] служба sshd не запущена после перезапуска. Откатываю харденинг."
-        rm -f /etc/ssh/sshd_config.d/01-hardening.conf
+        rm -f "$SSH_HARDEN_FILE"
         systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1 || true
         SSH_HARDENED=""; SSH_PENDING_REBOOT=""
         return 1
@@ -210,7 +210,7 @@ EOF
 
     echo "  [СБОЙ] sshd не видит порт $SSH_PORT в своём конфиге (sshd -T показывает '${want_port:-?}')."
     echo "         Значит файл харденинга не читается. Откатываю, чтобы не потерять доступ."
-    rm -f /etc/ssh/sshd_config.d/01-hardening.conf
+    rm -f "$SSH_HARDEN_FILE"
     systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1 || true
     SSH_HARDENED=""; SSH_PENDING_REBOOT=""
     return 1
