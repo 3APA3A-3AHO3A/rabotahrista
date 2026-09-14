@@ -7,16 +7,21 @@ fail2ban, тюнинг ядра, Docker, сама нода, сертификат
 ## Установка на сервер
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/setup.sh)
+curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/setup.sh -o /tmp/setup.sh
+sudo bash /tmp/setup.sh
 ```
 
-Запускать под root, на чистой Ubuntu или Debian. Скрипт задаёт вопросы,
+Нужны права root. Обратите внимание: `sudo bash <(curl ...)` **не работает** —
+sudo закрывает лишние файловые дескрипторы, а подстановка процесса это как раз
+дескриптор. Поэтому сначала скачиваем в файл. Под самим root первая строка не
+нужна, но скрипт отключает вход под root, так что после первой установки
+заходить вы будете обычным пользователем. Скрипт задаёт вопросы,
 показывает меню и в конце печатает отчёт с командой для входа и паролем.
 
 Неинтерактивная установка — с файлом ответов:
 
 ```bash
-bash <(curl -fsSL .../setup.sh) /root/node.conf
+sudo bash /tmp/setup.sh /root/node.conf
 ```
 
 За образец берите `config.example.conf`.
@@ -133,8 +138,9 @@ bash tests/run-tests.sh
 ## Диагностика живой ноды
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/check.sh)
-bash <(... check.sh) --deep    # + реальный тест продления сертификата
+curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/check.sh -o /tmp/check.sh
+sudo bash /tmp/check.sh           # быстрая проверка
+sudo bash /tmp/check.sh --deep    # + реальный тест продления сертификата
 ```
 
 `check.sh` только читает — это проверяется тестом, а не обещанием. Запускать

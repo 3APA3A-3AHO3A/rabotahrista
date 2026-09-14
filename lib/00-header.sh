@@ -53,7 +53,13 @@ APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq cer
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)
 if [[ -z "${RH_LIB_ONLY:-}" && "$EUID" -ne 0 ]]; then
-    echo "Пожалуйста, запустите скрипт с правами root (sudo bash ...)"
+    # Подсказываем рабочую команду: "sudo bash <(curl ...)" НЕ работает, потому
+    # что sudo закрывает лишние файловые дескрипторы, а <(...) — это как раз он.
+    echo "Нужны права root. Скрипт сам отключает вход под root, поэтому запускать так:"
+    echo
+    echo "  curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/setup.sh -o /tmp/setup.sh"
+    echo "  sudo bash /tmp/setup.sh"
+    echo
     exit 1
 fi
 

@@ -6,8 +6,9 @@
 #  Это сознательное ограничение: его безопасно запускать на живой ноде
 #  в любой момент, он не трогает ни конфиги, ни сервисы, ни фаервол.
 #
-#      bash <(curl -fsSL .../check.sh)           быстрая проверка
-#      bash <(curl -fsSL .../check.sh) --deep    + тест продления сертификата
+#      curl -fsSL .../check.sh -o /tmp/check.sh
+#      sudo bash /tmp/check.sh            быстрая проверка
+#      sudo bash /tmp/check.sh --deep     + тест продления сертификата
 # ##########################################################################
 
 set -uo pipefail
@@ -19,7 +20,15 @@ DEEP=""
 [[ "${1:-}" == "--deep" ]] && DEEP=1
 
 if locale -a 2>/dev/null | grep -qix 'C\.UTF-*8'; then export LC_ALL=C.UTF-8; fi
-[[ "$EUID" -ne 0 ]] && { echo "Запустите под root: sudo bash ..."; exit 1; }
+if [[ "$EUID" -ne 0 ]]; then
+    # "sudo bash <(curl ...)" не работает: sudo закрывает лишние дескрипторы
+    echo "Нужны права root. Запускать так:"
+    echo
+    echo "  curl -fsSL https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/check.sh -o /tmp/check.sh"
+    echo "  sudo bash /tmp/check.sh"
+    echo
+    exit 1
+fi
 
 PROBLEMS=0
 WARNINGS=0
