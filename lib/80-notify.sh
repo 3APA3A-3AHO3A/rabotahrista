@@ -162,7 +162,8 @@ UNIT
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" \
         ${TG_TOPIC_ID:+-d "message_thread_id=${TG_TOPIC_ID}"} \
-        --data-urlencode "text=✅ Уведомления настроены (SSH-входы, загрузка, падение/подъём ноды)" 2>/dev/null || true)
+        --data-urlencode "text=🖥 <b>${node_label}</b>${node_ip:+  <code>${node_ip}</code>}
+✅ Уведомления настроены (SSH-входы, загрузка, падение/подъём ноды)" 2>/dev/null || true)
     if grep -q '"ok":true' <<< "$resp"; then
         echo "  Тестовое сообщение доставлено в Telegram."
         return 0

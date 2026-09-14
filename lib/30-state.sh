@@ -104,12 +104,21 @@ save_state() {
     chmod 600 "$INSTALL_STATE"
 }
 
+# Любое сообщение уходит с шапкой: имя ноды и её IP. Без этого при обходе
+# нескольких нод непонятно, к какой из них относится пришедшее уведомление.
+tg_header() {
+    local h="🖥 <b>${NODE_LABEL:-$(hostname)}</b>"
+    [[ -n "${NODE_IP:-}" ]] && h="$h  <code>${NODE_IP}</code>"
+    printf '%s' "$h"
+}
+
 notify_telegram() {
     [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
     [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]] && return 0
     local args=(-s --max-time 15)
     [[ -n "${TG_PROXY:-}" ]] && args+=(-x "$TG_PROXY")
-    args+=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$1")
+    args+=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$(tg_header)
+$1")
     [[ -n "${TG_TOPIC_ID:-}" ]] && args+=(-d "message_thread_id=${TG_TOPIC_ID}")
     curl "${args[@]}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
 }

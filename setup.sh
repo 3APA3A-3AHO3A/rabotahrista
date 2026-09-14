@@ -545,12 +545,21 @@ save_state() {
     chmod 600 "$INSTALL_STATE"
 }
 
+# Любое сообщение уходит с шапкой: имя ноды и её IP. Без этого при обходе
+# нескольких нод непонятно, к какой из них относится пришедшее уведомление.
+tg_header() {
+    local h="🖥 <b>${NODE_LABEL:-$(hostname)}</b>"
+    [[ -n "${NODE_IP:-}" ]] && h="$h  <code>${NODE_IP}</code>"
+    printf '%s' "$h"
+}
+
 notify_telegram() {
     [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
     [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]] && return 0
     local args=(-s --max-time 15)
     [[ -n "${TG_PROXY:-}" ]] && args+=(-x "$TG_PROXY")
-    args+=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$1")
+    args+=(-d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=$(tg_header)
+$1")
     [[ -n "${TG_TOPIC_ID:-}" ]] && args+=(-d "message_thread_id=${TG_TOPIC_ID}")
     curl "${args[@]}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
 }
@@ -1619,7 +1628,8 @@ UNIT
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" \
         ${TG_TOPIC_ID:+-d "message_thread_id=${TG_TOPIC_ID}"} \
-        --data-urlencode "text=✅ Уведомления настроены (SSH-входы, загрузка, падение/подъём ноды)" 2>/dev/null || true)
+        --data-urlencode "text=🖥 <b>${node_label}</b>${node_ip:+  <code>${node_ip}</code>}
+✅ Уведомления настроены (SSH-входы, загрузка, падение/подъём ноды)" 2>/dev/null || true)
     if grep -q '"ok":true' <<< "$resp"; then
         echo "  Тестовое сообщение доставлено в Telegram."
         return 0
@@ -1930,6 +1940,9 @@ menu_step() {
     else
         echo -e "\n[СБОЙ] $label — подробности в $SETUP_LOG"
     fi
+    # Ответы, которые человек только что ввёл, надо запомнить: иначе на ноде
+    # без install.conf их придётся вводить заново при каждой следующей правке.
+    save_state || true
     return 0
 }
 
@@ -2031,19 +2044,19 @@ else
         # shellcheck disable=SC1090
         source "$INSTALL_STATE"
         STATE_LOADED=1
-    else
-        # Нода поставлена до появления install.conf — вычитываем настройки
-        # прямо с сервера, чтобы не заставлять вводить их по памяти
-        detect_existing_setup
-        if [[ -n "$DOMAIN$PANEL_IP$REMNA_SECRET" ]]; then
-            echo "Файла с ответами нет, но нода уже настроена — подставляю найденное:"
-            [[ -n "$SUBDOMAIN$DOMAIN" ]] && echo "  домен:    ${SUBDOMAIN}.${DOMAIN}"
-            [[ -n "$PANEL_IP" ]]         && echo "  панель:   $PANEL_IP"
-            [[ -n "$REMNA_SECRET" ]]     && echo "  секрет:   найден в docker-compose.yml"
-            [[ -n "$TG_BOT_TOKEN" ]]     && echo "  Telegram: настройки найдены"
-            echo "  Проверьте значения в вопросах ниже."
-            STATE_LOADED=1
-        fi
+    fi
+    # Дополняем тем, что можно вычитать с самого сервера. Вызывается всегда:
+    # install.conf может существовать, но быть неполным — например, создан
+    # ранней версией или после точечной правки через меню.
+    detect_existing_setup
+    if [[ -z "$STATE_LOADED" && -n "${DOMAIN:-}${PANEL_IP:-}${REMNA_SECRET:-}${TG_BOT_TOKEN:-}" ]]; then
+        echo "Файла с ответами нет, но нода настроена — вычитал с сервера:"
+        [[ -n "${SUBDOMAIN:-}${DOMAIN:-}" ]] && echo "  домен:    ${SUBDOMAIN}.${DOMAIN}"
+        [[ -n "${PANEL_IP:-}" ]]             && echo "  панель:   $PANEL_IP"
+        [[ -n "${REMNA_SECRET:-}" ]]         && echo "  секрет:   найден в docker-compose.yml"
+        [[ -n "${TG_BOT_TOKEN:-}" ]]         && echo "  Telegram: токен и chat_id найдены"
+        echo "  Значения подставлены в вопросы — проверьте их там."
+        STATE_LOADED=1
     fi
     validate_ssh_params
     main_menu

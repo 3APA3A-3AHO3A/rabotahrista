@@ -27,19 +27,19 @@ else
         # shellcheck disable=SC1090
         source "$INSTALL_STATE"
         STATE_LOADED=1
-    else
-        # Нода поставлена до появления install.conf — вычитываем настройки
-        # прямо с сервера, чтобы не заставлять вводить их по памяти
-        detect_existing_setup
-        if [[ -n "$DOMAIN$PANEL_IP$REMNA_SECRET" ]]; then
-            echo "Файла с ответами нет, но нода уже настроена — подставляю найденное:"
-            [[ -n "$SUBDOMAIN$DOMAIN" ]] && echo "  домен:    ${SUBDOMAIN}.${DOMAIN}"
-            [[ -n "$PANEL_IP" ]]         && echo "  панель:   $PANEL_IP"
-            [[ -n "$REMNA_SECRET" ]]     && echo "  секрет:   найден в docker-compose.yml"
-            [[ -n "$TG_BOT_TOKEN" ]]     && echo "  Telegram: настройки найдены"
-            echo "  Проверьте значения в вопросах ниже."
-            STATE_LOADED=1
-        fi
+    fi
+    # Дополняем тем, что можно вычитать с самого сервера. Вызывается всегда:
+    # install.conf может существовать, но быть неполным — например, создан
+    # ранней версией или после точечной правки через меню.
+    detect_existing_setup
+    if [[ -z "$STATE_LOADED" && -n "${DOMAIN:-}${PANEL_IP:-}${REMNA_SECRET:-}${TG_BOT_TOKEN:-}" ]]; then
+        echo "Файла с ответами нет, но нода настроена — вычитал с сервера:"
+        [[ -n "${SUBDOMAIN:-}${DOMAIN:-}" ]] && echo "  домен:    ${SUBDOMAIN}.${DOMAIN}"
+        [[ -n "${PANEL_IP:-}" ]]             && echo "  панель:   $PANEL_IP"
+        [[ -n "${REMNA_SECRET:-}" ]]         && echo "  секрет:   найден в docker-compose.yml"
+        [[ -n "${TG_BOT_TOKEN:-}" ]]         && echo "  Telegram: токен и chat_id найдены"
+        echo "  Значения подставлены в вопросы — проверьте их там."
+        STATE_LOADED=1
     fi
     validate_ssh_params
     main_menu
