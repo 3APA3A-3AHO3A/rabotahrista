@@ -8,6 +8,22 @@ ROOT="$PWD"
 FAILED=0
 PASSED=0
 
+# На Windows "python3" обычно существует как заглушка Microsoft Store:
+# она ничего не запускает и возвращает ошибку. Поэтому мало найти команду в
+# PATH — надо убедиться, что она реально работает.
+# Такая же проверка есть в .githooks/pre-commit; менять надо оба места.
+PY=""
+for _cand in python3 python py; do
+    if command -v "$_cand" >/dev/null 2>&1 && "$_cand" -c "import sys" >/dev/null 2>&1; then
+        PY="$_cand"; break
+    fi
+done
+if [[ -z "$PY" ]]; then
+    printf '\033[31mНе найден работающий python\033[0m — он нужен для build.py и части тестов.\n'
+    printf 'Пробовал: python3, python, py\n'
+    exit 1
+fi
+
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; PASSED=$((PASSED+1)); }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; FAILED=$((FAILED+1)); }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
@@ -35,16 +51,23 @@ done
 # --------------------------------------------------------------------------
 head_ "2. Сборка"
 # --------------------------------------------------------------------------
-if python3 build.py >/dev/null 2>&1; then ok "build.py отработал"; else bad "build.py упал"; fi
+# Порядок важен: сначала проверяем ЗАКОММИЧЕННЫЙ setup.sh и только потом
+# пересобираем. Если собрать первым, проверка сравнит файл сам с собой и
+# будет проходить всегда — именно так она и работала вхолостую.
+if "$PY" build.py --check >/dev/null 2>&1; then
+    ok "setup.sh собран из текущего lib/"
+else
+    bad "setup.sh устарел — соберите его заново (python build.py) и закоммитьте"
+fi
+if "$PY" build.py >/dev/null 2>&1; then ok "build.py отработал"; else bad "build.py упал"; fi
 if bash -n setup.sh 2>/dev/null; then ok "bash -n setup.sh"; else bad "bash -n setup.sh"; bash -n setup.sh; fi
-if python3 build.py --check >/dev/null 2>&1; then ok "setup.sh совпадает с lib/"; else bad "setup.sh устарел"; fi
 if head -1 setup.sh | grep -q '^#!/bin/bash'; then ok "shebang на первой строке"; else bad "нет shebang"; fi
 if grep -qU $'\r' setup.sh; then bad "в setup.sh есть CRLF — на сервере сломается"; else ok "переводы строк LF"; fi
 
 # --------------------------------------------------------------------------
 head_ "3. Статическая проверка кодов возврата"
 # --------------------------------------------------------------------------
-if python3 tests/check_returns.py; then ok "ни одна функция не заканчивается голым условием"
+if "$PY" tests/check_returns.py; then ok "ни одна функция не заканчивается голым условием"
 else bad "есть функции, которые молча убьют скрипт"; fi
 
 # --------------------------------------------------------------------------
@@ -255,7 +278,7 @@ head_ "13. Диагностика ничего не меняет"
 # --------------------------------------------------------------------------
 # check.sh запускают на живых нодах в рабочее время. Любая изменяющая команда
 # внутри него превращает безобидную проверку в незапланированную правку.
-if python3 tests/check_readonly.py; then ok "check.sh только читает"
+if "$PY" tests/check_readonly.py; then ok "check.sh только читает"
 else bad "в check.sh просочились изменяющие команды"; fi
 
 # grep -c при нуле совпадений печатает "0" И возвращает ненулевой код, поэтому

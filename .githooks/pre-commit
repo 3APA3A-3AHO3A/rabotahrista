@@ -1,0 +1,55 @@
+#!/bin/bash
+# Запускается автоматически перед каждым git commit.
+#
+# Задача: сделать невозможным коммит, где setup.sh не соответствует lib/
+# или где тесты не проходят. Раньше эту роль играл бот в CI, но он
+# коммитил пересобранный файл сам, и после каждого пуша требовался git pull.
+#
+# Установка (один раз на репозиторий):
+#     git config core.hooksPath .githooks
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# На Windows "python3" обычно существует как заглушка Microsoft Store:
+# она ничего не запускает и возвращает ошибку. Поэтому мало найти команду —
+# надо убедиться, что она реально работает.
+PY=""
+for cand in python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
+        PY="$cand"
+        break
+    fi
+done
+if [[ -z "$PY" ]]; then
+    echo "pre-commit: не найден работающий python (пробовал python3, python, py)" >&2
+    echo "            поставьте Python или закоммитьте с --no-verify" >&2
+    exit 1
+fi
+
+echo "pre-commit: пересобираю setup.sh ($PY)..."
+BUILD_OUT=$("$PY" build.py 2>&1) || {
+    echo "pre-commit: сборка упала — коммит отменён" >&2
+    echo "$BUILD_OUT" >&2
+    exit 1
+}
+
+# Если сборка изменила setup.sh — добавляем его в этот же коммит,
+# чтобы в репозитории никогда не оказалось расхождения с lib/
+if ! git diff --quiet -- setup.sh; then
+    git add setup.sh
+    echo "pre-commit: setup.sh пересобран и добавлен в коммит"
+fi
+
+LOG=$(mktemp)
+echo "pre-commit: прогоняю тесты..."
+if ! bash tests/run-tests.sh > "$LOG" 2>&1; then
+    echo >&2
+    echo "pre-commit: ТЕСТЫ НЕ ПРОШЛИ — коммит отменён" >&2
+    grep -E '✗|Пройдено' "$LOG" >&2
+    echo >&2
+    echo "Полный вывод: $LOG" >&2
+    echo "Закоммитить всё равно (на свой страх): git commit --no-verify" >&2
+    exit 1
+fi
+rm -f "$LOG"
+echo "pre-commit: тесты пройдены"

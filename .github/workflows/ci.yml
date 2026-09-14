@@ -1,4 +1,4 @@
-name: Проверка и сборка
+name: Проверка
 
 on:
   push:
@@ -6,11 +6,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Права на запись не нужны: CI ничего не коммитит.
+# Раньше он пересобирал setup.sh и делал свой коммит — из-за этого после
+# каждого пуша приходилось делать git pull, а в сгенерированном файле
+# возникали конфликты. Теперь он только проверяет и краснеет.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,15 +25,8 @@ jobs:
       - name: Прогнать тесты
         run: bash tests/run-tests.sh
 
-      - name: Закоммитить пересобранный setup.sh
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Подсказка, если setup.sh устарел
+        if: failure()
         run: |
-          if git diff --quiet -- setup.sh; then
-            echo "setup.sh не изменился — коммитить нечего"
-            exit 0
-          fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add setup.sh
-          git commit -m "build: пересобрать setup.sh из lib/ [skip ci]"
-          git push
+          echo "::error::Если тест «setup.sh собран из текущего lib/» красный —"
+          echo "::error::выполните локально: python build.py, затем закоммитьте setup.sh"
