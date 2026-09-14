@@ -837,6 +837,27 @@ ssh_daemon_active() {
     return 1
 }
 
+# sshd применяет ПЕРВОЕ встреченное значение директивы. Если выше строки
+# Include в основном sshd_config уже стоит PermitRootLogin yes (так делают
+# образы некоторых хостеров), наш файл харденинга лежит ниже и проигрывает:
+# порт меняется, а root и пароли остаются открытыми. Такие строки гасим.
+ssh_neutralize_conflicts() {
+    local inc_line conflicts n
+    inc_line=$(grep -nE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' \
+               /etc/ssh/sshd_config 2>/dev/null | head -1 | cut -d: -f1)
+    [[ -z "$inc_line" ]] && return 0
+    conflicts=$(awk -v n="$inc_line" \
+        'NR<n && /^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]/ {print NR}' \
+        /etc/ssh/sshd_config 2>/dev/null)
+    [[ -z "$conflicts" ]] && return 0
+    cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+    for n in $conflicts; do
+        sed -i "${n}s|^|# отключено харденингом rabotahrista: |" /etc/ssh/sshd_config
+    done
+    echo "  Выше Include нашлись строки, перебивавшие харденинг — закомментированы (строки: $(echo $conflicts | tr '\n' ' '))"
+    return 0
+}
+
 comp_ssh() {
     ask_ssh_params
     echo ">>> Харденинг SSH: порт $SSH_PORT, root закрыт..."
@@ -868,6 +889,8 @@ EOF
     sed -i 's/^PasswordAuthentication/#PasswordAuthentication/' \
         /etc/ssh/sshd_config.d/*cloudimg*.conf /etc/ssh/sshd_config.d/*cloud-init*.conf 2>/dev/null || true
 
+    ssh_neutralize_conflicts
+
     sshd -t || {
         echo "  [СБОЙ] sshd -t не прошёл — убираю свой файл, SSH не трогаю"
         rm -f /etc/ssh/sshd_config.d/01-hardening.conf
@@ -897,8 +920,21 @@ EOF
     done
 
     if [[ -n "$ok" ]] && ssh_daemon_active; then
+        # Порт мог быть таким и до нас — это ничего не доказывает. Проверяем
+        # то, ради чего всё затевалось: закрыты ли root и вход по паролю.
+        local eff_root eff_pass
+        eff_root=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
+        eff_pass=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
+        if [[ "$eff_root" != "no" || "$eff_pass" != "no" ]]; then
+            echo "  [СБОЙ] порт применился, но харденинг — нет: root=$eff_root, пароли=$eff_pass"
+            echo "         кто задаёт эти значения:"
+            grep -rniE '^[[:space:]]*(PermitRootLogin|PasswordAuthentication)' \
+                /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | head -5 | sed 's/^/           /'
+            SSH_HARDENED=""
+            return 1
+        fi
         SSH_HARDENED=1; SSH_PENDING_REBOOT=""
-        echo "  Проверено: sshd слушает порт $SSH_PORT прямо сейчас. Текущая сессия не разорвётся."
+        echo "  Проверено: sshd слушает порт $SSH_PORT, root и вход по паролю закрыты."
         return 0
     fi
 

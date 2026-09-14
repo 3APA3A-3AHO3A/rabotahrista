@@ -88,15 +88,36 @@ fi
 # --------------------------------------------------------------------------
 sect "SSH"
 # --------------------------------------------------------------------------
-if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
-    ok "sshd_config читает каталог sshd_config.d"
-else
-    if [[ -f /etc/ssh/sshd_config.d/01-hardening.conf ]]; then
+INC_LINE=$(grep -nE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null | head -1 | cut -d: -f1)
+HARD_FILE=/etc/ssh/sshd_config.d/01-hardening.conf
+
+if [[ -z "$INC_LINE" ]]; then
+    if [[ -f "$HARD_FILE" ]]; then
         bad "файл харденинга есть, но sshd_config его НЕ ЧИТАЕТ — настройки не применены"
         fix "SSH: добавить 'Include /etc/ssh/sshd_config.d/*.conf' первой строкой в /etc/ssh/sshd_config"
     else
-        info "sshd_config.d не подключён, но и файла харденинга нет"
+        info "sshd_config.d не подключён, и файла харденинга нет"
     fi
+else
+    ok "sshd_config читает каталог sshd_config.d (строка $INC_LINE)"
+    # sshd берёт ПЕРВОЕ встреченное значение. Если Include стоит не в начале,
+    # директивы выше него побеждают — и харденинг применяется лишь частично.
+    CONFLICT=$(awk -v n="$INC_LINE" \
+        'NR<n && /^[[:space:]]*(PermitRootLogin|PasswordAuthentication)[[:space:]]/ {print "    строка "NR": "$0}' \
+        /etc/ssh/sshd_config 2>/dev/null)
+    if [[ -n "$CONFLICT" ]]; then
+        bad "выше Include заданы настройки, которые перебивают харденинг:"
+        echo "$CONFLICT"
+        info "sshd берёт первое встреченное значение, поэтому файл харденинга ниже игнорируется"
+        fix "SSH: перенести строку Include в самое начало /etc/ssh/sshd_config, затем пункт 8"
+    fi
+fi
+
+if [[ -f "$HARD_FILE" ]]; then
+    ok "файл харденинга на месте"
+else
+    bad "нет $HARD_FILE — харденинг SSH на этой ноде не применялся"
+    fix "SSH: меню setup.sh, пункт 8"
 fi
 
 CFG_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
