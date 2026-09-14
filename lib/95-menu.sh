@@ -33,6 +33,7 @@ components_menu() {
         echo "--- Безопасность / обслуживание ---"
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "21) Сторож панели вкл.    22) Сторож панели выкл."
+        echo "23) Сменить домен ноды"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -62,6 +63,7 @@ components_menu() {
             20) menu_step "Обновление системы"   comp_os_update ;;
             21) menu_step "Сторож панели"        comp_panel_watch ;;
             22) menu_step "Отключение сторожа"   comp_panel_watch_off ;;
+            23) menu_step "Смена домена ноды"     comp_change_domain ;;
              0) return ;;
              *) echo "Нет такого пункта." ;;
         esac

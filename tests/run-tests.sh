@@ -28,7 +28,7 @@ TESTKEY="${TESTKEY:-ssh-ed25519 AAAAtest test@no-keygen}"
 # --------------------------------------------------------------------------
 head_ "1. Синтаксис"
 # --------------------------------------------------------------------------
-for f in lib/*.sh check.sh; do
+for f in lib/*.sh check.sh changedomain.sh; do
     if bash -n "$f" 2>/dev/null; then ok "bash -n $f"; else bad "bash -n $f"; bash -n "$f"; fi
 done
 
@@ -332,10 +332,32 @@ fi
 rm -rf "$PW"
 
 # --------------------------------------------------------------------------
-head_ "15. shellcheck (если установлен)"
+head_ "15. Шаблон nginx существует в одном экземпляре"
+# --------------------------------------------------------------------------
+# Смена домена раньше имела свою копию шаблона, и копия разошлась с оригиналом.
+# Теперь и установка, и смена домена зовут write_nginx_site.
+TPL=$(grep -c 'ssl_certificate ' lib/*.sh changedomain.sh 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+if [[ "$TPL" -eq 1 ]]; then
+    ok "шаблон nginx описан один раз"
+else
+    bad "шаблон nginx встречается $TPL раз — копии разойдутся"
+    grep -n 'ssl_certificate ' lib/*.sh changedomain.sh 2>/dev/null | sed 's/^/      /'
+fi
+# Упоминание в комментарии не считается — ищем именно вызов
+NGXCB=$(grep -n 'certbot --nginx' lib/*.sh changedomain.sh 2>/dev/null \
+        | grep -v ':[0-9]*:[[:space:]]*#' || true)
+if [[ -n "$NGXCB" ]]; then
+    bad "где-то остался вызов certbot --nginx (он требует готовый server_name и падает)"
+    echo "$NGXCB" | sed 's/^/      /'
+else
+    ok "выпуск сертификата везде через webroot"
+fi
+
+# --------------------------------------------------------------------------
+head_ "16. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh; then
+    if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then
         ok "shellcheck без замечаний"
     else
         bad "shellcheck нашёл проблемы"

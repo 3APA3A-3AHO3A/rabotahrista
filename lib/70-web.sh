@@ -89,6 +89,86 @@ acme_reachable() {
     return 1
 }
 
+# Пишет конфиг nginx для домена, включает его и перезапускает nginx.
+# Вынесено в функцию, потому что этим же занимается смена домена (lib/75-domain.sh):
+# две копии шаблона рано или поздно разъедутся.
+write_nginx_site() {
+    local dom="$1"
+    echo ">>> Конфиг nginx для $dom..."
+    cat <<EOF > "/etc/nginx/sites-available/$dom"
+server {
+    listen 80;
+    server_name $dom;
+
+    location /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+
+server {
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+    server_name $dom;
+
+    ssl_certificate /etc/letsencrypt/live/$dom/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$dom/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+    ssl_session_cache shared:SSL:1m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    real_ip_header proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+
+    # Нужно для продления: при "Always Use HTTPS" в Cloudflare проверка приходит
+    # сюда по HTTPS, и без этого блока отдавалась бы заглушка вместо токена.
+    location /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/;
+        default_type "text/plain";
+    }
+
+    location / {
+        root /var/www/stub;
+        index index.html;
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+    }
+}
+EOF
+    rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+    # Конфиг прошлой ноды (другой субдомен) содержит такой же default_server на
+    # 127.0.0.1:8443 — nginx -t упадёт на duplicate. Снимаем всё лишнее.
+    local link
+    for link in /etc/nginx/sites-enabled/*; do
+        [[ -e "$link" ]] || continue
+        [[ "$(basename "$link")" == "$dom" ]] && continue
+        grep -q 'proxy_protocol' "$link" 2>/dev/null && rm -f "$link"
+    done
+    ln -sf "/etc/nginx/sites-available/$dom" /etc/nginx/sites-enabled/
+    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"
+        return 1
+    fi
+    systemctl restart nginx >>"$SETUP_LOG" 2>&1
+    if ! systemctl is-active --quiet nginx; then
+        echo "  [СБОЙ] nginx не запустился (см. $SETUP_LOG)"
+        return 1
+    fi
+    return 0
+}
+
 comp_web() {
     ask_domain; ask_subdomain; ask_cf
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
@@ -168,75 +248,7 @@ comp_web() {
         acme_serve_stop
     fi
 
-    echo ">>> Nginx Fallback..."
-    cat <<EOF > /etc/nginx/sites-available/$FULL_DOMAIN
-server {
-    listen 80;
-    server_name $FULL_DOMAIN;
-
-    location /.well-known/acme-challenge/ {
-        root /var/lib/letsencrypt/;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
-    server_name _;
-    ssl_reject_handshake on;
-}
-
-server {
-    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
-    server_name $FULL_DOMAIN;
-
-    ssl_certificate /etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
-    ssl_session_cache shared:SSL:1m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-
-    real_ip_header proxy_protocol;
-    set_real_ip_from 127.0.0.1;
-
-    # Нужно для продления: при "Always Use HTTPS" в Cloudflare проверка приходит
-    # сюда по HTTPS, и без этого блока отдавалась бы заглушка вместо токена.
-    location /.well-known/acme-challenge/ {
-        root /var/lib/letsencrypt/;
-        default_type "text/plain";
-    }
-
-    location / {
-        root /var/www/stub;
-        index index.html;
-        try_files \$uri \$uri/ /index.html;
-        add_header Cache-Control "no-store, no-cache, must-revalidate";
-    }
-}
-EOF
-    rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    # Конфиг прошлой ноды (другой субдомен) содержит такой же default_server на
-    # 127.0.0.1:8443 — nginx -t упадёт на duplicate. Снимаем всё лишнее.
-    local link
-    for link in /etc/nginx/sites-enabled/*; do
-        [[ -e "$link" ]] || continue
-        [[ "$(basename "$link")" == "$FULL_DOMAIN" ]] && continue
-        grep -q 'proxy_protocol' "$link" 2>/dev/null && rm -f "$link"
-    done
-    ln -sf /etc/nginx/sites-available/$FULL_DOMAIN /etc/nginx/sites-enabled/
-    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
-        echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"; return 1
-    fi
-    systemctl restart nginx >>"$SETUP_LOG" 2>&1
-    if ! systemctl is-active --quiet nginx; then
-        echo "  [СБОЙ] nginx не запустился после подстановки конфига (см. $SETUP_LOG)"
+    if ! write_nginx_site "$FULL_DOMAIN"; then
         cf_restore_proxy
         return 1
     fi
