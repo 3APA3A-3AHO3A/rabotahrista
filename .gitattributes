@@ -1,0 +1,7 @@
+# Скрипты уезжают на Linux-сервер: CRLF ломает их наглухо.
+# Правило обязательно, потому что разработка идёт на Windows.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

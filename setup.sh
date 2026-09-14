@@ -1,34 +1,86 @@
 #!/bin/bash
+# ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
+# Правки вносятся в lib/, затем: python3 build.py
+# Любое изменение здесь будет затёрто при следующей сборке.
+# Собрано из: 00-header.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 50-security.sh, 60-node.sh, 70-web.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 95-menu.sh, 99-main.sh
 
-set -e
-trap 'echo -e "\n[ОШИБКА] Скрипт прерван на строке $LINENO. Код: $?. Подробности: $SETUP_LOG" >&2; exit 1' ERR
+# ===== lib/00-header.sh ================================================
+# ##########################################################################
+#  ЗАГОЛОВОК
+#  Режимы оболочки, обработчик ошибок и все настройки по умолчанию
+# ##########################################################################
+
+# -e  — падать на первой же ошибке, а не идти дальше по сломанному серверу
+# -E  — БЕЗ него ERR-трап не наследуется функциями, и падение внутри любой
+#       функции обрывает скрипт молча, без единой строки объяснения.
+#       Именно поэтому обрыв на Telegram-шаге выглядел как «просто вышел».
+set -eE
+
+# Подробный разбор падения: без имени команды такие ошибки ищутся вслепую.
+# Классический пример — функция, которая заканчивается проверкой [[ ... ]]:
+# при несовпадении она возвращает 1, и set -e молча убивает весь скрипт.
+rh_on_error() {
+    local code="$1" line="$2"; shift 2
+    local cmd="$*"
+    {
+        echo
+        echo "=========================================="
+        echo "  ОШИБКА — установка прервана"
+        echo "=========================================="
+        echo "  команда:      $cmd"
+        [[ -n "${FUNCNAME[1]:-}" ]] && echo "  в функции:    ${FUNCNAME[1]}()"
+        echo "  строка:       $line"
+        echo "  код возврата: $code"
+        echo "  полный лог:   ${SETUP_LOG:-(лог ещё не создан)}"
+        echo "=========================================="
+    } >&2
+    exit 1
+}
+trap 'rh_on_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # === НАСТРОЙКИ ===
 INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/index.html"
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
 INSTALL_STATE="/etc/rabotahrista/install.conf"
+PANEL_ENV="/etc/rabotahrista/panel.env"
+# Пути к генерируемым скриптам — переменными, чтобы тесты могли подставить
+# временный каталог и проверить логику, ничего не устанавливая в систему
+NOTIFY_BIN="/usr/local/bin/rh-notify.sh"
+PANEL_WATCH_BIN="/usr/local/bin/rh-panel-watch.sh"
 SETUP_LOG="/var/log/node-setup.log"
 REPORT_FILE="/root/node-install-report.txt"
 SSH_PORT="${SSH_PORT:-8422}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-NODE_PORT="2222"
+NODE_PORT="2222"        # порт, на который к ноде ходит панель
+WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
 # Пакеты из apt — один список на установку и на отчёт о версиях
 APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
 
-if [ "$EUID" -ne 0 ]; then
-  echo "Пожалуйста, запустите скрипт с правами root (sudo bash ...)"
-  exit 1
+# RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)
+if [[ -z "${RH_LIB_ONLY:-}" && "$EUID" -ne 0 ]]; then
+    echo "Пожалуйста, запустите скрипт с правами root (sudo bash ...)"
+    exit 1
 fi
+
 export DEBIAN_FRONTEND=noninteractive
 # Без UTF-8 локали bash считает длину строк в байтах — колонки отчёта разъезжаются
 if locale -a 2>/dev/null | grep -qix 'C\.UTF-*8'; then export LC_ALL=C.UTF-8; fi
-: > "$SETUP_LOG" 2>/dev/null || SETUP_LOG="/tmp/node-setup.log"
 
+if [[ -z "${RH_LIB_ONLY:-}" ]]; then
+    : > "$SETUP_LOG" 2>/dev/null || SETUP_LOG="/tmp/node-setup.log"
+    # В лог попадает итоговый отчёт вместе с паролем учётки — 0644 тут не годится
+    chmod 600 "$SETUP_LOG" 2>/dev/null || true
+fi
+
+SUMMARY=()
+
+# ===== lib/10-helpers.sh ===============================================
 # ##########################################################################
 #  ХЕЛПЕРЫ
+#  Сводка шагов и печать итогового отчёта
 # ##########################################################################
-SUMMARY=()
+
 # do_step "Метка" функция...  — запускает шаг, пишет результат в сводку (не роняет процесс)
 do_step() {
     local label="$1"; shift
@@ -40,6 +92,7 @@ do_step() {
     fi
     return 0
 }
+
 skip_step() { SUMMARY+=("[проп.]   $1"); }
 
 # Строка отчёта ровной колонкой ("метка" дополняется пробелами до 21 символа)
@@ -133,6 +186,12 @@ print_summary() {
     return 0
 }
 
+# ===== lib/20-prompts.sh ===============================================
+# ##########################################################################
+#  ОПРОС
+#  Всё, что спрашивается у пользователя, и проверка введённого
+# ##########################################################################
+
 ask_domain() {
     DOMAIN=$(echo "${DOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; do
@@ -140,7 +199,9 @@ ask_domain() {
         DOMAIN=$(echo "$DOMAIN" | tr -d '[:space:]')
         [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Только буквы, цифры, точки и дефисы."
     done
+    return 0
 }
+
 ask_subdomain() {
     SUBDOMAIN=$(echo "${SUBDOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]]; do
@@ -148,7 +209,9 @@ ask_subdomain() {
         SUBDOMAIN=$(echo "$SUBDOMAIN" | tr -d '[:space:]')
         [[ "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Только буквы, цифры и дефисы (без точек)."
     done
+    return 0
 }
+
 ask_panel_ip() {
     PANEL_IP=$(echo "${PANEL_IP:-}" | tr -d '[:space:]')
     while [[ ! "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
@@ -156,18 +219,44 @@ ask_panel_ip() {
         PANEL_IP=$(echo "$PANEL_IP" | tr -d '[:space:]')
         [[ "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Введите корректный IPv4."
     done
+    return 0
 }
+
 ask_secret() {
     REMNA_SECRET=$(echo "${REMNA_SECRET:-}" | tr -d '[:space:]')
     while [[ -z "$REMNA_SECRET" ]]; do
         read -ep "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
         REMNA_SECRET=$(echo "$REMNA_SECRET" | tr -d '[:space:]')
     done
+    return 0
 }
+
+# Проверяет, что строка — действительно публичный SSH-ключ.
+# Без этой проверки опечатка или обрезанный при копировании ключ приводит к тому,
+# что скрипт отключает вход по паролю и запирает сервер: ключ-то "непустой".
+ssh_key_valid() {
+    local key="$1"
+    [[ -z "$key" ]] && return 1
+    command -v ssh-keygen >/dev/null 2>&1 || return 0   # нечем проверить — не мешаем
+    local tmp; tmp=$(mktemp)
+    printf '%s\n' "$key" > "$tmp"
+    if ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"; return 0
+    fi
+    rm -f "$tmp"; return 1
+}
+
 ask_ssh_key() {
-    while [[ -z "$SSH_PUBLIC_KEY" ]]; do
+    while ! ssh_key_valid "$SSH_PUBLIC_KEY"; do
+        if [[ -n "$SSH_PUBLIC_KEY" ]]; then
+            echo -e "\e[31m[Ошибка]\e[0m Это не похоже на публичный SSH-ключ."
+            echo "  Нужна одна строка целиком, например: ssh-ed25519 AAAAC3Nza... you@host"
+            SSH_PUBLIC_KEY=""
+        fi
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] SSH_PUBLIC_KEY в конфиге некорректен"; return 1; }
         read -ep "Публичный SSH-ключ (ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
     done
+    return 0
 }
 
 # --- Имя админ-учётки и порт SSH -------------------------------------------
@@ -183,6 +272,7 @@ validate_ssh_params() {
         [[ -n "$SSH_PORT" ]] && echo "  [ВНИМАНИЕ] Некорректный SSH_PORT='$SSH_PORT' — использую 8422."
         SSH_PORT="8422"
     fi
+    return 0
 }
 
 ask_admin_user() {
@@ -206,6 +296,7 @@ ask_admin_user() {
         ADMIN_USER="$input"
         break
     done
+    return 0
 }
 
 ask_ssh_port() {
@@ -218,8 +309,8 @@ ask_ssh_port() {
             echo -e "\e[31m[Ошибка]\e[0m Порт — целое число от 1 до 65535."
             continue
         fi
-        if [[ " 80 443 2222 6000 " == *" $input "* ]]; then
-            echo -e "\e[31m[Ошибка]\e[0m Порт $input занят другими компонентами (80/443 — веб, 2222 — API ноды, 6000 — WARP)."
+        if [[ " 80 443 $NODE_PORT $WARP_PORT " == *" $input "* ]]; then
+            echo -e "\e[31m[Ошибка]\e[0m Порт $input уже занят: 80/443 — веб, $NODE_PORT — API ноды, $WARP_PORT — WARP."
             continue
         fi
         if (( input < 1024 )) && [[ "$input" != "22" ]]; then
@@ -231,6 +322,7 @@ ask_ssh_port() {
         SSH_PORT="$input"
         break
     done
+    return 0
 }
 
 ask_admin_password() {
@@ -271,6 +363,7 @@ ask_ssh_params() {
     validate_ssh_params
     SSH_PARAMS_ASKED=1
 }
+
 ask_cf() {
     [[ -z "$SETUP_CF" && -z "$NONINTERACTIVE" ]] && read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
     if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
@@ -281,38 +374,68 @@ ask_cf() {
         [[ -z "$CF_PROXY_CHOICE" ]] && read -ep "Включить Proxy (Оранжевое облако)? [y/N]: " CF_PROXY_CHOICE
         [[ "$CF_PROXY_CHOICE" =~ ^[Yy]$ ]] && CF_PROXIED="true" || CF_PROXIED="false"
     fi
+    return 0
 }
+
+# ВАЖНО: заканчивается явным "return 0".
+# Без него последняя строка ([[ -z ... ]] без совпадения) вернула бы 1,
+# и вызов "[[ ... ]] && ask_telegram" убивал бы весь скрипт из-за set -e.
 ask_telegram() {
+    [[ -n "$TG_ASKED" || -n "$NONINTERACTIVE" ]] && return 0
     [[ -z "$TG_BOT_TOKEN" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
     [[ -z "$TG_CHAT_ID" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
     [[ -z "$TG_TOPIC_ID" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
+    # Прокси нужен, если сервер не достаёт api.telegram.org напрямую.
+    # Спрашиваем здесь, а не в момент установки: все вопросы должны быть заданы заранее.
+    if [[ -z "$TG_PROXY" ]]; then
+        echo "  Если сервер не достаёт api.telegram.org напрямую, укажите прокси."
+        echo "  Формат: socks5h://user:pass@host:port или http://host:port. Enter — без прокси."
+        read -ep "Прокси для Telegram: " TG_PROXY
+    fi
+    [[ -z "$USER_NODE_LABEL" ]] && read -ep "Как называть эту ноду в уведомлениях (например NL-1): " USER_NODE_LABEL
+    if [[ -z "$PANEL_WATCH" ]]; then
+        echo "  Дежурная нода следит, не пропала ли связь с панелью, и пишет в Telegram."
+        echo "  Включайте ТОЛЬКО на одной ноде: иначе при падении панели напишут все сразу."
+        read -ep "Сделать эту ноду дежурной по панели? [y/N]: " PANEL_WATCH
+    fi
+    TG_ASKED=1
+    return 0
 }
-get_server_ip() { SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org); }
+
+# ===== lib/30-state.sh =================================================
+# ##########################################################################
+#  СОСТОЯНИЕ
+#  Сохранение ответов между запусками, IP сервера, отправка в Telegram
+# ##########################################################################
+
+get_server_ip() {
+    SERVER_IP=$(curl -fs --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    [[ -z "$SERVER_IP" ]] && SERVER_IP=$(curl -fs --max-time 10 https://ifconfig.me 2>/dev/null || true)
+    [[ -z "$SERVER_IP" ]] && SERVER_IP=$(wget -qO- --timeout=10 https://api.ipify.org 2>/dev/null || true)
+    SERVER_IP=$(echo "$SERVER_IP" | tr -d '[:space:]')
+    if [[ ! "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "  [ВНИМАНИЕ] Не удалось определить внешний IP сервера."
+        SERVER_IP=""
+        return 1
+    fi
+    return 0
+}
 
 # Сохранение введённых данных для будущих обновлений (chmod 600 — внутри секреты/токены)
 save_state() {
     mkdir -p "$(dirname "$INSTALL_STATE")"
-    cat <<EOF > "$INSTALL_STATE"
-DOMAIN="$DOMAIN"
-SUBDOMAIN="$SUBDOMAIN"
-PANEL_IP="$PANEL_IP"
-REMNA_SECRET="$REMNA_SECRET"
-SETUP_CF="$SETUP_CF"
-CF_API_TOKEN="$CF_API_TOKEN"
-CF_PROXY_CHOICE="$CF_PROXY_CHOICE"
-SETUP_SSH="$SETUP_SSH"
-SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY"
-SSH_PORT="$SSH_PORT"
-ADMIN_USER="$ADMIN_USER"
-USER_NODE_LABEL="$USER_NODE_LABEL"
-INSTALL_WARP="$INSTALL_WARP"
-INSTALL_SPEEDTEST="$INSTALL_SPEEDTEST"
-SETUP_TG="$SETUP_TG"
-TG_BOT_TOKEN="$TG_BOT_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-TG_TOPIC_ID="$TG_TOPIC_ID"
-TG_PROXY="$TG_PROXY"
-EOF
+    # Значения экранируются через %q: файл потом читается через "source" от root,
+    # и секрет вида a$(команда) иначе выполнился бы, а пароль с $ — молча испортился.
+    {
+        for _v in DOMAIN SUBDOMAIN PANEL_IP REMNA_SECRET SETUP_CF CF_API_TOKEN \
+                  CF_PROXY_CHOICE SETUP_SSH SSH_PUBLIC_KEY SSH_PORT ADMIN_USER \
+                  USER_NODE_LABEL INSTALL_WARP INSTALL_SPEEDTEST SETUP_TG \
+                  TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY PANEL_WATCH \
+                  PANEL_PROBE_PORT PANEL_FAIL_CHECKS; do
+            printf '%s=%q\n' "$_v" "${!_v-}"
+        done
+        unset _v
+    } > "$INSTALL_STATE"
     chmod 600 "$INSTALL_STATE"
 }
 
@@ -325,6 +448,198 @@ notify_telegram() {
     [[ -n "${TG_TOPIC_ID:-}" ]] && args+=(-d "message_thread_id=${TG_TOPIC_ID}")
     curl "${args[@]}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
 }
+
+# ===== lib/40-system.sh ================================================
+# ##########################################################################
+#  СИСТЕМА
+#  Базовая подготовка: swap, пакеты, ядро, диск, автообновления
+# ##########################################################################
+
+comp_swap() {
+    if [ -n "$(swapon --show)" ]; then
+        echo ">>> Swap уже есть, пропускаем."
+        return 0
+    fi
+    echo ">>> Создание Swap 2GB..."
+    # Раньше команды шли через ';' и запись в fstab добавлялась даже при провале —
+    # получался мёртвый swapfile.swap на каждой загрузке и зелёный шаг в сводке.
+    if ! fallocate -l 2G /swapfile >>"$SETUP_LOG" 2>&1; then
+        rm -f /swapfile
+        if ! dd if=/dev/zero of=/swapfile bs=1M count=2048 >>"$SETUP_LOG" 2>&1; then
+            echo "  [СБОЙ] не удалось создать /swapfile (нет места или ФС не поддерживает)"
+            rm -f /swapfile; return 1
+        fi
+    fi
+    chmod 600 /swapfile
+    if ! mkswap /swapfile >>"$SETUP_LOG" 2>&1 || ! swapon /swapfile >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] mkswap/swapon не отработали (см. $SETUP_LOG)"
+        rm -f /swapfile; return 1
+    fi
+    # В fstab пишем только после того, как swap реально включился
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    return 0
+}
+
+comp_packages() {
+    echo ">>> Обновление системы и установка пакетов (в фоне, лог: $SETUP_LOG)..."
+    local rc=0
+    {
+        apt-get clean
+        apt-get update
+        apt-get -y upgrade
+        apt-get -y dist-upgrade
+        apt-get -y autoremove --purge
+        apt-get -y install $APT_PACKAGES
+    } >>"$SETUP_LOG" 2>&1 || rc=$?
+    systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
+    if [[ $rc -ne 0 ]]; then
+        echo "  [СБОЙ] apt завершился с ошибкой (см. $SETUP_LOG)."
+        echo "         Без пакетов следующие шаги тоже посыплются — разберитесь с apt и повторите."
+        return 1
+    fi
+    # Проверяем не «apt отработал», а что ключевое реально на месте
+    local miss=""
+    for pkg in nginx certbot ufw fail2ban jq; do
+        command -v "$pkg" >/dev/null 2>&1 || miss+=" $pkg"
+    done
+    if [[ -n "$miss" ]]; then
+        echo "  [СБОЙ] после установки не найдены:$miss"
+        return 1
+    fi
+    return 0
+}
+
+comp_sysctl() {
+    echo ">>> Тюнинг ядра (sysctl)..."
+    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+    modprobe tcp_bbr || true
+    cat <<EOF > /etc/sysctl.d/99-vpn-tune.conf
+fs.file-max=1048576
+
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+# Меньше уводим в swap
+vm.swappiness=10
+
+# Отключаем icmp ping
+net.ipv4.icmp_echo_ignore_all=1
+
+# Диапазон исходящих портов
+net.ipv4.ip_local_port_range = 1024 65535
+
+# FIN-WAIT-2
+net.ipv4.tcp_fin_timeout = 15
+
+# TCP Keepalive
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+EOF
+    # Ключи ipv6 существуют, только пока стек ipv6 в ядре жив. После ipv6.disable=1
+    # из GRUB их нет, и sysctl --system падает с ошибкой на пустом месте.
+    if [[ -d /proc/sys/net/ipv6 ]]; then
+        cat <<EOF >> /etc/sysctl.d/99-vpn-tune.conf
+
+# Отключаем ipv6
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+EOF
+    else
+        echo -e "\n# ipv6 уже отключён в ядре (ipv6.disable=1 в GRUB) — ключи sysctl не нужны" \
+            >> /etc/sysctl.d/99-vpn-tune.conf
+    fi
+    sysctl --system >>"$SETUP_LOG" 2>&1
+}
+
+comp_ipv6() {
+    echo ">>> Отключение IPv6 в GRUB..."
+    if ! grep -q "ipv6.disable=1" /etc/default/grub; then
+        sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' /etc/default/grub
+        update-grub >>"$SETUP_LOG" 2>&1
+    fi
+}
+
+comp_disk() {
+    echo ">>> Защита диска: ротация логов Docker + journald..."
+    mkdir -p /etc/docker
+    if [[ -f /etc/docker/daemon.json ]]; then
+        # Чужой daemon.json не перезаписываем: там могут быть data-root, dns,
+        # registry-mirrors. Только аккуратно домешиваем настройки логов через jq.
+        if ! command -v jq >/dev/null 2>&1; then
+            echo "  [СБОЙ] /etc/docker/daemon.json уже есть, а jq нет — не рискую его перезаписывать"
+            return 1
+        fi
+        tmp=$(mktemp)
+        if jq '. + {"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' /etc/docker/daemon.json > "$tmp" 2>/dev/null; then
+            mv "$tmp" /etc/docker/daemon.json
+        else
+            rm -f "$tmp"
+            echo "  [СБОЙ] /etc/docker/daemon.json не разбирается как JSON — не трогаю его"
+            return 1
+        fi
+    else
+        cat <<'EOF' > /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+EOF
+    fi
+    systemctl restart docker >>"$SETUP_LOG" 2>&1 || true
+    mkdir -p /etc/systemd/journald.conf.d
+    cat <<'EOF' > /etc/systemd/journald.conf.d/size.conf
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=50M
+EOF
+    systemctl restart systemd-journald >>"$SETUP_LOG" 2>&1 || true
+}
+
+comp_autoupdates() {
+    echo ">>> Автообновления безопасности..."
+    apt-get install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
+    cat <<'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    cat <<'EOF' > /etc/apt/apt.conf.d/52unattended-upgrades-local
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+    systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+    if ! command -v unattended-upgrade >/dev/null 2>&1; then
+        echo "  [СБОЙ] unattended-upgrades не установлен — автообновлений безопасности не будет"
+        return 1
+    fi
+    return 0
+}
+
+comp_os_update() {
+    echo ">>> Полное обновление системы (apt). Вывод — на экран."
+    if apt-get clean && apt-get update && apt-get -y upgrade && apt-get -y dist-upgrade && apt-get -y autoremove --purge; then
+        echo "  Обновление завершено успешно."
+        notify_telegram "🧰 ОС обновлена, ухожу в перезагрузку ($(date '+%H:%M:%S'))"
+        echo "  Перезагрузка через 5 секунд (Ctrl+C — отменить)..."
+        sleep 5
+        reboot
+    else
+        echo "  [СБОЙ] apt-обновление завершилось с ошибкой — перезагрузка отменена."
+        return 1
+    fi
+}
+
+# ===== lib/50-security.sh ==============================================
+# ##########################################################################
+#  БЕЗОПАСНОСТЬ
+#  Пользователь, харденинг SSH, фаервол, fail2ban
+# ##########################################################################
 
 # ##########################################################################
 #  КОМПОНЕНТЫ  (тяжёлый вывод уходит в $SETUP_LOG, на экране — только шаги)
@@ -365,7 +680,12 @@ comp_user() {
 
     echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$ADMIN_USER"
     chmod 440 "/etc/sudoers.d/90-$ADMIN_USER"
-    visudo -c >/dev/null
+    if ! visudo -c >/dev/null 2>>"$SETUP_LOG"; then
+        # Битый sudoers.d ломает sudo целиком, а следом comp_ssh закроет вход под root
+        echo "  [СБОЙ] sudoers не проходит проверку — убираю свой файл"
+        rm -f "/etc/sudoers.d/90-$ADMIN_USER"
+        return 1
+    fi
 
     local H; H=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
     install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$H/.ssh"
@@ -376,6 +696,27 @@ comp_user() {
 
     [[ -s "$H/.ssh/authorized_keys" ]] || { echo "  [СБОЙ] authorized_keys пуст"; return 1; }
     echo "Пользователь готов."
+}
+
+# Порты, на которых СЕЙЧАС слушает именно sshd (а не кто попало).
+# ss -ltnp показывает процесс; при socket-активации слушателем выступает systemd,
+# поэтому его тоже засчитываем — иначе решим, что SSH мёртв, и зря откатимся.
+current_sshd_ports() {
+    ss -H -ltnp 2>/dev/null \
+        | grep -E 'users:\(\("(sshd|systemd)"' \
+        | awk '{print $4}' | sed 's/.*://' | sort -un
+    return 0
+}
+
+sshd_listens_on() {
+    grep -qx "$1" <<< "$(current_sshd_ports)"
+}
+
+ssh_daemon_active() {
+    systemctl is-active --quiet ssh 2>/dev/null && return 0
+    systemctl is-active --quiet sshd 2>/dev/null && return 0
+    systemctl is-active --quiet ssh.socket 2>/dev/null && return 0
+    return 1
 }
 
 comp_ssh() {
@@ -429,20 +770,30 @@ EOF
     # поэтому старый порт продолжал жить до перезагрузки.
     systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1 || true
 
-    # Проверяем фактом, а не надеждой: слушает ли кто-то новый порт
+    # Проверяем фактом, а не надеждой. Важно: «порт кем-то занят» — это НЕ успех.
+    # Если на порту сидит чужой сервис, а sshd не поднялся, старый доступ уже закрыт.
     local i ok=""
     for i in $(seq 1 10); do
-        if ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$SSH_PORT"; then ok=1; break; fi
+        if sshd_listens_on "$SSH_PORT"; then ok=1; break; fi
         sleep 1
     done
 
-    if [[ -n "$ok" ]]; then
+    if [[ -n "$ok" ]] && ssh_daemon_active; then
         SSH_HARDENED=1; SSH_PENDING_REBOOT=""
         echo "  Проверено: sshd слушает порт $SSH_PORT прямо сейчас. Текущая сессия не разорвётся."
         return 0
     fi
 
-    if [[ "$want_port" == "$SSH_PORT" ]]; then
+    # Демон не работает вообще — это авария, откатываемся немедленно
+    if ! ssh_daemon_active; then
+        echo "  [СБОЙ] служба sshd не запущена после перезапуска. Откатываю харденинг."
+        rm -f /etc/ssh/sshd_config.d/01-hardening.conf
+        systemctl restart ssh >>"$SETUP_LOG" 2>&1 || systemctl restart sshd >>"$SETUP_LOG" 2>&1 || true
+        SSH_HARDENED=""; SSH_PENDING_REBOOT=""
+        return 1
+    fi
+
+    if [[ "$want_port" == "$SSH_PORT" ]] && [[ -n "$(current_sshd_ports)" ]]; then
         # Конфиг принят, но демон не перебиндился. Не откатываем — применится на ребуте,
         # а UFW ниже оставит открытым и старый порт, чтобы не потерять доступ.
         SSH_HARDENED=1; SSH_PENDING_REBOOT=1
@@ -459,64 +810,29 @@ EOF
     return 1
 }
 
-comp_swap() {
-    if [ -z "$(swapon --show)" ]; then
-        echo ">>> Создание Swap 2GB..."
-        fallocate -l 2G /swapfile; chmod 600 /swapfile; mkswap /swapfile >>"$SETUP_LOG" 2>&1; swapon /swapfile
-        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    else
-        echo ">>> Swap уже есть, пропускаем."
-    fi
-}
-
-comp_packages() {
-    echo ">>> Обновление системы и установка пакетов (в фоне, лог: $SETUP_LOG)..."
-    {
-        apt-get clean
-        apt-get update
-        apt-get -y upgrade
-        apt-get -y dist-upgrade
-        apt-get -y autoremove --purge
-        apt-get -y install $APT_PACKAGES
-    } >>"$SETUP_LOG" 2>&1
-    systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
-}
-
-comp_speedtest() {
-    echo ">>> Установка Speedtest CLI..."
-    {
-        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
-        if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
-            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get update
-        fi
-        apt-get install -y speedtest
-    } >>"$SETUP_LOG" 2>&1 || { echo "  Speedtest не установился (см. $SETUP_LOG)"; return 1; }
-}
-
-comp_ipv6() {
-    echo ">>> Отключение IPv6 в GRUB..."
-    if ! grep -q "ipv6.disable=1" /etc/default/grub; then
-        sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' /etc/default/grub
-        update-grub >>"$SETUP_LOG" 2>&1
-    fi
-}
-
 comp_ufw() {
     ask_panel_ip
     echo ">>> Настройка UFW..."
     # Открываем целевой порт + все, на которых SSH может быть прямо сейчас.
     # Иначе при отложенном применении порта фаервол запер бы нас снаружи.
-    local ssh_ports p listening
-    listening=$(ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un || true)
-    ssh_ports="$SSH_PORT"                                   # куда переезжаем
+    local ssh_ports p
+    ssh_ports="$SSH_PORT"                                       # куда переезжаем
     for p in $(sshd -T 2>/dev/null | awk '/^port /{print $2}'); do ssh_ports+=" $p"; done
-    grep -qx 22 <<< "$listening" && ssh_ports+=" 22"        # на 22 ещё кто-то слушает — значит не переехали
+    for p in $(current_sshd_ports); do ssh_ports+=" $p"; done   # где sshd сидит прямо сейчас
     ssh_ports=$(printf '%s\n' $ssh_ports | sort -un)
     UFW_SSH_PORTS=""
     for p in $ssh_ports; do UFW_SSH_PORTS+="${UFW_SSH_PORTS:+, }$p/tcp"; done
     echo "  SSH-порты в правилах: $UFW_SSH_PORTS"
 
-    sed -i 's/IPV6=yes/IPV6=no/' /etc/default/ufw
+    # IPV6=no означает, что ufw вообще не трогает ip6tables: политика остаётся
+    # ACCEPT и все порты открыты миру по IPv6. Отключаем фильтрацию, только если
+    # стека IPv6 уже нет в ядре — иначе пусть ufw его фильтрует.
+    if [[ -d /proc/sys/net/ipv6 ]]; then
+        sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
+        echo "  IPv6 ещё активен — фаервол будет фильтровать и его."
+    else
+        sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
+    fi
     sed -i 's|net/ipv4/icmp_echo_ignore_all=0|net/ipv4/icmp_echo_ignore_all=1|' /etc/ufw/sysctl.conf
     {
         ufw --force reset
@@ -528,174 +844,6 @@ comp_ufw() {
         ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'API panel'
         ufw --force enable
     } >>"$SETUP_LOG" 2>&1
-}
-
-comp_sysctl() {
-    echo ">>> Тюнинг ядра (sysctl)..."
-    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-    modprobe tcp_bbr || true
-    cat <<EOF > /etc/sysctl.d/99-vpn-tune.conf
-fs.file-max=1048576
-
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-
-# Меньше уводим в swap
-vm.swappiness=10
-
-# Отключаем icmp ping
-net.ipv4.icmp_echo_ignore_all=1
-
-# Диапазон исходящих портов
-net.ipv4.ip_local_port_range = 1024 65535
-
-# FIN-WAIT-2
-net.ipv4.tcp_fin_timeout = 15
-
-# TCP Keepalive
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 5
-EOF
-    # Ключи ipv6 существуют, только пока стек ipv6 в ядре жив. После ipv6.disable=1
-    # из GRUB их нет, и sysctl --system падает с ошибкой на пустом месте.
-    if [[ -d /proc/sys/net/ipv6 ]]; then
-        cat <<EOF >> /etc/sysctl.d/99-vpn-tune.conf
-
-# Отключаем ipv6
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-EOF
-    else
-        echo -e "\n# ipv6 уже отключён в ядре (ipv6.disable=1 в GRUB) — ключи sysctl не нужны" \
-            >> /etc/sysctl.d/99-vpn-tune.conf
-    fi
-    sysctl --system >>"$SETUP_LOG" 2>&1
-}
-
-comp_docker() {
-    echo ">>> Установка Docker..."
-    if command -v docker >/dev/null 2>&1; then
-        echo "  Docker уже установлен."
-        return 0
-    fi
-    curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
-}
-
-comp_disk() {
-    echo ">>> Защита диска: ротация логов Docker + journald..."
-    mkdir -p /etc/docker
-    if [[ -f /etc/docker/daemon.json ]] && command -v jq >/dev/null 2>&1; then
-        tmp=$(mktemp)
-        if jq '. + {"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' /etc/docker/daemon.json > "$tmp" 2>/dev/null; then
-            mv "$tmp" /etc/docker/daemon.json
-        else
-            rm -f "$tmp"
-        fi
-    else
-        cat <<'EOF' > /etc/docker/daemon.json
-{
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-file": "3" }
-}
-EOF
-    fi
-    systemctl restart docker >>"$SETUP_LOG" 2>&1 || true
-    mkdir -p /etc/systemd/journald.conf.d
-    cat <<'EOF' > /etc/systemd/journald.conf.d/size.conf
-[Journal]
-SystemMaxUse=200M
-SystemMaxFileSize=50M
-EOF
-    systemctl restart systemd-journald >>"$SETUP_LOG" 2>&1 || true
-}
-
-comp_warp() {
-    echo ">>> Установка/переустановка Cloudflare WARP..."
-    {
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
-
-        apt-get update
-        apt-get install -y cloudflare-warp
-
-        warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
-
-        WARP_PORT=6000
-        warp-cli --accept-tos mode proxy || warp-cli mode proxy
-        warp-cli --accept-tos proxy port $WARP_PORT || warp-cli proxy port $WARP_PORT
-
-        warp-cli --accept-tos connect || warp-cli connect
-    } >>"$SETUP_LOG" 2>&1 || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
-}
-
-node_status() {
-    echo "----- Статус ноды -----"
-    docker inspect -f 'Контейнер: {{.State.Status}} (running={{.State.Running}}, restarts={{.RestartCount}}, oom={{.State.OOMKilled}})' remnanode 2>/dev/null || echo "Контейнер remnanode не найден."
-    if ss -H -ltn 2>/dev/null | grep -q ":$NODE_PORT"; then
-        echo "Порт $NODE_PORT (API, к нему подключается панель): СЛУШАЕТ — связь с панелью возможна"
-    else
-        echo "Порт $NODE_PORT (API, к нему подключается панель): НЕ слушает — панель НЕ подключится к ноде"
-    fi
-    echo "----- Последние 30 строк логов -----"
-    docker logs --tail=30 remnanode 2>&1 || echo "Логи недоступны."
-}
-
-comp_node() {
-    ask_secret
-    echo ">>> Разворачивание Remnanode..."
-    mkdir -p /opt/remnanode
-    cat <<EOF > /opt/remnanode/docker-compose.yml
-services:
-  remnanode:
-    container_name: remnanode
-    hostname: remnanode
-    image: remnawave/node:latest
-    network_mode: host
-    restart: always
-    cap_add:
-      - NET_ADMIN
-    ulimits:
-      nofile:
-        soft: 1048576
-        hard: 1048576
-    environment:
-      - NODE_PORT=$NODE_PORT
-      - SECRET_KEY="${REMNA_SECRET}"
-EOF
-    ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1
-    echo "  Ожидание запуска ноды (порт $NODE_PORT, до 15 сек)..."
-    for i in $(seq 1 15); do
-        if ss -H -ltn 2>/dev/null | grep -q ":$NODE_PORT"; then break; fi
-        sleep 1
-    done
-    node_status
-}
-
-comp_node_update() {
-    echo ">>> Обновление ноды Remnanode..."
-    if [[ -f /opt/remnanode/docker-compose.yml ]]; then
-        ( cd /opt/remnanode && docker compose pull && docker compose up -d ) >>"$SETUP_LOG" 2>&1
-        node_status
-        notify_telegram "⬆️ Нода <code>$(hostname)</code> обновлена ($(date '+%H:%M:%S'))"
-    else
-        echo "  Нода не установлена (/opt/remnanode/docker-compose.yml не найден)."
-        return 1
-    fi
-}
-
-comp_os_update() {
-    echo ">>> Полное обновление системы (apt). Вывод — на экран."
-    if apt-get clean && apt-get update && apt-get -y upgrade && apt-get -y dist-upgrade && apt-get -y autoremove --purge; then
-        echo "  Обновление завершено успешно."
-        notify_telegram "🧰 ОС обновлена, ухожу в перезагрузку ($(date '+%H:%M:%S'))"
-        echo "  Перезагрузка через 5 секунд (Ctrl+C — отменить)..."
-        sleep 5
-        reboot
-    else
-        echo "  [СБОЙ] apt-обновление завершилось с ошибкой — перезагрузка отменена."
-        return 1
-    fi
 }
 
 comp_fail2ban() {
@@ -723,172 +871,202 @@ maxretry = 5
 EOF
     systemctl enable fail2ban >/dev/null 2>&1 || true
     systemctl restart fail2ban >>"$SETUP_LOG" 2>&1
-    sleep 2
-    if ! fail2ban-client status sshd >>"$SETUP_LOG" 2>&1; then
-        echo "  [СБОЙ] джейл sshd в fail2ban не поднялся (см. $SETUP_LOG)"; return 1
-    fi
+    # С backend=systemd fail2ban при старте вычитывает журнал за findtime/bantime,
+    # на сервере с большим журналом это заметно дольше двух секунд.
+    local i
+    for i in $(seq 1 15); do
+        if fail2ban-client status sshd >>"$SETUP_LOG" 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "  [СБОЙ] джейл sshd в fail2ban не поднялся за 30 сек (см. $SETUP_LOG)"
+    return 1
 }
 
-comp_autoupdates() {
-    echo ">>> Автообновления безопасности..."
-    apt-get install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
-    cat <<'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
-    cat <<'EOF' > /etc/apt/apt.conf.d/52unattended-upgrades-local
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}-security";
-    "${distro_id}ESMApps:${distro_codename}-apps-security";
-    "${distro_id}ESM:${distro_codename}-infra-security";
-};
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-EOF
-    systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+# ===== lib/60-node.sh ==================================================
+# ##########################################################################
+#  НОДА
+#  Docker и контейнер Remnanode
+# ##########################################################################
+
+# Точное совпадение порта. Раньше было grep ":$NODE_PORT" — подстрока,
+# из-за неё слушатель на 22220 засчитывался за 2222 и нода считалась живой.
+port_is_listening() {
+    ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$1"
 }
 
-comp_telegram() {
-    [[ -z "$TG_BOT_TOKEN" && -z "$NONINTERACTIVE" ]] && read -ep "Telegram BOT_TOKEN: " TG_BOT_TOKEN
-    [[ -z "$TG_CHAT_ID" && -z "$NONINTERACTIVE" ]]   && read -ep "Telegram CHAT_ID (супергруппа: начинается с -100): " TG_CHAT_ID
-    [[ -z "$TG_TOPIC_ID" && -z "$NONINTERACTIVE" ]]  && read -ep "Topic ID темы супергруппы (Enter — если без топиков): " TG_TOPIC_ID
-    [[ -z "$TG_PROXY" && -z "$NONINTERACTIVE" ]]     && read -ep "Прокси для Telegram, если сервер не достаёт api.telegram.org (Enter — без; напр. socks5h://user:pass@host:port или http://host:port): " TG_PROXY
-    echo ">>> Настройка Telegram-уведомлений..."
-    local node_ip node_label
-    node_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "")
-
-    if [[ -z "$NONINTERACTIVE" ]]; then
-        read -ep "Введите красивое описание сервера (например: NL-1, Main-Node): " USER_NODE_LABEL
+comp_docker() {
+    echo ">>> Установка Docker..."
+    if command -v docker >/dev/null 2>&1; then
+        echo "  Docker уже установлен."
+        return 0
     fi
-    if [[ -n "$USER_NODE_LABEL" ]]; then
-        node_label="$USER_NODE_LABEL"
-    elif [[ -n "$FULL_DOMAIN" ]]; then
-        node_label="$FULL_DOMAIN"
+    curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
+}
+
+node_status() {
+    echo "----- Статус ноды -----"
+    docker inspect -f 'Контейнер: {{.State.Status}} (running={{.State.Running}}, restarts={{.RestartCount}}, oom={{.State.OOMKilled}})' remnanode 2>/dev/null || echo "Контейнер remnanode не найден."
+    if port_is_listening "$NODE_PORT"; then
+        echo "Порт $NODE_PORT (API, к нему подключается панель): СЛУШАЕТ — связь с панелью возможна"
     else
-        node_label=$(hostname)
+        echo "Порт $NODE_PORT (API, к нему подключается панель): НЕ слушает — панель НЕ подключится к ноде"
     fi
-    
-    mkdir -p "$(dirname "$NOTIFY_ENV")"
-    cat <<EOF > "$NOTIFY_ENV"
-TG_BOT_TOKEN="$TG_BOT_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-TG_TOPIC_ID="${TG_TOPIC_ID:-}"
-TG_PROXY="${TG_PROXY:-}"
-NODE_LABEL="$node_label"
-NODE_IP="$node_ip"
+    echo "----- Последние 30 строк логов -----"
+    docker logs --tail=30 remnanode 2>&1 || echo "Логи недоступны."
+}
+
+comp_node() {
+    ask_secret
+    echo ">>> Разворачивание Remnanode..."
+    mkdir -p /opt/remnanode
+    chmod 700 /opt/remnanode
+    cat <<EOF > /opt/remnanode/docker-compose.yml
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=$NODE_PORT
+      - SECRET_KEY="${REMNA_SECRET}"
 EOF
-    chmod 600 "$NOTIFY_ENV"
+    chmod 600 /opt/remnanode/docker-compose.yml   # внутри SECRET_KEY ноды
+    if ! ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] docker compose up не отработал (см. $SETUP_LOG)"
+        node_status
+        return 1
+    fi
+    echo "  Ожидание запуска ноды (порт $NODE_PORT, до 30 сек)..."
+    local i up=""
+    for i in $(seq 1 30); do
+        if port_is_listening "$NODE_PORT"; then up=1; break; fi
+        sleep 1
+    done
+    node_status
+    if [[ -z "$up" ]]; then
+        echo "  [СБОЙ] нода не начала слушать порт $NODE_PORT — панель её не увидит"
+        return 1
+    fi
+    return 0
+}
 
-    # универсальный отправщик: добавляет шапку с именем/IP ноды к любому сообщению
-    cat <<SCRIPT > /usr/local/bin/rh-notify.sh
-#!/bin/bash
-[[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
-[[ -z "\$TG_BOT_TOKEN" || -z "\$TG_CHAT_ID" ]] && exit 0
-HEADER="🖥 <b>\${NODE_LABEL:-\$(hostname)}</b>"
-[[ -n "\$NODE_IP" ]] && HEADER="\$HEADER  <code>\${NODE_IP}</code>"
-ARGS=(-s --max-time 15)
-[[ -n "\$TG_PROXY" ]] && ARGS+=(-x "\$TG_PROXY")
-ARGS+=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
-\$1")
-[[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
-curl "\${ARGS[@]}" -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
-SCRIPT
-    chmod 755 /usr/local/bin/rh-notify.sh
+comp_node_update() {
+    echo ">>> Обновление ноды Remnanode..."
+    if [[ -f /opt/remnanode/docker-compose.yml ]]; then
+        if ! ( cd /opt/remnanode && docker compose pull && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
+            echo "  [СБОЙ] обновление не прошло (см. $SETUP_LOG)"
+            node_status
+            notify_telegram "❌ Нода <code>$(hostname)</code>: обновление НЕ удалось ($(date '+%H:%M:%S'))"
+            return 1
+        fi
+        node_status
+        notify_telegram "⬆️ Нода <code>$(hostname)</code> обновлена ($(date '+%H:%M:%S'))"
+    else
+        echo "  Нода не установлена (/opt/remnanode/docker-compose.yml не найден)."
+        return 1
+    fi
+}
 
-    # 1) SSH-вход
-    cat <<'SCRIPT' > /usr/local/bin/rh-ssh-login.sh
-#!/bin/bash
-[[ "$PAM_TYPE" != "open_session" ]] && exit 0
-/usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
-Пользователь: <code>${PAM_USER}</code>
-Откуда IP: <code>${PAM_RHOST}</code>
-Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" &
-exit 0
-SCRIPT
-    chmod 755 /usr/local/bin/rh-ssh-login.sh
-    grep -q "rh-ssh-login.sh" /etc/pam.d/sshd || \
-        echo "session optional pam_exec.so seteuid /usr/local/bin/rh-ssh-login.sh" >> /etc/pam.d/sshd
+# ===== lib/70-web.sh ===================================================
+# ##########################################################################
+#  ВЕБ
+#  Сертификат Let's Encrypt, Cloudflare DNS и nginx
+# ##########################################################################
 
-    # 2) Загрузка сервера
-    cat <<'UNIT' > /etc/systemd/system/rh-boot-notify.service
-[Unit]
-Description=Telegram notify on boot
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStartPre=/bin/sleep 8
-ExecStart=/bin/bash -c '/usr/local/bin/rh-notify.sh "♻️ Сервер загрузился ($(date "+%H:%M:%S %Z"))"'
-[Install]
-WantedBy=multi-user.target
-UNIT
+# Обращение к Cloudflare API. Токен уходит через stdin (--config -),
+# а не в аргументах — иначе он виден в ps любому пользователю сервера.
+cf_api() {
+    local method="$1" path="$2" data="${3:-}"
+    local args=(-s --max-time 30 -X "$method"
+                "https://api.cloudflare.com/client/v4/$path"
+                -H "Content-Type: application/json")
+    [[ -n "$data" ]] && args+=(--data "$data")
+    printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN" \
+        | curl --config - "${args[@]}" 2>/dev/null || echo '{"success":false,"errors":["нет связи с Cloudflare"]}'
+    return 0
+}
 
-    # Мгновенный вотчер падения/подъёма ноды через docker events
-    cat <<'SCRIPT' > /usr/local/bin/rh-node-watch.sh
-#!/bin/bash
-FLAG=/run/rh-node-down
-down(){ [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
-up(){ [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
-docker events --filter 'container=remnanode' --filter 'event=start' --filter 'event=die' --filter 'event=stop' --filter 'event=kill' --format '{{.Action}}' 2>/dev/null | \
-while read -r ev; do
-    case "$ev" in
-        start) up ;;
-        die|stop|kill) down "$ev" ;;
-    esac
-done
-SCRIPT
-    chmod 755 /usr/local/bin/rh-node-watch.sh
-    cat <<'UNIT' > /etc/systemd/system/rh-node-watch.service
-[Unit]
-Description=Watch remnanode docker events -> Telegram (instant)
-After=docker.service
-Requires=docker.service
-[Service]
-Restart=always
-RestartSec=5
-ExecStart=/usr/local/bin/rh-node-watch.sh
-[Install]
-WantedBy=multi-user.target
-UNIT
+# Возвращает оранжевое облако, если мы его снимали на время выпуска сертификата.
+# Вызывается на любом выходе из comp_web: раньше неудачный перевыпуск оставлял
+# запись серой, и настоящий IP сервера становился публичным.
+cf_restore_proxy() {
+    [[ -z "$ZONE_ID" || -z "$RECORD_ID" || -z "$SERVER_IP" ]] && return 0
+    local want="false"
+    [[ "$CF_PROXIED" == "true" || "$CF_WAS_PROXIED" == "true" ]] && want="true"
+    [[ "$want" != "true" ]] && return 0
+    echo ">>> Возвращаю оранжевое облако Cloudflare..."
+    cf_api PUT "zones/$ZONE_ID/dns_records/$RECORD_ID" \
+        '{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":true}' >/dev/null
+    return 0
+}
 
-    # Страховочный опрос: ловит "контейнер жив, но порт 2222 не слушает" (каждые 2 мин)
-    cat <<'SCRIPT' > /usr/local/bin/rh-node-health.sh
-#!/bin/bash
-FLAG=/run/rh-node-down
-RUNNING=$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "false")
-LISTEN=no
-ss -H -ltn 2>/dev/null | grep -q ':2222' && LISTEN=yes
-if [[ "$RUNNING" != "true" || "$LISTEN" != "yes" ]]; then
-    [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Проблема ноды</b>: контейнер running=${RUNNING}, порт2222=${LISTEN} — панель может не видеть ноду"; touch "$FLAG"; }
-else
-    [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода в норме</b>"; rm -f "$FLAG"; }
-fi
-SCRIPT
-    chmod 755 /usr/local/bin/rh-node-health.sh
-    cat <<'UNIT' > /etc/systemd/system/rh-node-health.service
-[Unit]
-Description=Remnanode health (safety net) -> Telegram
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/rh-node-health.sh
-UNIT
-    cat <<'UNIT' > /etc/systemd/system/rh-node-health.timer
-[Unit]
-Description=Remnanode healthcheck safety-net every 2 min
-[Timer]
-OnBootSec=120
-OnUnitActiveSec=120
-[Install]
-WantedBy=timers.target
-UNIT
-    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
-    systemctl enable rh-boot-notify.service >/dev/null 2>&1 || true
-    systemctl enable --now rh-node-watch.service >/dev/null 2>&1 || true
-    systemctl enable --now rh-node-health.timer >/dev/null 2>&1 || true
+# Временный конфиг nginx, который отдаёт только ACME-челлендж
+ACME_SITE="/etc/nginx/sites-available/00-acme"
 
-    /usr/local/bin/rh-notify.sh "✅ Уведомления настроены (SSH-входы, загрузка, мгновенное падение/подъём ноды)"
-    echo "  Тестовое сообщение отправлено в Telegram."
+acme_serve_start() {
+    mkdir -p /var/lib/letsencrypt/.well-known/acme-challenge
+    chown -R www-data:www-data /var/lib/letsencrypt/.well-known 2>/dev/null || true
+    chmod -R 755 /var/lib/letsencrypt/.well-known
+    cat > "$ACME_SITE" <<'EOF'
+server {
+    listen 80 default_server;
+    server_name _;
+    location /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/;
+        default_type "text/plain";
+    }
+    location / { return 404; }
+}
+EOF
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf "$ACME_SITE" /etc/nginx/sites-enabled/00-acme
+    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] временный ACME-конфиг nginx не прошёл проверку (см. $SETUP_LOG)"
+        rm -f /etc/nginx/sites-enabled/00-acme
+        return 1
+    fi
+    systemctl restart nginx >>"$SETUP_LOG" 2>&1
+}
+
+acme_serve_stop() { rm -f /etc/nginx/sites-enabled/00-acme "$ACME_SITE"; }
+
+# Проверяем не «совпадает ли IP», а то, что реально нужно Let's Encrypt:
+# доходит ли запрос к /.well-known/acme-challenge/ до ЭТОГО сервера.
+# За оранжевым облаком Cloudflare IP никогда не совпадёт — и это нормально.
+acme_reachable() {
+    local token file url got i
+    token="rh-$(date +%s)-$RANDOM"
+    file="/var/lib/letsencrypt/.well-known/acme-challenge/$token"
+    echo "$token" > "$file"; chmod 644 "$file"
+    url="http://$FULL_DOMAIN/.well-known/acme-challenge/$token"
+
+    ACME_RESOLVED=$(dig +short "$FULL_DOMAIN" A 2>/dev/null | grep -E '^[0-9.]+$' | tail -n1 || true)
+    echo "  $FULL_DOMAIN резолвится в ${ACME_RESOLVED:-ПУСТО}, IP этого сервера: ${SERVER_IP:-?}"
+    if [[ -n "$ACME_RESOLVED" && -n "$SERVER_IP" && "$ACME_RESOLVED" != "$SERVER_IP" ]]; then
+        echo "  IP не совпадают — обычно это прокси Cloudflare (оранжевое облако), выпуску это не мешает."
+    fi
+    echo "  Проверяю доступность ACME-пути снаружи (до 2 минут)..."
+    for i in $(seq 1 20); do
+        got=$(curl -fsSL --max-time 10 "$url" 2>/dev/null || true)
+        if [[ "$got" == "$token" ]]; then
+            echo "  ОК: запрос дошёл до этого сервера (попытка $i). Let's Encrypt тоже дойдёт."
+            rm -f "$file"; return 0
+        fi
+        echo "  Попытка $i/20: пока не отвечает. Жду 6 сек..."
+        sleep 6
+    done
+    rm -f "$file"
+    return 1
 }
 
 comp_web() {
@@ -898,32 +1076,42 @@ comp_web() {
 
     echo ">>> Заглушка сайта..."
     mkdir -p /var/www/stub
-    mkdir -p /var/lib/letsencrypt/.well-known/acme-challenge/
-    chown -R www-data:www-data /var/lib/letsencrypt/.well-known
-    chmod -R 755 /var/lib/letsencrypt/.well-known
-    echo "test" > /var/lib/letsencrypt/.well-known/acme-challenge/test.txt
     wget -qO /var/www/stub/index.html "$INDEX_URL"
     [ -s /var/www/stub/index.html ] || echo "<html><body><h1>Hello World</h1></body></html>" > /var/www/stub/index.html
 
     if [[ "$SETUP_CF" =~ ^[Yy]$ ]] && [[ -n "$CF_API_TOKEN" ]]; then
         echo ">>> DNS в Cloudflare..."
-        ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
-            -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
-        if [ "$ZONE_ID" == "null" ] || [ -z "$ZONE_ID" ]; then
-            echo "  [ВНИМАНИЕ] Zone ID не получен. Ручной режим."
+        if [[ -z "$SERVER_IP" ]]; then
+            echo "  [СБОЙ] не знаю внешний IP сервера — нечего прописывать в DNS"
+            return 1
+        fi
+        local resp
+        resp=$(cf_api GET "zones?name=$DOMAIN")
+        ZONE_ID=$(jq -r '.result[0].id // empty' <<< "$resp")
+        if [[ -z "$ZONE_ID" ]]; then
+            echo "  [ВНИМАНИЕ] Зона $DOMAIN не найдена или у токена нет прав."
+            echo "    Ответ API: $(jq -rc '.errors // .success' <<< "$resp" 2>/dev/null | head -c 200)"
+            echo "    Продолжаю в ручном режиме: A-запись должна быть заведена вами."
         else
-            RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$FULL_DOMAIN&type=A" \
-                -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
-            JSON_DATA_GRAY='{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":false}'
-            if [ "$RECORD_ID" != "null" ] && [ -n "$RECORD_ID" ]; then
-                curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-                    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$JSON_DATA_GRAY" > /dev/null
+            resp=$(cf_api GET "zones/$ZONE_ID/dns_records?name=$FULL_DOMAIN&type=A")
+            RECORD_ID=$(jq -r '.result[0].id // empty' <<< "$resp")
+            # Запоминаем, было ли включено оранжевое облако: снимем на время выпуска
+            # сертификата и вернём обратно, даже если выпуск сорвётся.
+            CF_WAS_PROXIED=$(jq -r '.result[0].proxied // false' <<< "$resp")
+            local gray='{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":false}'
+            if [[ -n "$RECORD_ID" ]]; then
+                resp=$(cf_api PUT "zones/$ZONE_ID/dns_records/$RECORD_ID" "$gray")
             else
-                CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-                    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$JSON_DATA_GRAY")
-                RECORD_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id')
+                resp=$(cf_api POST "zones/$ZONE_ID/dns_records" "$gray")
+                RECORD_ID=$(jq -r '.result.id // empty' <<< "$resp")
             fi
-            echo "  DNS обновлён, ждём 15 сек..."; sleep 15
+            if [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
+                echo "  [СБОЙ] Cloudflare отклонил запись:"
+                echo "    $(jq -rc '.errors' <<< "$resp" 2>/dev/null | head -c 300)"
+                return 1
+            fi
+            echo "  A-запись $FULL_DOMAIN -> $SERVER_IP обновлена (пока без прокси)."
+            sleep 10
         fi
     fi
 
@@ -931,24 +1119,33 @@ comp_web() {
     if [ -d "/etc/letsencrypt/live/$FULL_DOMAIN" ]; then
         echo "  Сертификат уже есть, пропускаем."
     else
-        ATTEMPTS=0; MAX_ATTEMPTS=30
-        while true; do
-            RESOLVED_IP=$(dig +short "$FULL_DOMAIN" | tail -n1 || true)
-            [ "$RESOLVED_IP" == "$SERVER_IP" ] && { echo "  DNS указывает на $SERVER_IP"; break; }
-            ATTEMPTS=$((ATTEMPTS + 1))
-            echo "  Попытка $ATTEMPTS/$MAX_ATTEMPTS: DNS ещё не обновился (${RESOLVED_IP:-ПУСТО}). Ждём 10 сек..."
-            sleep 10
-            if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ]; then
-                echo "  [ВНИМАНИЕ] DNS не обновился (возможно, за CF Proxy)."
-                if [[ -n "$NONINTERACTIVE" ]]; then echo "  Неинтерактивный режим — продолжаем.";
-                else read -p "  Enter — продолжить на свой риск, Ctrl+C — выход..."; fi
-                break
+        acme_serve_start || return 1
+        if ! acme_reachable; then
+            echo "  [ВНИМАНИЕ] ACME-проверка не дошла до сервера. Возможные причины:"
+            echo "    - A-запись $FULL_DOMAIN ведёт на другой сервер (сейчас: ${ACME_RESOLVED:-ПУСТО}, здесь: $SERVER_IP)"
+            echo "    - порт 80 закрыт (проверь: ufw status | grep 80)"
+            echo "    - в Cloudflare включено правило, ломающее /.well-known/acme-challenge/"
+            if [[ -n "$NONINTERACTIVE" ]]; then
+                echo "  Неинтерактивный режим — пробую выпустить сертификат всё равно."
+            else
+                read -ep "  Пробовать выпустить сертификат всё равно? [y/N]: " TRY_ANYWAY
+                if [[ ! "$TRY_ANYWAY" =~ ^[Yy]$ ]]; then
+                    acme_serve_stop
+                    echo "  [СБОЙ] Выпуск сертификата отменён."
+                    cf_restore_proxy
+                    return 1
+                fi
             fi
-        done
-        if ! certbot --nginx -d "$FULL_DOMAIN" --register-unsafely-without-email --agree-tos --non-interactive >>"$SETUP_LOG" 2>&1; then
+        fi
+        if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
+                --register-unsafely-without-email --agree-tos --non-interactive \
+                --keep-until-expiring >>"$SETUP_LOG" 2>&1; then
+            acme_serve_stop
             echo "  [СБОЙ] Certbot не выпустил сертификат (см. $SETUP_LOG)"
+            cf_restore_proxy
             return 1
         fi
+        acme_serve_stop
     fi
 
     echo ">>> Nginx Fallback..."
@@ -989,6 +1186,13 @@ server {
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
 
+    # Нужно для продления: при "Always Use HTTPS" в Cloudflare проверка приходит
+    # сюда по HTTPS, и без этого блока отдавалась бы заглушка вместо токена.
+    location /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/;
+        default_type "text/plain";
+    }
+
     location / {
         root /var/www/stub;
         index index.html;
@@ -998,23 +1202,386 @@ server {
 }
 EOF
     rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+    # Конфиг прошлой ноды (другой субдомен) содержит такой же default_server на
+    # 127.0.0.1:8443 — nginx -t упадёт на duplicate. Снимаем всё лишнее.
+    local link
+    for link in /etc/nginx/sites-enabled/*; do
+        [[ -e "$link" ]] || continue
+        [[ "$(basename "$link")" == "$FULL_DOMAIN" ]] && continue
+        grep -q 'proxy_protocol' "$link" 2>/dev/null && rm -f "$link"
+    done
     ln -sf /etc/nginx/sites-available/$FULL_DOMAIN /etc/nginx/sites-enabled/
     if ! nginx -t >>"$SETUP_LOG" 2>&1; then
         echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"; return 1
     fi
     systemctl restart nginx >>"$SETUP_LOG" 2>&1
-
-    if [[ "$CF_PROXIED" == "true" ]] && [[ -n "$RECORD_ID" ]] && [[ "$RECORD_ID" != "null" ]]; then
-        echo ">>> Оранжевое облако CF..."
-        JSON_DATA_ORANGE='{"type":"A","name":"'"$FULL_DOMAIN"'","content":"'"$SERVER_IP"'","ttl":1,"proxied":true}'
-        curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-            -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$JSON_DATA_ORANGE" > /dev/null
+    if ! systemctl is-active --quiet nginx; then
+        echo "  [СБОЙ] nginx не запустился после подстановки конфига (см. $SETUP_LOG)"
+        cf_restore_proxy
+        return 1
     fi
+
+    cf_restore_proxy
+    return 0
+}
+
+# ===== lib/80-notify.sh ================================================
+# ##########################################################################
+#  УВЕДОМЛЕНИЯ
+#  Телеграм: вход по SSH, загрузка сервера, падение ноды
+# ##########################################################################
+
+comp_telegram() {
+    ask_telegram          # все вопросы заданы здесь же, если ещё не заданы раньше
+    echo ">>> Настройка Telegram-уведомлений..."
+    local node_ip node_label
+    node_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "")
+
+    if [[ -n "$USER_NODE_LABEL" ]]; then
+        node_label="$USER_NODE_LABEL"
+    elif [[ -n "$FULL_DOMAIN" ]]; then
+        node_label="$FULL_DOMAIN"
+    else
+        node_label=$(hostname)
+    fi
+    
+    mkdir -p "$(dirname "$NOTIFY_ENV")"
+    cat <<EOF > "$NOTIFY_ENV"
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+TG_TOPIC_ID="${TG_TOPIC_ID:-}"
+TG_PROXY="${TG_PROXY:-}"
+NODE_LABEL="$node_label"
+NODE_IP="$node_ip"
+NODE_PORT="$NODE_PORT"
+EOF
+    chmod 600 "$NOTIFY_ENV"
+
+    # универсальный отправщик: добавляет шапку с именем/IP ноды к любому сообщению
+    cat <<SCRIPT > /usr/local/bin/rh-notify.sh
+[[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
+[[ -z "\$TG_BOT_TOKEN" || -z "\$TG_CHAT_ID" ]] && exit 0
+HEADER="🖥 <b>\${NODE_LABEL:-\$(hostname)}</b>"
+[[ -n "\$NODE_IP" ]] && HEADER="\$HEADER  <code>\${NODE_IP}</code>"
+ARGS=(-s --max-time 15)
+[[ -n "\$TG_PROXY" ]] && ARGS+=(-x "\$TG_PROXY")
+ARGS+=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
+\$1")
+[[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
+curl "\${ARGS[@]}" -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
+SCRIPT
+    chmod 755 /usr/local/bin/rh-notify.sh
+
+    # 1) SSH-вход
+    cat <<'SCRIPT' > /usr/local/bin/rh-ssh-login.sh
+[[ "$PAM_TYPE" != "open_session" ]] && exit 0
+/usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
+Пользователь: <code>${PAM_USER}</code>
+Откуда IP: <code>${PAM_RHOST}</code>
+Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" &
+exit 0
+SCRIPT
+    chmod 755 /usr/local/bin/rh-ssh-login.sh
+    grep -q "rh-ssh-login.sh" /etc/pam.d/sshd || \
+        echo "session optional pam_exec.so seteuid /usr/local/bin/rh-ssh-login.sh" >> /etc/pam.d/sshd
+
+    # 2) Загрузка сервера
+    cat <<'UNIT' > /etc/systemd/system/rh-boot-notify.service
+[Unit]
+Description=Telegram notify on boot
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 8
+ExecStart=/bin/bash -c '/usr/local/bin/rh-notify.sh "♻️ Сервер загрузился ($(date "+%%H:%%M:%%S %%Z"))"'
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    # Мгновенный вотчер падения/подъёма ноды через docker events
+    cat <<'SCRIPT' > /usr/local/bin/rh-node-watch.sh
+FLAG=/run/rh-node-down
+down(){ [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
+up(){ [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
+docker events --filter 'container=remnanode' --filter 'event=start' --filter 'event=die' --filter 'event=stop' --filter 'event=kill' --format '{{.Action}}' 2>/dev/null | \
+while read -r ev; do
+    case "$ev" in
+        start) up ;;
+        die|stop|kill) down "$ev" ;;
+    esac
+done
+SCRIPT
+    chmod 755 /usr/local/bin/rh-node-watch.sh
+    cat <<'UNIT' > /etc/systemd/system/rh-node-watch.service
+[Unit]
+Description=Watch remnanode docker events -> Telegram (instant)
+After=docker.service
+Requires=docker.service
+[Service]
+Restart=always
+RestartSec=5
+ExecStart=/usr/local/bin/rh-node-watch.sh
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    # Страховочный опрос: ловит случай "контейнер жив, но порт панели не слушает" (каждые 2 мин).
+    # Heredoc без кавычек: $NOTIFY_ENV подставляется сейчас, всё остальное экранировано
+    # и остаётся переменными внутри сгенерированного скрипта.
+    cat <<SCRIPT > /usr/local/bin/rh-node-health.sh
+[[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
+PORT="\${NODE_PORT:-2222}"
+FLAG=/run/rh-node-down
+RUNNING=\$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "false")
+LISTEN=no
+ss -H -ltn 2>/dev/null | grep -q ":\${PORT}" && LISTEN=yes
+if [[ "\$RUNNING" != "true" || "\$LISTEN" != "yes" ]]; then
+    [[ -f "\$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Проблема ноды</b>: контейнер running=\${RUNNING}, порт \${PORT}=\${LISTEN} — панель может не видеть ноду"; touch "\$FLAG"; }
+else
+    [[ -f "\$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода в норме</b>"; rm -f "\$FLAG"; }
+fi
+SCRIPT
+    chmod 755 /usr/local/bin/rh-node-health.sh
+    cat <<'UNIT' > /etc/systemd/system/rh-node-health.service
+[Unit]
+Description=Remnanode health (safety net) -> Telegram
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rh-node-health.sh
+UNIT
+    cat <<'UNIT' > /etc/systemd/system/rh-node-health.timer
+[Unit]
+Description=Remnanode healthcheck safety-net every 2 min
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=120
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+    systemctl enable rh-boot-notify.service >/dev/null 2>&1 || true
+    systemctl enable rh-node-watch.service >/dev/null 2>&1 || true
+    systemctl restart rh-node-watch.service >>"$SETUP_LOG" 2>&1 || true
+    systemctl enable rh-node-health.timer >/dev/null 2>&1 || true
+    systemctl restart rh-node-health.timer >>"$SETUP_LOG" 2>&1 || true
+
+    # Проверяем ответ Telegram, а не просто факт запуска curl: неверный токен,
+    # не добавленный в группу бот и недоступный api.telegram.org выглядели как успех.
+    local tg_args=(-s --max-time 20)
+    [[ -n "$TG_PROXY" ]] && tg_args+=(-x "$TG_PROXY")
+    local resp
+    resp=$(curl "${tg_args[@]}" -X POST \
+        "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${TG_CHAT_ID}" -d "parse_mode=HTML" \
+        ${TG_TOPIC_ID:+-d "message_thread_id=${TG_TOPIC_ID}"} \
+        --data-urlencode "text=✅ Уведомления настроены (SSH-входы, загрузка, падение/подъём ноды)" 2>/dev/null || true)
+    if grep -q '"ok":true' <<< "$resp"; then
+        echo "  Тестовое сообщение доставлено в Telegram."
+        return 0
+    fi
+    echo "  [СБОЙ] Telegram не принял сообщение. Ответ API:"
+    echo "    $(head -c 300 <<< "${resp:-пустой ответ}")"
+    echo "    Проверьте BOT_TOKEN, CHAT_ID и что бот добавлен в группу."
+    return 1
+}
+
+# ===== lib/82-panel.sh =================================================
+# ##########################################################################
+#  СТОРОЖ ПАНЕЛИ
+#  Дежурная нода замечает, что панель перестала к ней приходить
+# ##########################################################################
+
+# Как это работает и почему именно так.
+#
+# Связь односторонняя: панель сама подключается к ноде на $NODE_PORT и держит
+# постоянные TCP-соединения (наблюдение на живой ноде: три ESTABLISHED с IP
+# панели, стабильно). Нода к панели не ходит вообще — значит узнать о падении
+# панели можно только по косвенному признаку: соединения пропали.
+#
+# У этого признака есть слабое место. Если машина панели умрёт жёстко (питание,
+# паника ядра), сокеты на стороне ноды могут остаться в ESTABLISHED, пока их не
+# добьёт TCP-таймаут. Поэтому есть вторая, активная проверка: нода сама стучится
+# в порт панели. Она ловит ровно тот случай, который пропускает первая.
+#
+# Сторож включается на ОДНОЙ дежурной ноде: иначе при падении панели придёт
+# столько одинаковых сообщений, сколько у вас нод.
+
+comp_panel_watch() {
+    if [[ ! -f "$NOTIFY_ENV" ]]; then
+        echo "  [СБОЙ] сначала настройте Telegram-уведомления (пункт 11) — сторожу некуда писать"
+        return 1
+    fi
+    ask_panel_ip
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        echo "  Активная проверка: нода сама постучится в порт панели."
+        echo "  Это ловит жёсткое падение сервера панели, когда соединения зависают."
+        echo "  Укажите порт веб-панели (обычно 443). Enter — без активной проверки."
+        read -ep "Порт панели для проверки [443]: " PANEL_PROBE_PORT || PANEL_PROBE_PORT=""
+        PANEL_PROBE_PORT=$(echo "${PANEL_PROBE_PORT:-443}" | tr -d '[:space:]')
+        [[ "$PANEL_PROBE_PORT" =~ ^[0-9]+$ ]] || PANEL_PROBE_PORT=""
+    fi
+    PANEL_FAIL_CHECKS="${PANEL_FAIL_CHECKS:-3}"
+
+    echo ">>> Настройка сторожа панели..."
+    mkdir -p "$(dirname "$PANEL_ENV")"
+    cat <<EOF > "$PANEL_ENV"
+PANEL_IP="$PANEL_IP"
+NODE_PORT="$NODE_PORT"
+PANEL_PROBE_PORT="${PANEL_PROBE_PORT:-}"
+# Сколько проверок подряд должно провалиться до тревоги (одна проверка = 2 мин).
+# 3 — это 6 минут: переживает перезапуск панели, но не проспит настоящее падение.
+PANEL_FAIL_CHECKS="$PANEL_FAIL_CHECKS"
+EOF
+    chmod 600 "$PANEL_ENV"
+
+    # Heredoc без кавычек: $PANEL_ENV подставляется сейчас, остальное экранировано
+    # и остаётся переменными внутри сгенерированного скрипта.
+    cat <<SCRIPT > "$PANEL_WATCH_BIN"
+[[ -f "$PANEL_ENV" ]] || exit 0
+source "$PANEL_ENV"
+[[ -z "\$PANEL_IP" ]] && exit 0
+
+COUNT_FILE=/run/rh-panel-fails
+FLAG=/run/rh-panel-down
+
+# 1) Сколько соединений держит панель с этой нодой
+CONNS=\$(ss -H -tn state established "( sport = :\${NODE_PORT} )" 2>/dev/null \\
+        | grep -c "\${PANEL_IP}:" || true)
+
+# 2) Достучаться до панели самим (ловит жёсткое падение, когда сокеты зависли)
+PROBE="skip"
+if [[ -n "\$PANEL_PROBE_PORT" ]]; then
+    if timeout 5 bash -c "exec 3<>/dev/tcp/\${PANEL_IP}/\${PANEL_PROBE_PORT}" 2>/dev/null; then
+        PROBE="ok"
+    else
+        PROBE="fail"
+    fi
+fi
+
+REASON=""
+[[ "\$CONNS" -eq 0 ]] && REASON="панель не держит ни одного соединения с нодой"
+[[ "\$PROBE" == "fail" ]] && REASON="порт \${PANEL_PROBE_PORT} панели не отвечает"
+if [[ "\$CONNS" -eq 0 && "\$PROBE" == "ok" ]]; then
+    REASON="сервер панели отвечает, но к ноде не подключается"
+fi
+
+FAILS=\$(cat "\$COUNT_FILE" 2>/dev/null || echo 0)
+if [[ -n "\$REASON" ]]; then
+    FAILS=\$((FAILS + 1))
+    echo "\$FAILS" > "\$COUNT_FILE"
+    if [[ "\$FAILS" -ge "\${PANEL_FAIL_CHECKS:-3}" && ! -f "\$FLAG" ]]; then
+        MIN=\$(( FAILS * 2 ))
+        $NOTIFY_BIN "🛑 <b>ПАНЕЛЬ НЕ НА СВЯЗИ</b>
+Причина: \${REASON}
+Не отвечает: ~\${MIN} мин
+IP панели: <code>\${PANEL_IP}</code>
+Соединений с нодой: \${CONNS}"
+        touch "\$FLAG"
+    fi
+else
+    echo 0 > "\$COUNT_FILE"
+    if [[ -f "\$FLAG" ]]; then
+        $NOTIFY_BIN "✅ <b>Панель снова на связи</b>
+Соединений с нодой: \${CONNS} (\$(date '+%H:%M:%S'))"
+        rm -f "\$FLAG"
+    fi
+fi
+exit 0
+SCRIPT
+    chmod 755 "$PANEL_WATCH_BIN"
+
+    cat <<UNIT > /etc/systemd/system/rh-panel-watch.service
+[Unit]
+Description=Watch master panel connectivity -> Telegram
+[Service]
+Type=oneshot
+ExecStart=$PANEL_WATCH_BIN
+UNIT
+    cat <<'UNIT' > /etc/systemd/system/rh-panel-watch.timer
+[Unit]
+Description=Panel connectivity check every 2 min
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=120
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+    systemctl enable rh-panel-watch.timer >/dev/null 2>&1 || true
+    systemctl restart rh-panel-watch.timer >>"$SETUP_LOG" 2>&1
+
+    # Сразу проверяем, что сторож видит панель прямо сейчас
+    local conns
+    conns=$(ss -H -tn state established "( sport = :${NODE_PORT} )" 2>/dev/null | grep -c "${PANEL_IP}:" || true)
+    if [[ "$conns" -gt 0 ]]; then
+        echo "  Панель сейчас держит $conns соединений с этой нодой — сторожу есть за чем следить."
+    else
+        echo "  [ВНИМАНИЕ] Панель сейчас НЕ подключена к этой ноде ($conns соединений)."
+        echo "             Либо панель действительно недоступна, либо нода ещё не добавлена в панель."
+    fi
+    PANEL_WATCH="y"
+    echo "  Сторож включён: проверка каждые 2 мин, тревога после $PANEL_FAIL_CHECKS провалов подряд."
+    return 0
+}
+
+comp_panel_watch_off() {
+    echo ">>> Отключаю сторож панели..."
+    systemctl disable --now rh-panel-watch.timer >>"$SETUP_LOG" 2>&1 || true
+    rm -f /etc/systemd/system/rh-panel-watch.timer /etc/systemd/system/rh-panel-watch.service
+    rm -f "$PANEL_WATCH_BIN" /run/rh-panel-down /run/rh-panel-fails
+    systemctl daemon-reload >>"$SETUP_LOG" 2>&1
+    PANEL_WATCH="n"
+    echo "  Сторож отключён. Эта нода больше не следит за панелью."
+    return 0
+}
+
+# ===== lib/85-extras.sh ================================================
+# ##########################################################################
+#  ДОПОЛНЕНИЯ
+#  Необязательные компоненты и диагностика
+# ##########################################################################
+
+comp_warp() {
+    echo ">>> Установка/переустановка Cloudflare WARP..."
+    {
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
+
+        apt-get update
+        apt-get install -y cloudflare-warp
+
+        warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
+
+        warp-cli --accept-tos mode proxy || warp-cli mode proxy
+        warp-cli --accept-tos proxy port "$WARP_PORT" || warp-cli proxy port "$WARP_PORT"
+
+        warp-cli --accept-tos connect || warp-cli connect
+    } >>"$SETUP_LOG" 2>&1 || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
+}
+
+comp_speedtest() {
+    echo ">>> Установка Speedtest CLI..."
+    {
+        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
+        if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
+            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get update
+        fi
+        apt-get install -y speedtest
+    } >>"$SETUP_LOG" 2>&1 || { echo "  Speedtest не установился (см. $SETUP_LOG)"; return 1; }
 }
 
 run_bench() { echo ">>> bench.sh..."; wget -qO- bench.sh | bash || true; }
+
 run_geo()   { echo ">>> ipregion.sh..."; bash <(wget -qO- https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh) || true; }
+
 run_censor() { echo ">>> Проверка блокировок/DPI/DNS (censorcheck)..."; bash <(wget -qO- https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh) || true; }
+
+# ===== lib/90-install.sh ===============================================
+# ##########################################################################
+#  ПОЛНАЯ УСТАНОВКА
+#  Порядок шагов при установке с нуля
+# ##########################################################################
 
 # ##########################################################################
 #  ПОЛНАЯ УСТАНОВКА
@@ -1023,7 +1590,7 @@ full_install() {
     echo -e "\n========== ПОЛНАЯ УСТАНОВКА =========="
     if [[ -n "$STATE_LOADED" && -z "$NONINTERACTIVE" ]]; then
         echo "Найдены данные прошлой установки: ${SUBDOMAIN}.${DOMAIN}, панель ${PANEL_IP}, учётка ${ADMIN_USER}, порт SSH ${SSH_PORT}"
-        read -ep "Обновить с этими данными (без повторного ввода)? [Y/n]: " USE_SAVED
+        read -ep "Обновить с этими данными (без повторного ввода)? [Y/n]: " USE_SAVED || USE_SAVED=""
         if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
             DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
             SETUP_CF=""; CF_API_TOKEN=""; CF_PROXY_CHOICE=""
@@ -1073,6 +1640,11 @@ full_install() {
     do_step "Нода Remnanode" comp_node
     do_step "Веб (заглушка+сертификат+nginx)" comp_web
     [[ -n "$TG_ON" ]] && do_step "Telegram-уведомления" comp_telegram || skip_step "Telegram-уведомления"
+    if [[ -n "$TG_ON" && "$PANEL_WATCH" =~ ^[Yy]$ ]]; then
+        do_step "Сторож панели" comp_panel_watch
+    else
+        skip_step "Сторож панели (нода не дежурная)"
+    fi
 
     notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена ($(date '+%H:%M:%S %Z'))"
 
@@ -1082,9 +1654,9 @@ full_install() {
         echo
         echo "Отчёт выше сохранён в $REPORT_FILE (в нём же пароль учётки)."
         echo "Отключение IPv6 (GRUB) применится только после перезагрузки."
-        read -ep "Доустановить/переустановить что-то в меню перед ребутом? [y/N]: " ADDC
+        read -ep "Доустановить/переустановить что-то в меню перед ребутом? [y/N]: " ADDC || ADDC=""
         [[ "$ADDC" =~ ^[Yy]$ ]] && components_menu
-        read -ep "Перезагрузить сервер сейчас? [Y/n]: " RB
+        read -ep "Перезагрузить сервер сейчас? [Y/n]: " RB || RB=""
         if [[ "$RB" =~ ^[Nn]$ ]]; then
             echo "Ок. Позже перезагрузи вручную (нужно для IPv6): reboot"
             return
@@ -1095,11 +1667,33 @@ full_install() {
     reboot
 }
 
+# ===== lib/95-menu.sh ==================================================
+# ##########################################################################
+#  МЕНЮ
+#  Главное меню и меню компонентов
+# ##########################################################################
+
 # ##########################################################################
 #  МЕНЮ
 # ##########################################################################
+# Запуск компонента из меню.
+# Обязательно через "if", а не напрямую: ERR-трап срабатывает даже при set +e,
+# и любая ненулевая команда внутри comp_* убивала бы весь установщик.
+# Внутри условия и set -e, и ERR-трап подавлены для всего поддерева вызова.
+menu_step() {
+    local label="$1"; shift
+    if "$@"; then
+        echo -e "\n[Готово] $label"
+    else
+        echo -e "\n[СБОЙ] $label — подробности в $SETUP_LOG"
+    fi
+    return 0
+}
+
+# Пункт 8 делает два шага подряд — оборачиваем, чтобы тоже шло через menu_step
+comp_user_and_ssh() { comp_user && comp_ssh; }
+
 components_menu() {
-    set +e
     while true; do
         echo -e "\n===== Компоненты (доустановить / переустановить) ====="
         echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
@@ -1108,6 +1702,7 @@ components_menu() {
         echo "10) IPv6 off (GRUB)"
         echo "--- Безопасность / обслуживание ---"
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
+        echo "21) Сторож панели вкл.    22) Сторож панели выкл."
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -1115,17 +1710,31 @@ components_menu() {
         echo " 0) Назад"
         read -ep "Выбор: " c
         case "$c" in
-            1) comp_warp ;;   2) comp_docker ;;   3) comp_node ;;   4) comp_web ;;
-            5) comp_ufw ;;    6) comp_sysctl ;;   7) comp_swap ;;   8) comp_user && comp_ssh ;;
-            9) comp_speedtest ;; 10) comp_ipv6 ;;
-            11) comp_telegram ;; 12) comp_fail2ban ;; 13) comp_autoupdates ;; 14) comp_disk ;;
-            15) comp_node_update ;; 16) node_status ;;
-            17) run_bench ;; 18) run_geo ;; 19) run_censor ;;
-            20) comp_os_update ;;
-            0) set -e; return ;;
-            *) echo "Нет такого пункта." ;;
+             1) menu_step "Cloudflare WARP"      comp_warp ;;
+             2) menu_step "Docker"               comp_docker ;;
+             3) menu_step "Нода (передеплой)"    comp_node ;;
+             4) menu_step "Веб (заглушка+серт)"  comp_web ;;
+             5) menu_step "UFW"                  comp_ufw ;;
+             6) menu_step "Sysctl-тюнинг"        comp_sysctl ;;
+             7) menu_step "Swap"                 comp_swap ;;
+             8) menu_step "Юзер + SSH-харденинг" comp_user_and_ssh ;;
+             9) menu_step "Speedtest"            comp_speedtest ;;
+            10) menu_step "IPv6 off (GRUB)"      comp_ipv6 ;;
+            11) menu_step "Telegram-уведомления" comp_telegram ;;
+            12) menu_step "fail2ban"             comp_fail2ban ;;
+            13) menu_step "Автообновления"       comp_autoupdates ;;
+            14) menu_step "Защита диска"         comp_disk ;;
+            15) menu_step "Обновление ноды"      comp_node_update ;;
+            16) menu_step "Статус ноды"          node_status ;;
+            17) menu_step "bench.sh"             run_bench ;;
+            18) menu_step "ipregion"             run_geo ;;
+            19) menu_step "censorcheck"          run_censor ;;
+            20) menu_step "Обновление системы"   comp_os_update ;;
+            21) menu_step "Сторож панели"        comp_panel_watch ;;
+            22) menu_step "Отключение сторожа"   comp_panel_watch_off ;;
+             0) return ;;
+             *) echo "Нет такого пункта." ;;
         esac
-        echo -e "\n[Готово] Компонент обработан."
     done
 }
 
@@ -1147,9 +1756,19 @@ main_menu() {
     done
 }
 
+# ===== lib/99-main.sh ==================================================
 # ##########################################################################
 #  ТОЧКА ВХОДА
+#  Три режима: только загрузка функций (тесты), неинтерактивный, меню
 # ##########################################################################
+
+# Режим «только функции»: используется tests/, чтобы вызывать функции по одной
+# без запуска установки. Работает и при source, и при обычном запуске.
+if [[ -n "${RH_LIB_ONLY:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+# Конфиг-файл первым аргументом — неинтерактивная установка
 if [[ -n "$1" && -f "$1" ]]; then
     echo "Загружаю конфигурацию из файла: $1"
     # shellcheck disable=SC1090
@@ -1162,7 +1781,12 @@ if [[ -n "$NONINTERACTIVE" ]] || { [[ -n "$DOMAIN" ]] && [[ -n "$SUBDOMAIN" ]] &
     NONINTERACTIVE=1
     full_install
 else
-    # интерактив: подхватить сохранённые данные прошлой установки как значения по умолчанию
-    [[ -f "$INSTALL_STATE" ]] && { source "$INSTALL_STATE"; STATE_LOADED=1; validate_ssh_params; }
+    # Интерактив: подхватить сохранённые данные прошлой установки как значения по умолчанию
+    if [[ -f "$INSTALL_STATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$INSTALL_STATE"
+        STATE_LOADED=1
+        validate_ssh_params
+    fi
     main_menu
 fi
