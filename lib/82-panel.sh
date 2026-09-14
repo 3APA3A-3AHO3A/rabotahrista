@@ -24,14 +24,9 @@ comp_panel_watch() {
         return 1
     fi
     ask_panel_ip
-    if [[ -z "$NONINTERACTIVE" ]]; then
-        echo "  Активная проверка: нода сама постучится в порт панели."
-        echo "  Это ловит жёсткое падение сервера панели, когда соединения зависают."
-        echo "  Укажите порт веб-панели (обычно 443). Enter — без активной проверки."
-        read -ep "Порт панели для проверки [443]: " PANEL_PROBE_PORT || PANEL_PROBE_PORT=""
-        PANEL_PROBE_PORT=$(echo "${PANEL_PROBE_PORT:-443}" | tr -d '[:space:]')
-        [[ "$PANEL_PROBE_PORT" =~ ^[0-9]+$ ]] || PANEL_PROBE_PORT=""
-    fi
+    # Вопросы задаются заранее (ask_panel_watch_params), а не здесь: во время
+    # установки скрипт не должен останавливаться и ждать ввода.
+    ask_panel_watch_params
     PANEL_FAIL_CHECKS="${PANEL_FAIL_CHECKS:-3}"
 
     echo ">>> Настройка сторожа панели..."

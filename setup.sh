@@ -326,7 +326,18 @@ ask_ssh_port() {
 }
 
 ask_admin_password() {
-    local p1 p2
+    local p1 p2 yn
+    # Если учётка уже есть, решение про пароль принимаем СЕЙЧАС, а не во время
+    # установки: иначе скрипт замрёт с вопросом посреди работ.
+    if id "$ADMIN_USER" &>/dev/null; then
+        echo "  Пользователь $ADMIN_USER уже существует."
+        read -ep "  Сменить ему пароль? [y/N]: " yn
+        if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+            ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
+            echo "  Пароль останется прежним."
+            return 0
+        fi
+    fi
     while true; do
         read -s -p "Пароль для учётки $ADMIN_USER (Enter — сгенерировать случайный): " p1; echo
         if [[ -z "$p1" ]]; then
@@ -398,7 +409,26 @@ ask_telegram() {
         echo "  Включайте ТОЛЬКО на одной ноде: иначе при падении панели напишут все сразу."
         read -ep "Сделать эту ноду дежурной по панели? [y/N]: " PANEL_WATCH
     fi
+    [[ "$PANEL_WATCH" =~ ^[Yy]$ ]] && ask_panel_watch_params
     TG_ASKED=1
+    return 0
+}
+
+# Параметры сторожа панели. Отдельной функцией, потому что спрашиваются они
+# и при полной установке (заранее, вместе с остальными вопросами), и при
+# включении сторожа из меню. Задаются один раз за запуск.
+ask_panel_watch_params() {
+    [[ -n "$PANEL_PARAMS_ASKED" || -n "$NONINTERACTIVE" ]] && return 0
+    if [[ -z "$PANEL_PROBE_PORT" ]]; then
+        echo "  Дополнительно нода может сама стучаться в порт панели."
+        echo "  Это ловит жёсткое падение сервера панели, при котором соединения зависают"
+        echo "  и по ним кажется, что всё в порядке."
+        read -ep "  Порт веб-панели для проверки [443; 0 — не проверять]: " PANEL_PROBE_PORT
+        PANEL_PROBE_PORT=$(echo "${PANEL_PROBE_PORT:-443}" | tr -d '[:space:]')
+        [[ "$PANEL_PROBE_PORT" =~ ^[0-9]+$ ]] || PANEL_PROBE_PORT="443"
+        [[ "$PANEL_PROBE_PORT" == "0" ]] && PANEL_PROBE_PORT=""
+    fi
+    PANEL_PARAMS_ASKED=1
     return 0
 }
 
@@ -498,8 +528,10 @@ comp_packages() {
         return 1
     fi
     # Проверяем не «apt отработал», а что ключевое реально на месте
+    # Проверяем по ИМЕНИ КОМАНДЫ, а оно не всегда совпадает с именем пакета:
+    # у fail2ban исполняемый файл называется fail2ban-client.
     local miss=""
-    for pkg in nginx certbot ufw fail2ban jq; do
+    for pkg in nginx certbot ufw fail2ban-client jq; do
         command -v "$pkg" >/dev/null 2>&1 || miss+=" $pkg"
     done
     if [[ -n "$miss" ]]; then
@@ -660,17 +692,10 @@ comp_user() {
         [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
             echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $ADMIN_PASS  (повторю в итоговом отчёте)"
     else
-        # Существующей учётке пароль молча не меняем — только если явно попросили
+        # Согласие на смену пароля уже получено в ask_admin_password
         if [[ "$ADMIN_PASS_SOURCE" == "manual" && -n "$ADMIN_PASS" ]]; then
-            local yn="y"
-            [[ -z "$NONINTERACTIVE" ]] && read -ep "  Пользователь $ADMIN_USER уже есть. Сменить ему пароль на введённый? [y/N]: " yn
-            if [[ "$yn" =~ ^[Yy]$ ]]; then
-                echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
-                echo "  Пароль изменён."
-            else
-                ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
-                echo "  Пароль оставлен прежним."
-            fi
+            echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
+            echo "  Пароль пользователя $ADMIN_USER изменён."
         else
             ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
             echo "  Пользователь $ADMIN_USER уже существует — пароль не трогаю."
@@ -1205,17 +1230,12 @@ comp_web() {
             echo "    - A-запись $FULL_DOMAIN ведёт на другой сервер (сейчас: ${ACME_RESOLVED:-ПУСТО}, здесь: $SERVER_IP)"
             echo "    - порт 80 закрыт (проверь: ufw status | grep 80)"
             echo "    - в Cloudflare включено правило, ломающее /.well-known/acme-challenge/"
-            if [[ -n "$NONINTERACTIVE" ]]; then
-                echo "  Неинтерактивный режим — пробую выпустить сертификат всё равно."
-            else
-                read -ep "  Пробовать выпустить сертификат всё равно? [y/N]: " TRY_ANYWAY
-                if [[ ! "$TRY_ANYWAY" =~ ^[Yy]$ ]]; then
-                    acme_serve_stop
-                    echo "  [СБОЙ] Выпуск сертификата отменён."
-                    cf_restore_proxy
-                    return 1
-                fi
-            fi
+            # Спросить заранее нельзя — ответ зависит от результата проверки,
+            # а останавливать установку вопросом мы не имеем права. Поэтому
+            # пробуем: проверка бывает ложноотрицательной (сервер не всегда
+            # достаёт собственный внешний адрес), а неудачная попытка certbot
+            # ничего не ломает — шаг просто пометится сбоем.
+            echo "  Пробую выпустить сертификат несмотря на это."
         fi
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \
@@ -1546,14 +1566,9 @@ comp_panel_watch() {
         return 1
     fi
     ask_panel_ip
-    if [[ -z "$NONINTERACTIVE" ]]; then
-        echo "  Активная проверка: нода сама постучится в порт панели."
-        echo "  Это ловит жёсткое падение сервера панели, когда соединения зависают."
-        echo "  Укажите порт веб-панели (обычно 443). Enter — без активной проверки."
-        read -ep "Порт панели для проверки [443]: " PANEL_PROBE_PORT || PANEL_PROBE_PORT=""
-        PANEL_PROBE_PORT=$(echo "${PANEL_PROBE_PORT:-443}" | tr -d '[:space:]')
-        [[ "$PANEL_PROBE_PORT" =~ ^[0-9]+$ ]] || PANEL_PROBE_PORT=""
-    fi
+    # Вопросы задаются заранее (ask_panel_watch_params), а не здесь: во время
+    # установки скрипт не должен останавливаться и ждать ввода.
+    ask_panel_watch_params
     PANEL_FAIL_CHECKS="${PANEL_FAIL_CHECKS:-3}"
 
     echo ">>> Настройка сторожа панели..."

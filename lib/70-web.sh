@@ -225,17 +225,12 @@ comp_web() {
             echo "    - A-запись $FULL_DOMAIN ведёт на другой сервер (сейчас: ${ACME_RESOLVED:-ПУСТО}, здесь: $SERVER_IP)"
             echo "    - порт 80 закрыт (проверь: ufw status | grep 80)"
             echo "    - в Cloudflare включено правило, ломающее /.well-known/acme-challenge/"
-            if [[ -n "$NONINTERACTIVE" ]]; then
-                echo "  Неинтерактивный режим — пробую выпустить сертификат всё равно."
-            else
-                read -ep "  Пробовать выпустить сертификат всё равно? [y/N]: " TRY_ANYWAY
-                if [[ ! "$TRY_ANYWAY" =~ ^[Yy]$ ]]; then
-                    acme_serve_stop
-                    echo "  [СБОЙ] Выпуск сертификата отменён."
-                    cf_restore_proxy
-                    return 1
-                fi
-            fi
+            # Спросить заранее нельзя — ответ зависит от результата проверки,
+            # а останавливать установку вопросом мы не имеем права. Поэтому
+            # пробуем: проверка бывает ложноотрицательной (сервер не всегда
+            # достаёт собственный внешний адрес), а неудачная попытка certbot
+            # ничего не ломает — шаг просто пометится сбоем.
+            echo "  Пробую выпустить сертификат несмотря на это."
         fi
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \

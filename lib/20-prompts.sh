@@ -137,7 +137,18 @@ ask_ssh_port() {
 }
 
 ask_admin_password() {
-    local p1 p2
+    local p1 p2 yn
+    # Если учётка уже есть, решение про пароль принимаем СЕЙЧАС, а не во время
+    # установки: иначе скрипт замрёт с вопросом посреди работ.
+    if id "$ADMIN_USER" &>/dev/null; then
+        echo "  Пользователь $ADMIN_USER уже существует."
+        read -ep "  Сменить ему пароль? [y/N]: " yn
+        if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+            ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
+            echo "  Пароль останется прежним."
+            return 0
+        fi
+    fi
     while true; do
         read -s -p "Пароль для учётки $ADMIN_USER (Enter — сгенерировать случайный): " p1; echo
         if [[ -z "$p1" ]]; then
@@ -209,6 +220,25 @@ ask_telegram() {
         echo "  Включайте ТОЛЬКО на одной ноде: иначе при падении панели напишут все сразу."
         read -ep "Сделать эту ноду дежурной по панели? [y/N]: " PANEL_WATCH
     fi
+    [[ "$PANEL_WATCH" =~ ^[Yy]$ ]] && ask_panel_watch_params
     TG_ASKED=1
+    return 0
+}
+
+# Параметры сторожа панели. Отдельной функцией, потому что спрашиваются они
+# и при полной установке (заранее, вместе с остальными вопросами), и при
+# включении сторожа из меню. Задаются один раз за запуск.
+ask_panel_watch_params() {
+    [[ -n "$PANEL_PARAMS_ASKED" || -n "$NONINTERACTIVE" ]] && return 0
+    if [[ -z "$PANEL_PROBE_PORT" ]]; then
+        echo "  Дополнительно нода может сама стучаться в порт панели."
+        echo "  Это ловит жёсткое падение сервера панели, при котором соединения зависают"
+        echo "  и по ним кажется, что всё в порядке."
+        read -ep "  Порт веб-панели для проверки [443; 0 — не проверять]: " PANEL_PROBE_PORT
+        PANEL_PROBE_PORT=$(echo "${PANEL_PROBE_PORT:-443}" | tr -d '[:space:]')
+        [[ "$PANEL_PROBE_PORT" =~ ^[0-9]+$ ]] || PANEL_PROBE_PORT="443"
+        [[ "$PANEL_PROBE_PORT" == "0" ]] && PANEL_PROBE_PORT=""
+    fi
+    PANEL_PARAMS_ASKED=1
     return 0
 }

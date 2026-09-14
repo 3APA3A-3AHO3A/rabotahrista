@@ -22,17 +22,10 @@ comp_user() {
         [[ "$ADMIN_PASS_SOURCE" == "generated" ]] && \
             echo "!!! ПАРОЛЬ $ADMIN_USER@$(hostname): $ADMIN_PASS  (повторю в итоговом отчёте)"
     else
-        # Существующей учётке пароль молча не меняем — только если явно попросили
+        # Согласие на смену пароля уже получено в ask_admin_password
         if [[ "$ADMIN_PASS_SOURCE" == "manual" && -n "$ADMIN_PASS" ]]; then
-            local yn="y"
-            [[ -z "$NONINTERACTIVE" ]] && read -ep "  Пользователь $ADMIN_USER уже есть. Сменить ему пароль на введённый? [y/N]: " yn
-            if [[ "$yn" =~ ^[Yy]$ ]]; then
-                echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
-                echo "  Пароль изменён."
-            else
-                ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
-                echo "  Пароль оставлен прежним."
-            fi
+            echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
+            echo "  Пароль пользователя $ADMIN_USER изменён."
         else
             ADMIN_PASS=""; ADMIN_PASS_SOURCE="kept"
             echo "  Пользователь $ADMIN_USER уже существует — пароль не трогаю."

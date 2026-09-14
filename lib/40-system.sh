@@ -46,8 +46,10 @@ comp_packages() {
         return 1
     fi
     # Проверяем не «apt отработал», а что ключевое реально на месте
+    # Проверяем по ИМЕНИ КОМАНДЫ, а оно не всегда совпадает с именем пакета:
+    # у fail2ban исполняемый файл называется fail2ban-client.
     local miss=""
-    for pkg in nginx certbot ufw fail2ban jq; do
+    for pkg in nginx certbot ufw fail2ban-client jq; do
         command -v "$pkg" >/dev/null 2>&1 || miss+=" $pkg"
     done
     if [[ -n "$miss" ]]; then
