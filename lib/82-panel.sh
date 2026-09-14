@@ -54,8 +54,11 @@ EOF
 source "$PANEL_ENV"
 [[ -z "\$PANEL_IP" ]] && exit 0
 
-COUNT_FILE=/run/rh-panel-fails
-FLAG=/run/rh-panel-down
+# Каталог состояния: на сервере это /run (сторож работает от root через systemd),
+# в тестах подменяется на временный, чтобы прогон не требовал прав root
+STATE_DIR="\${RH_STATE_DIR:-/run}"
+COUNT_FILE="\$STATE_DIR/rh-panel-fails"
+FLAG="\$STATE_DIR/rh-panel-down"
 
 # 1) Сколько соединений держит панель с этой нодой
 CONNS=\$(ss -H -tn state established "( sport = :\${NODE_PORT} )" 2>/dev/null \\

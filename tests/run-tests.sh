@@ -292,17 +292,17 @@ else
                                        || bad "сгенерированный сторож не парсится"
     run_watch() {  # $1=соединения $2=проба; печатает, что ушло в Telegram
         PW_OUT="$PW/out"; : > "$PW_OUT"
-        PATH="$PW:$PATH" PW_OUT="$PW_OUT" FAKE_CONNS="$1" FAKE_PROBE="$2" \
+        PATH="$PW:$PATH" PW_OUT="$PW_OUT" RH_STATE_DIR="$PW" FAKE_CONNS="$1" FAKE_PROBE="$2" \
             bash "$PW/watch.sh" >/dev/null 2>&1
         cat "$PW_OUT"
     }
-    rm -f /run/rh-panel-fails /run/rh-panel-down
+    rm -f "$PW"/rh-panel-fails "$PW"/rh-panel-down
     R1=$(run_watch 3 ok)                       # всё хорошо
     R2=$(run_watch 0 fail)$(run_watch 0 fail)  # два провала — ещё молчим
     R3=$(run_watch 0 fail)                     # третий — тревога
     R4=$(run_watch 0 fail)                     # повтора быть не должно
     R5=$(run_watch 3 ok)                       # восстановление
-    rm -f /run/rh-panel-fails /run/rh-panel-down
+    rm -f "$PW"/rh-panel-fails "$PW"/rh-panel-down
 
     [[ -z "$R1" ]] && ok "панель на связи — сообщений нет" || bad "лишнее сообщение при живой панели: $R1"
     [[ -z "$R2" ]] && ok "два провала подряд — ещё не паникуем" || bad "паника раньше порога: $R2"
@@ -311,10 +311,10 @@ else
     grep -q "снова на связи" <<< "$R5" && ok "восстановление отмечено" || bad "нет сообщения о восстановлении: $R5"
 
     # Панель отвечает, но к ноде не подключается — это отдельный диагноз
-    rm -f /run/rh-panel-fails /run/rh-panel-down
+    rm -f "$PW"/rh-panel-fails "$PW"/rh-panel-down
     run_watch 0 ok >/dev/null; run_watch 0 ok >/dev/null
     R6=$(run_watch 0 ok)
-    rm -f /run/rh-panel-fails /run/rh-panel-down
+    rm -f "$PW"/rh-panel-fails "$PW"/rh-panel-down
     grep -q "не подключается" <<< "$R6" && ok "случай «сервер жив, но нода не подключена» различается" \
         || bad "неверный диагноз: $R6"
 fi
