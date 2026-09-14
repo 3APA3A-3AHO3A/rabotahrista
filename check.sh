@@ -96,6 +96,29 @@ rhc_perm()      { stat -c '%a' "$1" 2>/dev/null || echo "?"; }
 # и арифметическое сравнение падало с syntax error.
 rhc_num()       { local v; v=$(printf '%s' "${1:-}" | head -1 | tr -cd '0-9'); echo "${v:-0}"; }
 
+# Вердикт о способе продления: имя плагина из renewal-конфига плюс, если он
+# был, результат настоящего dry-run. Отдельной функцией, чтобы тесты могли
+# проверить сам вердикт, не запуская всю диагностику и не требуя root.
+rhc_renewal_verdict() {
+    local cn="$1" dry="${2:-}" auth
+    auth=$(awk -F= '/^authenticator/{gsub(/ /,"",$2); print $2; exit}' \
+           "$LE_RENEWAL/$cn.conf" 2>/dev/null)
+    if [[ "$auth" == "webroot" ]]; then
+        rhc_ok "продление через webroot — конфиг nginx при этом не трогается"
+    elif [[ -z "$auth" ]]; then
+        rhc_warn "не нашёл настройки продления ($LE_RENEWAL/$cn.conf)"
+    elif [[ "$dry" == "ok" ]]; then
+        rhc_ok "продление через «$auth» — не наш способ, но вживую работает, менять не нужно"
+    else
+        rhc_warn "продление настроено через «$auth», а не webroot — не проверено"
+        rhc_info "так делали ранние версии установщика: плагин nginx на время проверки"
+        rhc_info "сам правит конфиг, а за «Always Use HTTPS» в Cloudflare может не сработать"
+        rhc_fix "продление: прогоните пункт 5 меню (настоящий dry-run), и если красный —"
+        rhc_fix "  sudo certbot certonly --webroot -w /var/lib/letsencrypt --cert-name $cn -d $cn --keep-until-expiring"
+    fi
+    return 0
+}
+
 # rh_check [--deep]   — вызывать ТОЛЬКО в подоболочке: ( rh_check )
 rh_check() {
     # Диагностика перебирает десятки проверок, половина из которых штатно
@@ -340,7 +363,8 @@ rh_check() {
     # ----------------------------------------------------------------------
     rhc_sect "Сертификат и nginx"
     # ----------------------------------------------------------------------
-    local rhc_full rhc_certdir rhc_cn rhc_end rhc_days rhc_ngx rhc_auth rhc_enabled
+    local rhc_full rhc_certdir rhc_cn rhc_end rhc_days rhc_ngx rhc_enabled
+    local rhc_dry=""
     rhc_full="${SUBDOMAIN:-}${SUBDOMAIN:+.}${DOMAIN:-}"
     rhc_certdir=$(ls -d "$LE_LIVE"/*/ 2>/dev/null | head -1)
     if [[ -n "$rhc_certdir" ]]; then
@@ -365,19 +389,23 @@ rh_check() {
                 rhc_fix "сертификат: меню, пункт 4 (починка) — перезапишет конфиг nginx правильно"
             fi
         fi
-        rhc_auth=$(awk -F= '/^authenticator/{gsub(/ /,"",$2); print $2; exit}' \
-                   "$LE_RENEWAL/$rhc_cn.conf" 2>/dev/null)
-        if [[ "$rhc_auth" == "webroot" ]]; then
-            rhc_ok "продление через webroot — конфиг nginx при этом не трогается"
-        elif [[ -z "$rhc_auth" ]]; then
-            rhc_warn "не нашёл настройки продления ($LE_RENEWAL/$rhc_cn.conf)"
-        else
-            rhc_warn "продление настроено через «$rhc_auth», а не webroot"
-            rhc_info "так делали ранние версии установщика: плагин nginx на время проверки"
-            rhc_info "сам правит конфиг, а за «Always Use HTTPS» в Cloudflare может не сработать"
-            rhc_fix "продление: проверьте пунктом 5 меню (настоящий dry-run), и если красный —"
-            rhc_fix "  sudo certbot certonly --webroot -w /var/lib/letsencrypt --cert-name $rhc_cn -d $rhc_cn --keep-until-expiring"
+        # Настоящее продление знает больше, чем имя плагина в конфиге, поэтому
+        # сначала прогоняем его (если просили), и только потом судим о способе.
+        # Иначе в одном выводе оказывались и предупреждение про плагин, и
+        # «тестовое продление прошло» — читателю оставалось гадать, кому верить.
+        if [[ -n "$rhc_deep" ]] && command -v certbot >/dev/null 2>&1; then
+            rhc_info "проверяю продление вживую (certbot --dry-run, до минуты)..."
+            if certbot renew --dry-run >/dev/null 2>&1; then
+                rhc_dry="ok"
+                rhc_ok "тестовое продление прошло — сертификат продлится сам"
+            else
+                rhc_dry="fail"
+                rhc_bad "тестовое продление ПРОВАЛИЛОСЬ — через 90 дней сертификат умрёт"
+                rhc_info "подробности: certbot renew --dry-run"
+            fi
         fi
+
+        rhc_renewal_verdict "$rhc_cn" "$rhc_dry"
     else
         rhc_warn "сертификатов Let's Encrypt не найдено"
     fi
@@ -433,16 +461,6 @@ rh_check() {
         else
             rhc_bad "конфиг ноды $rhc_full НЕ опубликован (нет ссылки в sites-enabled)"
             rhc_fix "nginx: ln -sf ${NGINX_AVAIL}/$rhc_full ${NGINX_ENABLED}/"
-        fi
-    fi
-
-    if [[ -n "$rhc_deep" ]] && command -v certbot >/dev/null 2>&1 && [[ -n "$rhc_certdir" ]]; then
-        rhc_info "проверяю продление вживую (certbot --dry-run, до минуты)..."
-        if certbot renew --dry-run >/dev/null 2>&1; then
-            rhc_ok "тестовое продление прошло — сертификат продлится сам"
-        else
-            rhc_bad "тестовое продление ПРОВАЛИЛОСЬ — через 90 дней сертификат умрёт"
-            rhc_info "подробности: certbot renew --dry-run"
         fi
     fi
 

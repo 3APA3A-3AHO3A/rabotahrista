@@ -1455,6 +1455,19 @@ nginx_report_state() {
     return 0
 }
 
+# Есть ли что советовать по nginx. Если конфиг наш, опубликован и содержит путь
+# для ACME в TLS-блоке — печатать простыню не за чем.
+# Возвращает 0 («да, есть»), чтобы читалось как "if nginx_needs_attention".
+nginx_needs_attention() {
+    local dom="$1"
+    local site="$NGINX_AVAIL/$dom"
+    [[ -f "$site" ]]                  || return 0
+    [[ -e "$NGINX_ENABLED/$dom" ]]    || return 0
+    rh_owns_nginx_site "$site"        || return 0
+    awk '/listen .*8443/,0' "$site" 2>/dev/null | grep -q 'acme-challenge' || return 0
+    return 1
+}
+
 # Рекомендация вместо правки. Ничего не меняет — это её единственная задача.
 nginx_advise() {
     local dom="$1" tmp
@@ -2325,15 +2338,100 @@ repair_verify() {
     return 0
 }
 
+# ##########################################################################
+#  ПЛАН
+#  Сначала показываем, что именно будет сделано, и только потом делаем.
+#  Пункт меню — это одна кнопка; человек имеет право знать, что за ней.
+# ##########################################################################
+
+# Каждый шаг — строка "функция|метка|что именно меняет"
+repair_add()  { REPAIR_PLAN+=("$1|$2|$3"); }
+repair_note() { REPAIR_SKIPS+=("$1"); }
+
+repair_build_plan() {
+    REPAIR_PLAN=()
+    REPAIR_SKIPS=()
+
+    repair_add repair_perms "Права на файлы с секретами" \
+        "chmod 600 на install.conf, notify.env, лог и отчёт; 700 на каталог ноды"
+
+    if [[ -f "$SSH_HARDEN_FILE" ]]; then
+        repair_add repair_ssh_hardening "Харденинг SSH" \
+            "только если sshd -T показывает открытый root или вход по паролю: перезальёт $(basename "$SSH_HARDEN_FILE") и перезапустит sshd"
+    else
+        repair_note "Харденинг SSH — на этой ноде не применялся, первичный делается пунктом 2 -> 8"
+    fi
+
+    if getent group docker >/dev/null 2>&1 && [[ -n "${ADMIN_USER:-}" ]] && id "$ADMIN_USER" &>/dev/null; then
+        repair_add docker_group_member "Группа docker у $ADMIN_USER" \
+            "usermod -aG docker, если его там ещё нет (нужно, чтобы docker ps работал без sudo)"
+    else
+        repair_note "Группа docker — Docker не установлен или учётка не определена"
+    fi
+
+    if [[ -f "$NOTIFY_ENV" ]]; then
+        repair_add comp_telegram "Скрипты уведомлений и юниты" \
+            "перезапишет /usr/local/bin/rh-*.sh и systemd-юниты, перезапустит их и пришлёт тестовое сообщение"
+    else
+        repair_note "Уведомления — Telegram на этой ноде не настроен (пункт 2 -> 11)"
+    fi
+
+    if [[ -f "$PANEL_ENV" ]]; then
+        repair_add comp_panel_watch "Сторож панели" \
+            "перезапишет сторожа и его таймер"
+    else
+        repair_note "Сторож панели — нода не дежурная"
+    fi
+
+    repair_add repair_verify "Проверка служебных скриптов" \
+        "ничего не меняет, только читает первую строку каждого скрипта"
+    return 0
+}
+
+repair_print_plan() {
+    local line fn label what n=0
+    echo "  БУДЕТ СДЕЛАНО:"
+    for line in "${REPAIR_PLAN[@]}"; do
+        n=$((n+1))
+        IFS='|' read -r fn label what <<< "$line"
+        printf '   %d) %s\n' "$n" "$label"
+        printf '      %s\n' "$what"
+    done
+    if [[ ${#REPAIR_SKIPS[@]} -gt 0 ]]; then
+        echo
+        echo "  ПРОПУЩУ:"
+        printf '      %s\n' "${REPAIR_SKIPS[@]}"
+    fi
+    echo
+    echo "  НЕ ТРОНУ: фаервол, контейнер ноды, пакеты, nginx. Перезагрузки не будет."
+    echo
+    return 0
+}
+
+# Выбор шагов по одному. Отдельной функцией, чтобы вопрос не оказался
+# внутри шага установки — там ждать ввода нельзя.
+repair_pick_steps() {
+    local line fn label what ans kept=()
+    echo
+    for line in "${REPAIR_PLAN[@]}"; do
+        IFS='|' read -r fn label what <<< "$line"
+        read -ep "  $label — делать? [Y/n]: " ans || ans=""
+        if [[ "$ans" =~ ^[Nn]$ ]]; then
+            REPAIR_SKIPS+=("$label — отказались")
+        else
+            kept+=("$line")
+        fi
+    done
+    REPAIR_PLAN=("${kept[@]}")
+    return 0
+}
+
 run_repair() {
+    SUMMARY=()
     echo
     echo "=========================================="
     echo "  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ"
     echo "=========================================="
-    echo "  Фаервол, контейнер, пакеты и nginx не трогаются, перезагрузки не будет."
-    echo "  SSH правится, только если харденинг фактически слетел."
-    echo "  По nginx будет только рекомендация — правки там делаете вы."
-    echo
 
     FULL_DOMAIN=""
     [[ -n "${SUBDOMAIN:-}" && -n "${DOMAIN:-}" ]] && FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
@@ -2343,37 +2441,49 @@ run_repair() {
     echo "  Telegram: $([[ -n "${TG_BOT_TOKEN:-}" ]] && echo "настроен" || echo "не настроен")"
     echo
 
-    do_step "Права на файлы с секретами" repair_perms
-    do_step "Харденинг SSH (root и пароли)" repair_ssh_hardening
-    do_step "Группа docker у ${ADMIN_USER:-админа}" docker_group_member
+    repair_build_plan
+    repair_print_plan
 
-    # nginx автоматическая починка НЕ ТРОГАЕТ. Человек не видит, что именно
-    # правится, а на сервере рядом с нодой может жить чужой сайт — однажды
-    # починка переписала его конфиг и сняла с публикации конфиг ноды.
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        local ans
+        read -ep "  Выполнить? [y — всё / s — выбрать по шагам / N — отмена]: " ans || ans=""
+        case "$ans" in
+            [Yy]) ;;
+            [Ss]) repair_pick_steps ;;
+            *)    echo "  Отменено. Ничего не изменено."; return 0 ;;
+        esac
+    fi
+
+    if [[ ${#REPAIR_PLAN[@]} -eq 0 ]]; then
+        echo "  Не выбрано ни одного шага. Ничего не изменено."
+        return 0
+    fi
+
+    echo
+    local line fn label what
+    for line in "${REPAIR_PLAN[@]}"; do
+        IFS='|' read -r fn label what <<< "$line"
+        do_step "$label" "$fn"
+    done
+
+    local skipped
+    for skipped in "${REPAIR_SKIPS[@]}"; do skip_step "$skipped"; done
+
+    # nginx автоматическая починка НЕ ТРОГАЕТ: человек не видит, что именно
+    # правится, а рядом с нодой может жить чужой сайт. Рекомендацию печатаем
+    # только когда есть что рекомендовать — иначе это простыня на ровном месте.
     if [[ -n "${DOMAIN_AMBIGUOUS:-}" ]]; then
         echo "  На ноде несколько доменов: $DOMAIN_AMBIGUOUS"
         echo "  Какой из них принадлежит ноде — решать вам."
         skip_step "Конфиг nginx — доменов несколько, разбирайтесь вручную (пункт 2 -> 4)"
-    elif [[ -n "$FULL_DOMAIN" ]]; then
+    elif [[ -z "$FULL_DOMAIN" ]]; then
+        skip_step "Конфиг nginx — домен не определён"
+    elif nginx_needs_attention "$FULL_DOMAIN"; then
         nginx_advise "$FULL_DOMAIN" || true
         skip_step "Конфиг nginx — только рекомендация, ничего не изменено"
     else
-        skip_step "Конфиг nginx — домен не определён"
+        skip_step "Конфиг nginx — в порядке, не трогаю"
     fi
-
-    if [[ -f "$NOTIFY_ENV" ]]; then
-        do_step "Скрипты уведомлений и юниты" comp_telegram
-    else
-        skip_step "Уведомления — Telegram на этой ноде не настроен (пункт 2 -> 11)"
-    fi
-
-    if [[ -f "$PANEL_ENV" ]]; then
-        do_step "Сторож панели" comp_panel_watch
-    else
-        skip_step "Сторож панели — нода не дежурная"
-    fi
-
-    do_step "Проверка служебных скриптов" repair_verify
 
     save_state || true
 
@@ -2421,6 +2531,29 @@ rhc_perm()      { stat -c '%a' "$1" 2>/dev/null || echo "?"; }
 # Из-за этого "|| echo 0" дописывал второй ноль, получалось "0\n0",
 # и арифметическое сравнение падало с syntax error.
 rhc_num()       { local v; v=$(printf '%s' "${1:-}" | head -1 | tr -cd '0-9'); echo "${v:-0}"; }
+
+# Вердикт о способе продления: имя плагина из renewal-конфига плюс, если он
+# был, результат настоящего dry-run. Отдельной функцией, чтобы тесты могли
+# проверить сам вердикт, не запуская всю диагностику и не требуя root.
+rhc_renewal_verdict() {
+    local cn="$1" dry="${2:-}" auth
+    auth=$(awk -F= '/^authenticator/{gsub(/ /,"",$2); print $2; exit}' \
+           "$LE_RENEWAL/$cn.conf" 2>/dev/null)
+    if [[ "$auth" == "webroot" ]]; then
+        rhc_ok "продление через webroot — конфиг nginx при этом не трогается"
+    elif [[ -z "$auth" ]]; then
+        rhc_warn "не нашёл настройки продления ($LE_RENEWAL/$cn.conf)"
+    elif [[ "$dry" == "ok" ]]; then
+        rhc_ok "продление через «$auth» — не наш способ, но вживую работает, менять не нужно"
+    else
+        rhc_warn "продление настроено через «$auth», а не webroot — не проверено"
+        rhc_info "так делали ранние версии установщика: плагин nginx на время проверки"
+        rhc_info "сам правит конфиг, а за «Always Use HTTPS» в Cloudflare может не сработать"
+        rhc_fix "продление: прогоните пункт 5 меню (настоящий dry-run), и если красный —"
+        rhc_fix "  sudo certbot certonly --webroot -w /var/lib/letsencrypt --cert-name $cn -d $cn --keep-until-expiring"
+    fi
+    return 0
+}
 
 # rh_check [--deep]   — вызывать ТОЛЬКО в подоболочке: ( rh_check )
 rh_check() {
@@ -2666,7 +2799,8 @@ rh_check() {
     # ----------------------------------------------------------------------
     rhc_sect "Сертификат и nginx"
     # ----------------------------------------------------------------------
-    local rhc_full rhc_certdir rhc_cn rhc_end rhc_days rhc_ngx rhc_auth rhc_enabled
+    local rhc_full rhc_certdir rhc_cn rhc_end rhc_days rhc_ngx rhc_enabled
+    local rhc_dry=""
     rhc_full="${SUBDOMAIN:-}${SUBDOMAIN:+.}${DOMAIN:-}"
     rhc_certdir=$(ls -d "$LE_LIVE"/*/ 2>/dev/null | head -1)
     if [[ -n "$rhc_certdir" ]]; then
@@ -2691,19 +2825,23 @@ rh_check() {
                 rhc_fix "сертификат: меню, пункт 4 (починка) — перезапишет конфиг nginx правильно"
             fi
         fi
-        rhc_auth=$(awk -F= '/^authenticator/{gsub(/ /,"",$2); print $2; exit}' \
-                   "$LE_RENEWAL/$rhc_cn.conf" 2>/dev/null)
-        if [[ "$rhc_auth" == "webroot" ]]; then
-            rhc_ok "продление через webroot — конфиг nginx при этом не трогается"
-        elif [[ -z "$rhc_auth" ]]; then
-            rhc_warn "не нашёл настройки продления ($LE_RENEWAL/$rhc_cn.conf)"
-        else
-            rhc_warn "продление настроено через «$rhc_auth», а не webroot"
-            rhc_info "так делали ранние версии установщика: плагин nginx на время проверки"
-            rhc_info "сам правит конфиг, а за «Always Use HTTPS» в Cloudflare может не сработать"
-            rhc_fix "продление: проверьте пунктом 5 меню (настоящий dry-run), и если красный —"
-            rhc_fix "  sudo certbot certonly --webroot -w /var/lib/letsencrypt --cert-name $rhc_cn -d $rhc_cn --keep-until-expiring"
+        # Настоящее продление знает больше, чем имя плагина в конфиге, поэтому
+        # сначала прогоняем его (если просили), и только потом судим о способе.
+        # Иначе в одном выводе оказывались и предупреждение про плагин, и
+        # «тестовое продление прошло» — читателю оставалось гадать, кому верить.
+        if [[ -n "$rhc_deep" ]] && command -v certbot >/dev/null 2>&1; then
+            rhc_info "проверяю продление вживую (certbot --dry-run, до минуты)..."
+            if certbot renew --dry-run >/dev/null 2>&1; then
+                rhc_dry="ok"
+                rhc_ok "тестовое продление прошло — сертификат продлится сам"
+            else
+                rhc_dry="fail"
+                rhc_bad "тестовое продление ПРОВАЛИЛОСЬ — через 90 дней сертификат умрёт"
+                rhc_info "подробности: certbot renew --dry-run"
+            fi
         fi
+
+        rhc_renewal_verdict "$rhc_cn" "$rhc_dry"
     else
         rhc_warn "сертификатов Let's Encrypt не найдено"
     fi
@@ -2759,16 +2897,6 @@ rh_check() {
         else
             rhc_bad "конфиг ноды $rhc_full НЕ опубликован (нет ссылки в sites-enabled)"
             rhc_fix "nginx: ln -sf ${NGINX_AVAIL}/$rhc_full ${NGINX_ENABLED}/"
-        fi
-    fi
-
-    if [[ -n "$rhc_deep" ]] && command -v certbot >/dev/null 2>&1 && [[ -n "$rhc_certdir" ]]; then
-        rhc_info "проверяю продление вживую (certbot --dry-run, до минуты)..."
-        if certbot renew --dry-run >/dev/null 2>&1; then
-            rhc_ok "тестовое продление прошло — сертификат продлится сам"
-        else
-            rhc_bad "тестовое продление ПРОВАЛИЛОСЬ — через 90 дней сертификат умрёт"
-            rhc_info "подробности: certbot renew --dry-run"
         fi
     fi
 
@@ -2921,10 +3049,9 @@ menu_check() {
     return 0
 }
 
-# Починка из меню. NONINTERACTIVE делаем локальным: внутри вызова компоненты
-# не задают вопросов, а после возврата из функции всё как было.
+# Починка из меню. NONINTERACTIVE НЕ выставляем: из меню починка обязана
+# показать план и спросить подтверждение, иначе это кнопка вслепую.
 menu_repair() {
-    local NONINTERACTIVE=1
     if run_repair; then
         echo
         echo "Проверить результат: пункт 3."

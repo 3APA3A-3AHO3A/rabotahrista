@@ -235,6 +235,19 @@ nginx_report_state() {
     return 0
 }
 
+# Есть ли что советовать по nginx. Если конфиг наш, опубликован и содержит путь
+# для ACME в TLS-блоке — печатать простыню не за чем.
+# Возвращает 0 («да, есть»), чтобы читалось как "if nginx_needs_attention".
+nginx_needs_attention() {
+    local dom="$1"
+    local site="$NGINX_AVAIL/$dom"
+    [[ -f "$site" ]]                  || return 0
+    [[ -e "$NGINX_ENABLED/$dom" ]]    || return 0
+    rh_owns_nginx_site "$site"        || return 0
+    awk '/listen .*8443/,0' "$site" 2>/dev/null | grep -q 'acme-challenge' || return 0
+    return 1
+}
+
 # Рекомендация вместо правки. Ничего не меняет — это её единственная задача.
 nginx_advise() {
     local dom="$1" tmp

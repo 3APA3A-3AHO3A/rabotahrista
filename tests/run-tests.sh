@@ -815,7 +815,11 @@ R=$(RH_LIB_ONLY=1 bash -c '
     repair_verify() { return 0; }; comp_telegram() { return 0; }
     comp_panel_watch() { return 0; }; save_state() { return 0; }
     nginx_advise() { return 0; }
+    nginx_needs_attention() { return 1; }
+    getent() { return 0; }
+    id() { return 0; }
     docker_group_member() { echo "ЧИНИЛ ГРУППУ"; }
+    ADMIN_USER="vadim"
     run_repair
 ' 2>&1 || true)
 if grep -q "ЧИНИЛ ГРУППУ" <<< "$R"; then
@@ -825,7 +829,106 @@ else
 fi
 
 # --------------------------------------------------------------------------
-head_ "22. shellcheck (если установлен)"
+# Диагностика не должна противоречить сама себе: если настоящий dry-run прошёл,
+# ругаться на «неправильный» плагин продления бессмысленно.
+# Проверяем именно вердикт, а не всю диагностику: rh_check требует root, и на
+# машине разработчика тест из-за этого молча проходил вхолостую.
+verdict() {   # $1 — authenticator в конфиге, $2 — результат dry-run
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        T=$(mktemp -d); LE_RENEWAL="$T"
+        printf "[renewalparams]\nauthenticator = %s\n" "'"$1"'" > "$T/n1.example.com.conf"
+        rhc_renewal_verdict "n1.example.com" "'"${2:-}"'"
+        rm -rf "$T"
+    ' 2>&1 || true
+}
+R=$(verdict nginx ok)
+if grep -q "вживую работает, менять не нужно" <<< "$R" && ! grep -q "а не webroot" <<< "$R"; then
+    ok "успешный dry-run снимает претензию к способу продления"
+else
+    bad "вердикт при успешном dry-run: $R"
+fi
+R=$(verdict nginx "")
+if grep -q "а не webroot" <<< "$R"; then
+    ok "без dry-run претензия к чужому плагину остаётся"
+else
+    bad "быстрый прогон молчит про чужой плагин продления: $R"
+fi
+R=$(verdict webroot "")
+if grep -q "через webroot" <<< "$R" && ! grep -q "не проверено" <<< "$R"; then
+    ok "webroot принимается без оговорок"
+else
+    bad "вердикт по webroot неверен: $R"
+fi
+
+# --------------------------------------------------------------------------
+head_ "22. Починка показывает план и спрашивает"
+# --------------------------------------------------------------------------
+# Пункт меню — одна кнопка. Раньше по ней сразу начинались правки, и человек
+# узнавал о них по факту. Теперь сначала план, потом вопрос.
+repair_run() {   # $1 — что подать на stdin, $2 — доп. код перед запуском
+    printf '%b' "$1" | RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        SETUP_LOG=/dev/null; NONINTERACTIVE=""
+        SUBDOMAIN="n1"; DOMAIN="example.com"; ADMIN_USER="vadim"
+        SSH_HARDEN_FILE=$(mktemp); SUMMARY=()
+        NOTIFY_ENV=/nonexistent; PANEL_ENV=/nonexistent
+        getent() { return 0; }; id() { return 0; }
+        save_state() { return 0; }
+        nginx_needs_attention() { return 1; }
+        repair_perms() { echo "ВЫПОЛНЕН: права"; }
+        repair_ssh_hardening() { echo "ВЫПОЛНЕН: ssh"; }
+        docker_group_member() { echo "ВЫПОЛНЕН: docker"; }
+        repair_verify() { echo "ВЫПОЛНЕН: проверка"; }
+        '"${2:-}"'
+        run_repair
+        rm -f "$SSH_HARDEN_FILE"
+    ' 2>&1 || true
+}
+
+R=$(repair_run 'n\n')
+if grep -q "БУДЕТ СДЕЛАНО" <<< "$R" && grep -q "НЕ ТРОНУ" <<< "$R"; then
+    ok "план печатается до вопроса"
+else
+    bad "плана нет:"; sed 's/^/      /' <<< "$R"
+fi
+if grep -q "ВЫПОЛНЕН" <<< "$R"; then
+    bad "починка начала работать, хотя ответили «нет»:"; grep ВЫПОЛНЕН <<< "$R" | sed 's/^/      /'
+else
+    ok "на «нет» ни один шаг не выполняется"
+fi
+
+R=$(repair_run 'y\n')
+if grep -q "ВЫПОЛНЕН: права" <<< "$R" && grep -q "ВЫПОЛНЕН: проверка" <<< "$R"; then
+    ok "на «да» выполняются все шаги плана"
+else
+    bad "шаги не выполнились:"; sed 's/^/      /' <<< "$R"
+fi
+
+# s — пройтись по шагам; отказываемся от первого, соглашаемся на остальные
+R=$(repair_run 's\nn\ny\ny\ny\n')
+if ! grep -q "ВЫПОЛНЕН: права" <<< "$R" && grep -q "ВЫПОЛНЕН: проверка" <<< "$R"; then
+    ok "по шагам можно отключить отдельный пункт"
+else
+    bad "выбор по шагам не работает:"; grep -E 'ВЫПОЛНЕН|делать' <<< "$R" | sed 's/^/      /'
+fi
+
+# А неинтерактивный --repair обязан работать молча и делать всё
+R=$(repair_run '' 'NONINTERACTIVE=1')
+if grep -q "ВЫПОЛНЕН: права" <<< "$R" && ! grep -q "Выполнить?" <<< "$R"; then
+    ok "--repair не спрашивает и делает всё"
+else
+    bad "неинтерактивный режим сломан:"; sed 's/^/      /' <<< "$R"
+fi
+
+# План обязан называть то, чего на ноде нет, а не молча это скрывать
+if grep -q "ПРОПУЩУ" <<< "$R"; then
+    ok "пропущенные шаги названы в плане"
+else
+    bad "план не показывает, что пропускается"
+fi
+
+head_ "23. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then
