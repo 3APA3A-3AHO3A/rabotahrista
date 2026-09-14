@@ -40,6 +40,10 @@ sshd_ports() {
 listening() { ss -H -ltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un; }
 has_port()  { grep -qx "$1" <<< "$(listening)"; }
 perm_of()   { stat -c '%a' "$1" 2>/dev/null || echo "?"; }
+# grep -c при нуле совпадений печатает "0" И возвращает ненулевой код.
+# Из-за этого "|| echo 0" дописывал второй ноль, получалось "0\n0",
+# и арифметическое сравнение падало с syntax error.
+num()       { local v; v=$(printf '%s' "${1:-}" | head -1 | tr -cd '0-9'); echo "${v:-0}"; }
 
 printf '\033[1m==========================================\n'
 printf '  ДИАГНОСТИКА НОДЫ  —  %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -108,7 +112,7 @@ fi
 
 if [[ -n "${ADMIN_USER:-}" ]] && id "$ADMIN_USER" &>/dev/null; then
     AH=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
-    KEYS=$(grep -cvE '^\s*(#|$)' "$AH/.ssh/authorized_keys" 2>/dev/null || echo 0)
+    KEYS=$(num "$(grep -cvE '^[[:space:]]*(#|$)' "$AH/.ssh/authorized_keys" 2>/dev/null)")
     [[ "$KEYS" -gt 0 ]] && ok "у $ADMIN_USER ключей: $KEYS" || bad "у $ADMIN_USER нет ни одного SSH-ключа"
 fi
 
@@ -272,7 +276,7 @@ if [[ -f "$NOTIFY_ENV" ]]; then
     else
         info "эта нода за панелью не следит (сторож включается на одной дежурной, пункт 21)"
     fi
-    CONNS=$(ss -H -tn state established "( sport = :$NODE_PORT )" 2>/dev/null | grep -c . || echo 0)
+    CONNS=$(num "$(ss -H -tn state established "( sport = :$NODE_PORT )" 2>/dev/null | grep -c .)")
     if [[ "$CONNS" -gt 0 ]]; then
         ok "панель сейчас держит $CONNS соединений с нодой"
     else
@@ -298,7 +302,7 @@ sect "Обновления"
 # --------------------------------------------------------------------------
 command -v unattended-upgrade >/dev/null 2>&1 && ok "автообновления безопасности установлены" \
     || { warn "unattended-upgrades не установлен"; fix "автообновления: меню setup.sh, пункт 13"; }
-SEC=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst.*security' || echo 0)
+SEC=$(num "$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst.*security')")
 [[ "$SEC" -gt 0 ]] && warn "ждут установки обновлений безопасности: $SEC" || ok "обновления безопасности установлены"
 
 # --------------------------------------------------------------------------
