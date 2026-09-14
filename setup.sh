@@ -849,12 +849,27 @@ ssh_neutralize_conflicts() {
     conflicts=$(awk -v n="$inc_line" \
         'NR<n && /^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]/ {print NR}' \
         /etc/ssh/sshd_config 2>/dev/null)
-    [[ -z "$conflicts" ]] && return 0
-    cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-    for n in $conflicts; do
-        sed -i "${n}s|^|# отключено харденингом rabotahrista: |" /etc/ssh/sshd_config
+    if [[ -n "$conflicts" ]]; then
+        cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+        for n in $conflicts; do
+            sed -i "${n}s|^|# отключено харденингом rabotahrista: |" /etc/ssh/sshd_config
+        done
+        echo "  Выше Include нашлись строки, перебивавшие харденинг — закомментированы (строки: $(echo $conflicts | tr '\n' ' '))"
+    fi
+
+    # Дроп-ины читаются по алфавиту, и тот же принцип «первое значение
+    # побеждает» действует между ними. Наш файл называется 01-hardening.conf,
+    # значит всё, что сортируется раньше (00-*.conf и подобное), перебивает его.
+    local f base
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" < "01-hardening.conf" ]] || continue
+        grep -qE '^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]' "$f" || continue
+        cp -a "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
+        sed -i -E 's|^([[:space:]]*(PermitRootLogin\|PasswordAuthentication\|KbdInteractiveAuthentication\|ChallengeResponseAuthentication)[[:space:]])|# отключено харденингом rabotahrista: \1|' "$f"
+        echo "  $base читается раньше нашего файла и перебивал харденинг — строки закомментированы"
     done
-    echo "  Выше Include нашлись строки, перебивавшие харденинг — закомментированы (строки: $(echo $conflicts | tr '\n' ' '))"
     return 0
 }
 
