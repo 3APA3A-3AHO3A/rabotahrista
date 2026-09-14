@@ -2,7 +2,7 @@
 # ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
 # Правки вносятся в lib/, затем: python3 build.py
 # Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 95-menu.sh, 99-main.sh
+# Собрано из: 00-header.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 92-repair.sh, 95-menu.sh, 99-main.sh
 
 # ===== lib/00-header.sh ================================================
 # ##########################################################################
@@ -521,8 +521,16 @@ detect_existing_setup() {
         [[ -n "$TG_BOT_TOKEN" && -z "${SETUP_TG:-}" ]] && SETUP_TG="y"
     fi
 
-    # Дежурная ли эта нода
-    [[ -f "$PANEL_ENV" && -z "${PANEL_WATCH:-}" ]] && PANEL_WATCH="y"
+    # Дежурная ли эта нода и с какими параметрами
+    if [[ -f "$PANEL_ENV" ]]; then
+        [[ -z "${PANEL_WATCH:-}" ]] && PANEL_WATCH="y"
+        local key
+        for key in PANEL_PROBE_PORT PANEL_FAIL_CHECKS; do
+            [[ -n "${!key:-}" ]] && continue
+            v=$(grep -m1 "^${key}=" "$PANEL_ENV" 2>/dev/null | cut -d= -f2- | sed 's/^"//; s/"$//')
+            [[ -n "$v" ]] && printf -v "$key" '%s' "$v"
+        done
+    fi
 
     return 0
 }
@@ -1920,6 +1928,104 @@ full_install() {
     reboot
 }
 
+# ===== lib/92-repair.sh ================================================
+# ##########################################################################
+#  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ
+#  Один проход без вопросов: sudo bash setup.sh --repair
+# ##########################################################################
+
+# Зачем отдельный режим. При обходе парка нод находки повторяются: права на
+# файлы с секретами, отсутствие ACME-пути в конфиге nginx, сломанные служебные
+# скрипты. Ходить по меню на каждой ноде и вводить домен с токеном руками —
+# долго и есть риск опечататься на рабочем сервере.
+#
+# Режим ничего не переустанавливает: не трогает ufw, не пересоздаёт контейнер,
+# не перезагружает сервер. Все ответы берутся с самой ноды.
+
+repair_perms() {
+    local rc=0 f
+    if [[ -d /opt/remnanode ]]; then
+        chmod 700 /opt/remnanode || rc=1
+        [[ -f /opt/remnanode/docker-compose.yml ]] && { chmod 600 /opt/remnanode/docker-compose.yml || rc=1; }
+    fi
+    for f in "$SETUP_LOG" "$INSTALL_STATE" "$NOTIFY_ENV" "$PANEL_ENV" "$REPORT_FILE"; do
+        [[ -f "$f" ]] && { chmod 600 "$f" || rc=1; }
+    done
+    echo "  Права приведены к 600 (каталог ноды — 700)."
+    return $rc
+}
+
+# Проверка, что служебные скрипты действительно годные: файл без первой строки
+# исполняется через /bin/sh, где нет [[ ]], и молча не работает.
+repair_verify() {
+    local f bad=""
+    for f in /usr/local/bin/rh-notify.sh /usr/local/bin/rh-ssh-login.sh \
+             /usr/local/bin/rh-node-watch.sh /usr/local/bin/rh-node-health.sh \
+             /usr/local/bin/rh-panel-watch.sh; do
+        [[ -f "$f" ]] || continue
+        head -1 "$f" | grep -q '^#!' || bad+=" $(basename "$f")"
+    done
+    if [[ -n "$bad" ]]; then
+        echo "  [СБОЙ] без первой строки (#!/bin/bash):$bad"
+        return 1
+    fi
+    echo "  Служебные скрипты на месте и начинаются с #!/bin/bash."
+    return 0
+}
+
+run_repair() {
+    echo
+    echo "=========================================="
+    echo "  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ"
+    echo "=========================================="
+    echo "  Фаервол, контейнер и пакеты не трогаются, перезагрузки не будет."
+    echo
+
+    FULL_DOMAIN=""
+    [[ -n "${SUBDOMAIN:-}" && -n "${DOMAIN:-}" ]] && FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
+    echo "  Нода:     ${FULL_DOMAIN:-не определена}"
+    echo "  Панель:   ${PANEL_IP:-не определена}"
+    echo "  Учётка:   ${ADMIN_USER:-?} | порт SSH: ${SSH_PORT:-?}"
+    echo "  Telegram: $([[ -n "${TG_BOT_TOKEN:-}" ]] && echo "настроен" || echo "не настроен")"
+    echo
+
+    do_step "Права на файлы с секретами" repair_perms
+
+    if [[ -n "$FULL_DOMAIN" ]]; then
+        do_step "Конфиг nginx (путь для ACME)" comp_web
+    else
+        skip_step "Конфиг nginx — домен не определён, почините через меню (пункт 4)"
+    fi
+
+    if [[ -f "$NOTIFY_ENV" ]]; then
+        do_step "Скрипты уведомлений и юниты" comp_telegram
+    else
+        skip_step "Уведомления — Telegram на этой ноде не настроен (пункт 11)"
+    fi
+
+    if [[ -f "$PANEL_ENV" ]]; then
+        do_step "Сторож панели" comp_panel_watch
+    else
+        skip_step "Сторож панели — нода не дежурная"
+    fi
+
+    do_step "Проверка служебных скриптов" repair_verify
+
+    save_state || true
+
+    echo
+    echo "=========================================="
+    echo "  ИТОГ ПОЧИНКИ"
+    echo "=========================================="
+    printf '%s\n' "${SUMMARY[@]}"
+    echo "=========================================="
+    echo
+    echo "Ответы ноды сохранены в $INSTALL_STATE"
+    echo "Проверьте результат:  sudo bash /tmp/check.sh"
+    echo "Продление сертификата: sudo certbot renew --dry-run"
+    return 0
+}
+
 # ===== lib/95-menu.sh ==================================================
 # ##########################################################################
 #  МЕНЮ
@@ -2024,6 +2130,19 @@ main_menu() {
 # без запуска установки. Работает и при source, и при обычном запуске.
 if [[ -n "${RH_LIB_ONLY:-}" ]]; then
     return 0 2>/dev/null || exit 0
+fi
+
+# Починка уже настроенной ноды: без вопросов, без переустановки
+if [[ "${1:-}" == "--repair" ]]; then
+    NONINTERACTIVE=1
+    if [[ -f "$INSTALL_STATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$INSTALL_STATE"
+    fi
+    detect_existing_setup
+    validate_ssh_params
+    run_repair
+    exit 0
 fi
 
 # Конфиг-файл первым аргументом — неинтерактивная установка

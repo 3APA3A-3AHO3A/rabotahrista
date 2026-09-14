@@ -80,8 +80,16 @@ detect_existing_setup() {
         [[ -n "$TG_BOT_TOKEN" && -z "${SETUP_TG:-}" ]] && SETUP_TG="y"
     fi
 
-    # Дежурная ли эта нода
-    [[ -f "$PANEL_ENV" && -z "${PANEL_WATCH:-}" ]] && PANEL_WATCH="y"
+    # Дежурная ли эта нода и с какими параметрами
+    if [[ -f "$PANEL_ENV" ]]; then
+        [[ -z "${PANEL_WATCH:-}" ]] && PANEL_WATCH="y"
+        local key
+        for key in PANEL_PROBE_PORT PANEL_FAIL_CHECKS; do
+            [[ -n "${!key:-}" ]] && continue
+            v=$(grep -m1 "^${key}=" "$PANEL_ENV" 2>/dev/null | cut -d= -f2- | sed 's/^"//; s/"$//')
+            [[ -n "$v" ]] && printf -v "$key" '%s' "$v"
+        done
+    fi
 
     return 0
 }

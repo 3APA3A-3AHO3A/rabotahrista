@@ -9,6 +9,19 @@ if [[ -n "${RH_LIB_ONLY:-}" ]]; then
     return 0 2>/dev/null || exit 0
 fi
 
+# Починка уже настроенной ноды: без вопросов, без переустановки
+if [[ "${1:-}" == "--repair" ]]; then
+    NONINTERACTIVE=1
+    if [[ -f "$INSTALL_STATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$INSTALL_STATE"
+    fi
+    detect_existing_setup
+    validate_ssh_params
+    run_repair
+    exit 0
+fi
+
 # Конфиг-файл первым аргументом — неинтерактивная установка
 if [[ -n "$1" && -f "$1" ]]; then
     echo "Загружаю конфигурацию из файла: $1"
