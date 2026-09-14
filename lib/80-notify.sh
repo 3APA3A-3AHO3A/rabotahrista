@@ -32,6 +32,10 @@ EOF
     # универсальный отправщик: добавляет шапку с именем/IP ноды к любому сообщению
     cat <<SCRIPT > /usr/local/bin/rh-notify.sh
 #!/bin/bash
+# PATH задан явно: этот скрипт вызывается в том числе из pam_exec, который
+# запускает команды с почти пустым окружением. Без PATH не находился бы curl,
+# и уведомление о входе по SSH молча не отправлялось.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
 [[ -z "\$TG_BOT_TOKEN" || -z "\$TG_CHAT_ID" ]] && exit 0
 HEADER="🖥 <b>\${NODE_LABEL:-\$(hostname)}</b>"
@@ -48,16 +52,23 @@ SCRIPT
     # 1) SSH-вход
     cat <<'SCRIPT' > /usr/local/bin/rh-ssh-login.sh
 #!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [[ "$PAM_TYPE" != "open_session" ]] && exit 0
-/usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
+# setsid обязателен: PAM дожидается только самого скрипта, а отправку мы уводим
+# в фон, чтобы не задерживать вход. Без отвязки от сессии фоновый curl успевали
+# убить при зачистке процессов раньше, чем он достучится до Telegram.
+setsid /usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
 Пользователь: <code>${PAM_USER}</code>
 Откуда IP: <code>${PAM_RHOST}</code>
-Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" &
+Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" >/dev/null 2>&1 &
 exit 0
 SCRIPT
     chmod 755 /usr/local/bin/rh-ssh-login.sh
-    grep -q "rh-ssh-login.sh" /etc/pam.d/sshd || \
-        echo "session optional pam_exec.so seteuid /usr/local/bin/rh-ssh-login.sh" >> /etc/pam.d/sshd
+    # Строку переписываем, а не дописываем: на старых нодах она уже есть в
+    # прежнем виде (с seteuid), и простое "добавить, если нет" её не обновит.
+    # seteuid убран: notify.env доступен только root, читать его надо от root.
+    sed -i '\|rh-ssh-login\.sh|d' /etc/pam.d/sshd
+    echo "session optional pam_exec.so /usr/local/bin/rh-ssh-login.sh" >> /etc/pam.d/sshd
 
     # 2) Загрузка сервера
     cat <<'UNIT' > /etc/systemd/system/rh-boot-notify.service

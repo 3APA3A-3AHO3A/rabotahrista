@@ -44,8 +44,14 @@ def assemble() -> str:
     parts: list[str] = ["#!/bin/bash", BANNER, "# Собрано из: " + ", ".join(f.name for f in files), ""]
     for f in files:
         text = f.read_text(encoding="utf-8")
-        # shebang есть только у 00-header.sh — в середине файла он не нужен
-        lines = [ln for ln in text.split("\n") if not ln.startswith("#!/")]
+        # Убираем ТОЛЬКО собственный shebang модуля — он всегда первой строкой.
+        # Раньше вырезались все строки с "#!/", и вместе с ними пропадали
+        # shebang'и внутри heredoc'ов, которыми модули генерируют служебные
+        # скрипты на сервере: файлы получались без первой строки и исполнялись
+        # через /bin/sh, где нет [[ ]]. Ломалось молча.
+        lines = text.split("\n")
+        if lines and lines[0].startswith("#!/"):
+            lines = lines[1:]
         parts.append(f"# ===== lib/{f.name} " + "=" * max(0, 60 - len(f.name)))
         parts.append("\n".join(lines).strip("\n"))
         parts.append("")

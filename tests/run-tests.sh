@@ -62,6 +62,27 @@ fi
 if "$PY" build.py >/dev/null 2>&1; then ok "build.py отработал"; else bad "build.py упал"; fi
 if bash -n setup.sh 2>/dev/null; then ok "bash -n setup.sh"; else bad "bash -n setup.sh"; bash -n setup.sh; fi
 if head -1 setup.sh | grep -q '^#!/bin/bash'; then ok "shebang на первой строке"; else bad "нет shebang"; fi
+
+# Модули генерируют на сервере служебные скрипты, и внутри heredoc'ов лежат
+# их собственные shebang'и. Сборщик однажды вырезал их все разом — файлы
+# получались без первой строки, исполнялись через /bin/sh (где нет [[ ]])
+# и молча не работали. Считаем: сборка убирает ровно один shebang и добавляет
+# свой, значит количество обязано совпадать.
+LIBSHE=$(grep -c '^#!/bin/bash' lib/*.sh 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+SETSHE=$(grep -c '^#!/bin/bash' setup.sh 2>/dev/null || echo 0)
+if [[ "$LIBSHE" -eq "$SETSHE" ]]; then
+    ok "shebang'и генерируемых скриптов на месте ($SETSHE)"
+else
+    bad "сборка потеряла shebang'и: в lib/ $LIBSHE, в setup.sh $SETSHE"
+fi
+# И структурно: первая строка каждого генерируемого скрипта — shebang
+NOSHE=$(awk '/cat <<.*> \/usr\/local\/bin\// { f=NR; getline; if ($0 !~ /^#!\//) print f": "$0 }' setup.sh)
+if [[ -n "$NOSHE" ]]; then
+    bad "генерируемый скрипт начинается не с shebang:"
+    echo "$NOSHE" | sed 's/^/      /'
+else
+    ok "каждый генерируемый скрипт начинается с shebang"
+fi
 if grep -qU $'\r' setup.sh; then bad "в setup.sh есть CRLF — на сервере сломается"; else ok "переводы строк LF"; fi
 
 # --------------------------------------------------------------------------
