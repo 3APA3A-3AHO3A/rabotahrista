@@ -12,6 +12,19 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; PASSED=$((PASSED+1)); }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; FAILED=$((FAILED+1)); }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
+# Тестовый SSH-ключ. Проверка ключа в скрипте настоящая (через ssh-keygen),
+# поэтому строка-пустышка не годится: с ней тесты проходили только там, где
+# ssh-keygen не установлен, и падали на любой машине, где он есть.
+TESTKEY=""
+if command -v ssh-keygen >/dev/null 2>&1; then
+    _kf=$(mktemp -u)
+    ssh-keygen -q -t ed25519 -N "" -f "$_kf" <<< y >/dev/null 2>&1
+    TESTKEY=$(cat "$_kf.pub" 2>/dev/null || true)
+    rm -f "$_kf" "$_kf.pub"
+fi
+# Без ssh-keygen проверка ключа пропускается, поэтому годится любая непустая строка
+TESTKEY="${TESTKEY:-ssh-ed25519 AAAAtest test@no-keygen}"
+
 # --------------------------------------------------------------------------
 head_ "1. Синтаксис"
 # --------------------------------------------------------------------------
@@ -45,7 +58,7 @@ RH_LIB_ONLY=1 bash -c '
     source "'"$ROOT"'/setup.sh"
     # всё заполнено — ни один read не должен сработать
     DOMAIN="example.com"; SUBDOMAIN="node-1"; PANEL_IP="1.2.3.4"
-    REMNA_SECRET="secret"; SSH_PUBLIC_KEY="ssh-ed25519 AAAA test"
+    REMNA_SECRET="secret"; SSH_PUBLIC_KEY="'"$TESTKEY"'"
     ADMIN_USER="deploy"; SSH_PORT="45123"; ADMIN_PASS="pass"
     SETUP_CF="n"; CF_API_TOKEN=""; CF_PROXY_CHOICE="n"
     TG_BOT_TOKEN="123:ABC"; TG_CHAT_ID="-100123"; TG_TOPIC_ID="7"
@@ -111,7 +124,7 @@ printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
     set -e
     source "'"$ROOT"'/setup.sh"
     DOMAIN="example.com"; SUBDOMAIN="node-1"; PANEL_IP="1.2.3.4"
-    REMNA_SECRET="secret"; SSH_PUBLIC_KEY="ssh-ed25519 AAAA test"
+    REMNA_SECRET="secret"; SSH_PUBLIC_KEY="'"$TESTKEY"'"
     ADMIN_USER="deploy"; SSH_PORT="45123"
     INSTALL_WARP="n"; INSTALL_SPEEDTEST="n"
     SETUP_CF="n"; CF_PROXY_CHOICE="n"
@@ -222,15 +235,13 @@ head_ "12. Битый SSH-ключ отбраковывается"
 if ! command -v ssh-keygen >/dev/null 2>&1; then
     printf '  — ssh-keygen не установлен, пропускаю\n'
 else
-    ssh-keygen -q -t ed25519 -N "" -f /tmp/rh-testkey <<< y >/dev/null 2>&1
-    GOODKEY=$(cat /tmp/rh-testkey.pub)
+    GOODKEY="$TESTKEY"
     KEYCHK=$(RH_LIB_ONLY=1 bash -c '
         source "'"$ROOT"'/setup.sh"
         ssh_key_valid "ssh-ed25519 AAAAOBREZANNYY" && echo "ПЛОХОЙ ПРИНЯТ" || echo "плохой отклонён"
         ssh_key_valid "" && echo "ПУСТОЙ ПРИНЯТ" || echo "пустой отклонён"
         ssh_key_valid "'"$GOODKEY"'" && echo "хороший принят" || echo "ХОРОШИЙ ОТКЛОНЁН"
     ' 2>&1 || true)
-    rm -f /tmp/rh-testkey /tmp/rh-testkey.pub
     if grep -q "плохой отклонён" <<< "$KEYCHK" && grep -q "пустой отклонён" <<< "$KEYCHK" \
        && grep -q "хороший принят" <<< "$KEYCHK"; then
         ok "проверка SSH-ключа отличает настоящий от мусора"
