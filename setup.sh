@@ -457,6 +457,76 @@ get_server_ip() {
     return 0
 }
 
+# Восстановление ответов с уже настроенной ноды.
+#
+# Ноды, поставленные до появления install.conf, при запуске меню спрашивают
+# всё заново — и человек по памяти вводит домен, IP панели и секрет. Одна
+# опечатка на рабочем сервере обходится дорого. Поэтому вычитываем то, что
+# уже настроено, прямо с сервера и подставляем как значения по умолчанию.
+#
+# Только чтение: ничего не меняет, все значения потом показываются в вопросах.
+detect_existing_setup() {
+    local v
+
+    # Домен — из выпущенного сертификата, иначе из включённого конфига nginx
+    if [[ -z "${DOMAIN:-}${SUBDOMAIN:-}" ]]; then
+        v=$(ls -d /etc/letsencrypt/live/*/ 2>/dev/null | head -1)
+        [[ -n "$v" ]] && v=$(basename "$v")
+        if [[ -z "$v" ]]; then
+            v=$(find /etc/nginx/sites-enabled -maxdepth 1 \( -type l -o -type f \) \
+                -printf '%f\n' 2>/dev/null | grep -v '^default$' | head -1)
+        fi
+        if [[ "$v" == *.*.* ]]; then
+            SUBDOMAIN="${v%%.*}"
+            DOMAIN="${v#*.}"
+        fi
+    fi
+
+    # IP панели — из правила ufw, открывающего порт ноды
+    if [[ -z "${PANEL_IP:-}" ]]; then
+        PANEL_IP=$(ufw status 2>/dev/null | grep -w "$NODE_PORT" \
+                   | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
+    fi
+
+    # Секрет ноды — из compose (кавычки вокруг значения снимаем)
+    if [[ -z "${REMNA_SECRET:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
+        REMNA_SECRET=$(grep -m1 'SECRET_KEY=' /opt/remnanode/docker-compose.yml 2>/dev/null \
+                       | sed 's/.*SECRET_KEY=//' | tr -d '"'"'"'" \r\n')
+    fi
+
+    # Порт SSH и админ-учётка — из живой конфигурации
+    if [[ -z "${SSH_PORT_DETECTED:-}" ]]; then
+        v=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+        [[ "$v" =~ ^[0-9]+$ ]] && SSH_PORT="$v"
+        SSH_PORT_DETECTED=1
+    fi
+    if [[ -z "${ADMIN_USER_DETECTED:-}" ]]; then
+        v=$(find /etc/sudoers.d -maxdepth 1 -name '90-*' -printf '%f\n' 2>/dev/null | head -1)
+        v="${v#90-}"
+        [[ -n "$v" ]] && id "$v" &>/dev/null && ADMIN_USER="$v"
+        ADMIN_USER_DETECTED=1
+    fi
+
+    # Telegram — из файла уведомлений
+    if [[ -f "$NOTIFY_ENV" ]]; then
+        local key
+        for key in TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY; do
+            [[ -n "${!key:-}" ]] && continue
+            v=$(grep -m1 "^${key}=" "$NOTIFY_ENV" 2>/dev/null | cut -d= -f2- | sed 's/^"//; s/"$//')
+            [[ -n "$v" ]] && printf -v "$key" '%s' "$v"
+        done
+        if [[ -z "${USER_NODE_LABEL:-}" ]]; then
+            USER_NODE_LABEL=$(grep -m1 '^NODE_LABEL=' "$NOTIFY_ENV" 2>/dev/null | cut -d= -f2- | sed 's/^"//; s/"$//')
+        fi
+        [[ -n "$TG_BOT_TOKEN" && -z "${SETUP_TG:-}" ]] && SETUP_TG="y"
+    fi
+
+    # Дежурная ли эта нода
+    [[ -f "$PANEL_ENV" && -z "${PANEL_WATCH:-}" ]] && PANEL_WATCH="y"
+
+    return 0
+}
+
 # Сохранение введённых данных для будущих обновлений (chmod 600 — внутри секреты/токены)
 save_state() {
     mkdir -p "$(dirname "$INSTALL_STATE")"
@@ -1961,7 +2031,20 @@ else
         # shellcheck disable=SC1090
         source "$INSTALL_STATE"
         STATE_LOADED=1
-        validate_ssh_params
+    else
+        # Нода поставлена до появления install.conf — вычитываем настройки
+        # прямо с сервера, чтобы не заставлять вводить их по памяти
+        detect_existing_setup
+        if [[ -n "$DOMAIN$PANEL_IP$REMNA_SECRET" ]]; then
+            echo "Файла с ответами нет, но нода уже настроена — подставляю найденное:"
+            [[ -n "$SUBDOMAIN$DOMAIN" ]] && echo "  домен:    ${SUBDOMAIN}.${DOMAIN}"
+            [[ -n "$PANEL_IP" ]]         && echo "  панель:   $PANEL_IP"
+            [[ -n "$REMNA_SECRET" ]]     && echo "  секрет:   найден в docker-compose.yml"
+            [[ -n "$TG_BOT_TOKEN" ]]     && echo "  Telegram: настройки найдены"
+            echo "  Проверьте значения в вопросах ниже."
+            STATE_LOADED=1
+        fi
     fi
+    validate_ssh_params
     main_menu
 fi
