@@ -28,9 +28,39 @@ comp_swap() {
     return 0
 }
 
-# Кто прямо сейчас держит apt/dpkg. Только смотрит и рассказывает.
+# Кто держит apt/dpkg прямо сейчас. Только смотрит.
+#
+# Смотрим на сами файлы блокировок, а не на имена процессов. Раньше искали
+# «unattended-upgrade» по командной строке — а на Ubuntu постоянно висит демон
+# unattended-upgrade-shutdown, который ждёт выключения сервера и к apt в данный
+# момент отношения не имеет. Поиск считал apt занятым всегда, и установка
+# стояла бы по 10 минут на каждом сервере. Так и было, проверено.
+RH_APT_LOCKS=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+              /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+
+apt_lock_pids() {
+    if command -v fuser >/dev/null 2>&1; then
+        # fuser печатает PID в stdout, имена файлов — в stderr
+        fuser "${RH_APT_LOCKS[@]}" 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | sort -u
+    else
+        # Без fuser — по точному имени процесса, и демон ожидания выключения
+        # отсеиваем по полной командной строке
+        pgrep -a -x 'apt-get|apt|dpkg|aptitude|unattended-upgr' 2>/dev/null \
+            | grep -v 'unattended-upgrade-shutdown' | awk '{print $1}'
+    fi
+    return 0
+}
+
+rh_apt_busy() {
+    [[ -n "$(apt_lock_pids)" ]] && return 0
+    return 1
+}
+
 apt_busy_who() {
-    pgrep -a -f 'apt-get|unattended-upgrade|/usr/bin/dpkg' 2>/dev/null | head -3
+    local pid
+    for pid in $(apt_lock_pids); do
+        ps -o pid=,args= -p "$pid" 2>/dev/null | sed 's/^ *//' | cut -c1-70
+    done | head -3
     return 0
 }
 
@@ -45,14 +75,18 @@ comp_packages() {
         echo "  Обычно это первое после загрузки автообновление, оно закончится само."
     fi
     local rc=0
-    {
-        apt-get "${APT_WAIT[@]}" clean
-        apt-get "${APT_WAIT[@]}" update
-        apt-get "${APT_WAIT[@]}" -y upgrade
-        apt-get "${APT_WAIT[@]}" -y dist-upgrade
-        apt-get "${APT_WAIT[@]}" -y autoremove --purge
-        apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES
-    } >>"$SETUP_LOG" 2>&1 || rc=$?
+    ui_step_status "Пакеты: обновляю список"
+    { apt-get "${APT_WAIT[@]}" clean && apt-get "${APT_WAIT[@]}" update; } >>"$SETUP_LOG" 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        ui_step_status "Пакеты: обновляю систему"
+        { apt-get "${APT_WAIT[@]}" -y upgrade
+          apt-get "${APT_WAIT[@]}" -y dist-upgrade
+          apt-get "${APT_WAIT[@]}" -y autoremove --purge; } >>"$SETUP_LOG" 2>&1 || rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+        ui_step_status "Пакеты: ставлю нужное скрипту"
+        apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES >>"$SETUP_LOG" 2>&1 || rc=$?
+    fi
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
     if [[ $rc -ne 0 ]]; then
         echo "  [СБОЙ] apt завершился с ошибкой (см. $SETUP_LOG)."

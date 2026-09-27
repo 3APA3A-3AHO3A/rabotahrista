@@ -129,7 +129,7 @@ repair_build_plan() {
 
 repair_print_plan() {
     local line fn label what n=0
-    echo "  БУДЕТ СДЕЛАНО:"
+    ui_section "БУДЕТ СДЕЛАНО"
     for line in "${REPAIR_PLAN[@]}"; do
         n=$((n+1))
         IFS='|' read -r fn label what <<< "$line"
@@ -137,12 +137,12 @@ repair_print_plan() {
         printf '      %s\n' "$what"
     done
     if [[ ${#REPAIR_SKIPS[@]} -gt 0 ]]; then
-        echo
-        echo "  ПРОПУЩУ:"
-        printf '      %s\n' "${REPAIR_SKIPS[@]}"
+        ui_section "ПРОПУЩУ"
+        local s
+        for s in "${REPAIR_SKIPS[@]}"; do ui_skip "$s"; done
     fi
     echo
-    echo "  НЕ ТРОНУ: фаервол, контейнер ноды, пакеты, nginx. Перезагрузки не будет."
+    ui_info "не тронет: фаервол, контейнер ноды, пакеты, nginx; перезагрузки не будет"
     echo
     return 0
 }
@@ -167,18 +167,14 @@ repair_pick_steps() {
 
 run_repair() {
     SUMMARY=()
-    echo
-    echo "=========================================="
-    echo "  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ"
-    echo "=========================================="
+    ui_title "Починка настроенной ноды" "типовые поломки; nginx не трогается"
 
     FULL_DOMAIN=""
     [[ -n "${SUBDOMAIN:-}" && -n "${DOMAIN:-}" ]] && FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
-    echo "  Нода:     ${FULL_DOMAIN:-не определена}"
-    echo "  Панель:   ${PANEL_IP:-не определена}"
-    echo "  Учётка:   ${ADMIN_USER:-?} | порт SSH: ${SSH_PORT:-?}"
-    echo "  Telegram: $([[ -n "${TG_BOT_TOKEN:-}" ]] && echo "настроен" || echo "не настроен")"
-    echo
+    ui_kv "нода" "${FULL_DOMAIN:-не определена}"
+    ui_kv "панель" "${PANEL_IP:-не определена}"
+    ui_kv "учётка и порт" "${ADMIN_USER:-?}, ${SSH_PORT:-?}"
+    ui_kv "telegram" "$([[ -n "${TG_BOT_TOKEN:-}" ]] && echo "настроен" || echo "не настроен")"
 
     repair_build_plan
     repair_print_plan
@@ -192,6 +188,11 @@ run_repair() {
             *)    echo "  Отменено. Ничего не изменено."; return 0 ;;
         esac
     fi
+
+    # Дальше — работа без вопросов. Шаги идут под спиннером, их вывод уходит
+    # в лог, и приглашение ввода было бы невидимо: установка просто встала бы.
+    # Все ответы уже либо вычитаны с ноды, либо заданы.
+    local NONINTERACTIVE=1
 
     if [[ ${#REPAIR_PLAN[@]} -eq 0 ]]; then
         echo "  Не выбрано ни одного шага. Ничего не изменено."
@@ -226,15 +227,11 @@ run_repair() {
 
     save_state || true
 
+    ui_section "Итог"
+    ui_summary "${SUMMARY[@]}"
     echo
-    echo "=========================================="
-    echo "  ИТОГ ПОЧИНКИ"
-    echo "=========================================="
-    printf '%s\n' "${SUMMARY[@]}"
-    echo "=========================================="
-    echo
-    echo "Ответы ноды сохранены в $INSTALL_STATE"
-    echo "Проверьте результат:   sudo bash /tmp/setup.sh --check"
-    echo "Продление сертификата: sudo certbot renew --dry-run"
+    ui_kv "ответы ноды" "$INSTALL_STATE"
+    ui_kv "проверить" "sudo bash /tmp/setup.sh --check"
+    ui_kv "продление серта" "sudo certbot renew --dry-run"
     return 0
 }

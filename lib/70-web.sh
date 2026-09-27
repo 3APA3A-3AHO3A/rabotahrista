@@ -73,6 +73,7 @@ acme_reachable() {
     fi
     echo "  Проверяю доступность ACME-пути снаружи (до 2 минут)..."
     for i in $(seq 1 20); do
+        ui_step_status "Сертификат: проверяю ACME-путь ($i/20)"
         got=$(curl -fsSL --max-time 10 "$url" 2>/dev/null || true)
         if [[ "$got" == "$token" ]]; then
             echo "  ОК: запрос дошёл до этого сервера (попытка $i). Let's Encrypt тоже дойдёт."
@@ -347,6 +348,7 @@ comp_web() {
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
     get_server_ip
 
+    ui_step_status "Веб: заглушка сайта"
     echo ">>> Заглушка сайта..."
     mkdir -p /var/www/stub
     wget -qO /var/www/stub/index.html "$INDEX_URL"
@@ -408,6 +410,7 @@ comp_web() {
             cf_restore_proxy
             return 1
         fi
+        ui_step_status "Сертификат: выпускаю через Let's Encrypt"
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \
                 --keep-until-expiring >>"$SETUP_LOG" 2>&1; then

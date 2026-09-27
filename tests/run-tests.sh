@@ -179,7 +179,9 @@ printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
     SETUP_CF="n"; CF_PROXY_CHOICE="n"
     SETUP_TG="y"; TG_BOT_TOKEN="123:ABC"; TG_CHAT_ID="-100123"; TG_TOPIC_ID="7"
     INSTALL_STATE=$(mktemp); SETUP_LOG=$(mktemp); REPORT_FILE=$(mktemp)
-    for f in comp_swap comp_packages comp_user comp_ssh comp_fail2ban comp_autoupdates \
+    # rh_preflight тоже заглушка: он честно проверяет, что под ногами Ubuntu,
+    # а тесты гоняются и на Windows, где apt-get нет вовсе
+    for f in rh_preflight comp_swap comp_packages comp_user comp_ssh comp_fail2ban comp_autoupdates \
              comp_ipv6 comp_ufw comp_sysctl comp_docker comp_disk comp_speedtest \
              comp_warp comp_node comp_web comp_telegram notify_telegram reboot \
              components_menu; do
@@ -678,7 +680,7 @@ REP=$(RH_LIB_ONLY=1 bash -c '
 ' 2>&1 || true)
 if grep -q "ПИСАЛ КОНФИГ" <<< "$REP"; then
     bad "автоматическая починка правит nginx:"; sed 's/^/      /' <<< "$REP"
-elif grep -q "КОНФИГ NGINX — РЕКОМЕНДАЦИЯ" <<< "$REP" && grep -q "ИТОГ ПОЧИНКИ" <<< "$REP"; then
+elif grep -q "КОНФИГ NGINX — РЕКОМЕНДАЦИЯ" <<< "$REP" && grep -q "Итог" <<< "$REP"; then
     ok "починка nginx не трогает, печатает рекомендацию и доходит до конца"
 else
     bad "починка ни рекомендации, ни правки:"; sed 's/^/      /' <<< "$REP"
@@ -826,7 +828,7 @@ fi
 # И починка обязана это чинить: на старых нодах это типовая находка
 R=$(RH_LIB_ONLY=1 bash -c '
     source "'"$ROOT"'/setup.sh"
-    SETUP_LOG=/dev/null; NONINTERACTIVE=1
+    SETUP_LOG=$(mktemp); NONINTERACTIVE=1
     SUBDOMAIN="n1"; DOMAIN="example.com"; SUMMARY=()
     repair_perms() { return 0; }; repair_ssh_hardening() { return 0; }
     repair_verify() { return 0; }; comp_telegram() { return 0; }
@@ -838,6 +840,7 @@ R=$(RH_LIB_ONLY=1 bash -c '
     docker_group_member() { echo "ЧИНИЛ ГРУППУ"; }
     ADMIN_USER="vadim"
     run_repair
+    cat "$SETUP_LOG"; rm -f "$SETUP_LOG"
 ' 2>&1 || true)
 if grep -q "ЧИНИЛ ГРУППУ" <<< "$R"; then
     ok "починка проверяет группу docker"
@@ -886,7 +889,7 @@ head_ "22. Починка показывает план и спрашивает"
 repair_run() {   # $1 — что подать на stdin, $2 — доп. код перед запуском
     printf '%b' "$1" | RH_LIB_ONLY=1 bash -c '
         source "'"$ROOT"'/setup.sh"
-        SETUP_LOG=/dev/null; NONINTERACTIVE=""
+        SETUP_LOG=$(mktemp); NONINTERACTIVE=""
         SUBDOMAIN="n1"; DOMAIN="example.com"; ADMIN_USER="vadim"
         SSH_HARDEN_FILE=$(mktemp); SUMMARY=()
         NOTIFY_ENV=/nonexistent; PANEL_ENV=/nonexistent
@@ -899,12 +902,13 @@ repair_run() {   # $1 — что подать на stdin, $2 — доп. код 
         repair_verify() { echo "ВЫПОЛНЕН: проверка"; }
         '"${2:-}"'
         run_repair
-        rm -f "$SSH_HARDEN_FILE"
+        cat "$SETUP_LOG"          # вывод шагов теперь оседает в логе
+        rm -f "$SSH_HARDEN_FILE" "$SETUP_LOG"
     ' 2>&1 || true
 }
 
 R=$(repair_run 'n\n')
-if grep -q "БУДЕТ СДЕЛАНО" <<< "$R" && grep -q "НЕ ТРОНУ" <<< "$R"; then
+if grep -q "БУДЕТ СДЕЛАНО" <<< "$R" && grep -q "не тронет" <<< "$R"; then
     ok "план печатается до вопроса"
 else
     bad "плана нет:"; sed 's/^/      /' <<< "$R"
@@ -1001,6 +1005,7 @@ INST=$(printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
     INSTALL_WARP="n"; INSTALL_SPEEDTEST="n"; SETUP_CF="n"; CF_PROXY_CHOICE="n"
     SETUP_TG="n"
     INSTALL_STATE=$(mktemp); SETUP_LOG=$(mktemp); REPORT_FILE=$(mktemp)
+    rh_preflight() { return 0; }     # см. тест 7: на Windows apt-get нет
     comp_swap() { return 0; }
     comp_packages() { echo "  [СБОЙ] apt занят"; return 1; }
     for f in comp_user comp_ssh comp_fail2ban comp_autoupdates comp_ipv6 comp_ufw \
@@ -1027,7 +1032,208 @@ else
     ok "доступ по SSH при останове не менялся"
 fi
 
-head_ "25. shellcheck (если установлен)"
+# --------------------------------------------------------------------------
+head_ "25. Оформление и тихий вывод"
+# --------------------------------------------------------------------------
+# printf считает точность (%-42.42s) в БАЙТАХ. На кириллице метка обрезалась
+# по середине буквы: «Пакеты: обновляю списо?».
+FIT=$(RH_LIB_ONLY=1 LC_ALL=C.UTF-8 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    s=$(ui_fit "Пакеты: обновляю список пакетов" 20)
+    echo "[$s] символов=${#s}"
+' 2>&1 || true)
+if grep -q "символов=20" <<< "$FIT" && ! grep -qP '\xef\xbf\xbd' <<< "$FIT"; then
+    ok "метка обрезается по символам, а не по байтам"
+else
+    bad "обрезка рвёт кириллицу: $FIT"
+fi
+
+# Человек не должен видеть, как apt перечисляет двести пакетов: вывод шага
+# уходит в лог, на экране — одна строка состояния.
+QUIET=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=$(mktemp); SUMMARY=()
+    болтливый() { echo "ДВЕСТИ СТРОК ВЫВОДА"; return 0; }
+    do_step "Пакеты" болтливый
+    echo "--- в логе: $(grep -c "ДВЕСТИ СТРОК ВЫВОДА" "$SETUP_LOG") ---"
+    rm -f "$SETUP_LOG"
+' 2>&1 || true)
+if ! grep -q '^ *ДВЕСТИ СТРОК ВЫВОДА' <<< "$QUIET" && grep -q 'в логе: 1' <<< "$QUIET"; then
+    ok "вывод успешного шага виден только в логе"
+else
+    bad "вывод шага сыплется на экран:"; sed 's/^/      /' <<< "$QUIET"
+fi
+
+# --------------------------------------------------------------------------
+head_ "26. Проверки перед установкой"
+# --------------------------------------------------------------------------
+# Смысл: не начинать работу на сервере, где она заведомо не доедет до конца.
+pre() {   # $1 — код, подменяющий окружение
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        rh_wait_cloud_init() { return 0; }
+        rh_wait_apt() { return 0; }
+        command() { return 0; }          # «всё установлено» — даже на Windows
+        getent() { return 0; }
+        free() { echo "Mem: 2048"; }
+        df() { echo Avail; echo 20000M; }
+        '"$1"'
+        rh_preflight >/dev/null 2>&1 && echo НАЧАЛ || echo ОСТАНОВИЛ
+    ' 2>&1 || true
+}
+R=$(pre 'true')
+if grep -q "НАЧАЛ" <<< "$R"; then ok "исправный сервер проверку проходит"
+else bad "проверка не пускает исправный сервер: $R"; fi
+
+R=$(pre 'command() { [[ "${2:-}" == "apt-get" ]] && return 1; return 0; }')
+if grep -q "ОСТАНОВИЛ" <<< "$R"; then ok "без apt-get установка не начинается"
+else bad "скрипт готов ставить ноду не на Debian/Ubuntu"; fi
+
+R=$(pre 'df() { echo Avail; echo 900M; }')
+if grep -q "ОСТАНОВИЛ" <<< "$R"; then ok "на переполненном диске установка не начинается"
+else bad "скрипт начинает установку без места на диске"; fi
+
+R=$(pre 'getent() { return 1; }')
+if grep -q "ОСТАНОВИЛ" <<< "$R"; then ok "без DNS установка не начинается"
+else bad "скрипт начинает установку без сети"; fi
+
+# --------------------------------------------------------------------------
+head_ "27. Живучесть при обрыве ssh"
+# --------------------------------------------------------------------------
+# Установка идёт минуты, ssh рвётся. Внутри tmux сессия переживает обрыв.
+# Но перезапускать себя можно только на живом терминале: в неинтерактивном
+# запуске (cron, ssh -c, --repair по списку нод) это сломало бы всё.
+guard() {
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        RH_LIB_ONLY=""            # дальше ведём себя как настоящий запуск
+        '"$1"'
+        tmux() { echo "УШЁЛ В TMUX"; }
+        exec() { echo "УШЁЛ В TMUX"; }
+        rh_session_guard
+        echo "ПРОДОЛЖИЛ БЕЗ TMUX"
+    ' 2>&1 || true
+}
+R=$(guard 'true')                      # stdout не терминал
+if grep -q "ПРОДОЛЖИЛ БЕЗ TMUX" <<< "$R" && ! grep -q "УШЁЛ В TMUX" <<< "$R"; then
+    ok "без терминала себя не перезапускает"
+else
+    bad "в неинтерактивном запуске лезет в tmux:"; sed 's/^/      /' <<< "$R"
+fi
+R=$(guard 'TMUX=/tmp/fake')            # уже внутри tmux
+if ! grep -q "УШЁЛ В TMUX" <<< "$R"; then ok "внутри tmux второй раз не заходит"
+else bad "плодит сессии tmux внутри tmux"; fi
+R=$(guard 'RH_NO_TMUX=1')
+if ! grep -q "УШЁЛ В TMUX" <<< "$R"; then ok "RH_NO_TMUX отключает перезапуск"
+else bad "RH_NO_TMUX не работает"; fi
+
+# Два установщика на одном сервере — это два apt и два перезапуска sshd.
+if ! command -v flock >/dev/null 2>&1; then
+    printf '  — flock не установлен, пропускаю\n'
+else
+    LK=$(mktemp -u)
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        RH_LOCK="'"$LK"'"; rh_take_lock; sleep 3
+    ' >/dev/null 2>&1 &
+    sleep 1
+    SECOND=$(RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        RH_LOCK="'"$LK"'"; rh_take_lock; echo "ВТОРОЙ ЗАПУСТИЛСЯ"
+    ' 2>&1 || true)
+    wait 2>/dev/null || true
+    rm -f "$LK"
+    if grep -q "уже работает другой запуск" <<< "$SECOND"; then
+        ok "второй одновременный запуск отбивается"
+    else
+        bad "два установщика могут работать разом:"; sed 's/^/      /' <<< "$SECOND"
+    fi
+fi
+
+# --------------------------------------------------------------------------
+head_ "28. Ошибки, найденные при проверке кода"
+# --------------------------------------------------------------------------
+# Каждая из них прошла все тесты выше и сломала бы установку на живом сервере.
+
+# «exec 9>файл 2>/dev/null» отправлял stderr ВСЕГО скрипта в никуда: пропадали
+# приглашения read (bash пишет их в stderr) и аварийные сообщения.
+ERRV=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    RH_LOCK=$(mktemp -u); rh_take_lock
+    echo "ВИДНО В STDERR" >&2
+    rm -f "$RH_LOCK"
+' 2>&1 || true)
+if grep -q "ВИДНО В STDERR" <<< "$ERRV"; then
+    ok "замок не глушит stderr — вопросы и ошибки видны"
+else
+    bad "после замка stderr пропадает: вопросы установщика станут невидимы"
+fi
+
+# Замок, взятый ДО перехода в tmux, наследует клиент tmux — и установщик
+# внутри tmux упирается в собственный замок: «уже работает другой запуск».
+L_GUARD=$(grep -n '^rh_session_guard' lib/99-main.sh | head -1 | cut -d: -f1)
+L_LOCK=$(grep -n '^rh_take_lock' lib/99-main.sh | head -1 | cut -d: -f1)
+if [[ -n "$L_GUARD" && -n "$L_LOCK" && "$L_GUARD" -lt "$L_LOCK" ]]; then
+    ok "сначала tmux, потом замок"
+else
+    bad "замок берётся до tmux (строки $L_LOCK и $L_GUARD) — установка откажет сама себе"
+fi
+
+# На Ubuntu постоянно висит unattended-upgrade-shutdown. Поиск по имени
+# процесса считал apt занятым всегда — ожидание по 10 минут на каждом сервере.
+busy() {   # $1 — код, подменяющий окружение
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        '"$1"'
+        if rh_apt_busy; then echo ЗАНЯТ; else echo СВОБОДЕН; fi
+    ' 2>&1 || true
+}
+R=$(busy 'fuser() { return 1; }')
+[[ "$R" == *СВОБОДЕН* ]] && ok "fuser никого не видит — apt свободен" \
+                         || bad "занятость apt определяется неверно: $R"
+R=$(busy 'fuser() { echo " 4242"; }')
+[[ "$R" == *ЗАНЯТ* ]] && ok "fuser видит держателя блокировки — apt занят" \
+                      || bad "держателя блокировки не видит: $R"
+R=$(busy 'command() { [[ "${2:-}" == fuser ]] && return 1; return 0; }
+          pgrep() { echo "812 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal"; }')
+[[ "$R" == *СВОБОДЕН* ]] && ok "демон unattended-upgrade-shutdown занятостью не считается" \
+                         || bad "постоянный демон считается занятым apt — ждать будем всегда"
+R=$(busy 'command() { [[ "${2:-}" == fuser ]] && return 1; return 0; }
+          pgrep() { echo "901 apt-get -y install nginx"; }')
+[[ "$R" == *ЗАНЯТ* ]] && ok "без fuser настоящий apt-get всё равно замечается" \
+                      || bad "без fuser apt-get не замечается: $R"
+
+# Остановленная установка уже объяснила причину. Голый вызов под set -e
+# рисовал поверх её объяснения красную рамку «ОШИБКА — установка прервана,
+# команда: return 1» и убивал меню.
+MENU=$(printf '1\n0\n' | RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    rh_preflight() { echo "  (проверка сервера не прошла)"; return 1; }
+    main_menu
+' 2>&1; echo "КОД=$?")
+if ! grep -q "ОШИБКА — установка прервана" <<< "$MENU" && grep -q "КОД=0" <<< "$MENU"; then
+    ok "остановленная установка не рисует аварию и не убивает меню"
+else
+    bad "остановка установки выглядит как авария:"; tail -8 <<< "$MENU" | sed 's/^/      /'
+fi
+
+# Шаг под спиннером не должен ждать ввода с терминала: вопрос ушёл бы в лог,
+# и установка «висела» бы без объяснений.
+HANG=$(sleep 30 | timeout 8 env RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=$(mktemp); SUMMARY=()
+    спрашивает() { read -r x; return 0; }
+    do_step "шаг с вопросом" спрашивает
+    echo "НЕ ЗАВИС"; rm -f "$SETUP_LOG"
+' 2>&1 || true)
+if grep -q "НЕ ЗАВИС" <<< "$HANG"; then
+    ok "шаг с неожиданным вопросом не вешает установку"
+else
+    bad "шаг ждёт ввода с терминала под спиннером — установка зависнет"
+fi
+
+# --------------------------------------------------------------------------
+head_ "29. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then

@@ -11,8 +11,8 @@
              пронумерованы: 00-header (режимы оболочки и настройки) первым,
              99-main (точка входа) последним.
 
-  check.sh   только диагностика: блок настроек из 00-header.sh плюс
-             lib/94-check.sh. Тот же код, что и в меню установщика, — чтобы
+  check.sh   только диагностика: блок настроек из 00-header.sh, оформление
+             из 05-ui.sh и сама диагностика из 94-check.sh. Тот же код, что и в меню установщика, — чтобы
              проверка и починка не разъезжались. Отдельный файл нужен тем,
              кому на живой ноде хочется запустить заведомо ничего не меняющий
              скрипт.
@@ -30,6 +30,7 @@ LIB = ROOT / "lib"
 OUT = ROOT / "setup.sh"
 CHECK_OUT = ROOT / "check.sh"
 CHECK_MOD = LIB / "94-check.sh"
+UI_MOD = LIB / "05-ui.sh"
 HEADER_MOD = LIB / "00-header.sh"
 
 # Границы блока с путями и портами внутри 00-header.sh. Диагностике нужны те же
@@ -116,7 +117,7 @@ def assemble_check() -> str:
     parts: list[str] = [
         "#!/bin/bash",
         BANNER,
-        f"# Собрано из: {HEADER_MOD.name} (блок настроек), {CHECK_MOD.name}",
+        f"# Собрано из: {HEADER_MOD.name} (блок настроек), {UI_MOD.name}, {CHECK_MOD.name}",
         "",
         CHECK_DOC,
         "",
@@ -127,6 +128,9 @@ def assemble_check() -> str:
         settings_block(),
         "",
         'if locale -a 2>/dev/null | grep -qix \'C\\.UTF-*8\'; then export LC_ALL=C.UTF-8; fi',
+        "",
+        strip_shebang(UI_MOD.read_text(encoding="utf-8")),
+        "",
         'if [[ "$EUID" -ne 0 ]]; then',
         '    # "sudo bash <(curl ...)" не работает: sudo закрывает лишние дескрипторы',
         '    echo "Нужны права root. Запускать так:"',

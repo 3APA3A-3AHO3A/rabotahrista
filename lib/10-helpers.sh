@@ -3,26 +3,38 @@
 #  Сводка шагов и печать итогового отчёта
 # ##########################################################################
 
-# Запуск шага: вывод идёт и на экран, и в лог.
+# Запуск шага.
 #
-# Раньше объяснение шага оставалось только на экране, а print_summary экран
-# очищал — и причина сбоя исчезала навсегда, хотя в сводке было написано
-# «см. лог». Именно так пропало объяснение, почему не применился харденинг SSH.
+# На экране — одна живая строка: кадр спиннера, что делается, сколько идёт.
+# Весь вывод шага уходит в $SETUP_LOG: смотреть, как apt перечисляет двести
+# пакетов, никому не нужно, а при сбое причина всё равно печатается сразу,
+# последними строками — потому что итоговый отчёт очищает экран, и искать её
+# потом в логе было бы лишним шагом.
 #
-# Подстановка процесса, а не конвейер: в конвейере функция выполнялась бы в
-# подоболочке, и её переменные (SSH_HARDENED, ADMIN_PASS, FULL_DOMAIN,
-# UFW_SSH_PORTS) не дошли бы до итогового отчёта.
-# Только stdout: приглашения read идут в stderr и должны появляться сразу.
+# Шаг выполняется в ТЕКУЩЕЙ оболочке, в фоне только анимация. Через конвейер
+# (`"$@" | tee`) шаг ушёл бы в подоболочку, и выставленные им переменные —
+# пароль учётки, домен, признак применённого харденинга — не дошли бы до отчёта.
 rh_step_exec() {
     local label="$1"; shift
+    local out rc=0
+    out=$(mktemp)
     { echo; echo "=== ШАГ: $label — $(date '+%H:%M:%S') ==="; } >>"$SETUP_LOG" 2>/dev/null || true
-    if "$@" > >(tee -a "$SETUP_LOG"); then
+    ui_spin_start "$label"
+    # stdin от /dev/null: если какой-то шаг всё же задаст вопрос, read получит
+    # конец ввода и шаг упадёт с понятной ошибкой. Иначе вопрос ушёл бы в лог,
+    # а на экране крутился бы спиннер — установка «висела» бы без объяснений.
+    "$@" >"$out" 2>&1 </dev/null || rc=$?
+    ui_spin_stop "$rc"
+    cat "$out" >>"$SETUP_LOG" 2>/dev/null || true
+    if [[ "$rc" -ne 0 ]]; then
+        grep -v '^[[:space:]]*$' "$out" 2>/dev/null | tail -12 \
+            | sed "s/^/   ${C_DIM}/; s/\$/${C_R}/"
+        SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
+    else
         SUMMARY+=("[ OK ]    $label")
-        return 0
     fi
-    SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
-    echo "  [СБОЙ] $label — подробности в $SETUP_LOG"
-    return 1
+    rm -f "$out"
+    return "$rc"
 }
 
 # do_step "Метка" функция...  — обычный шаг: сбой не роняет установку
@@ -39,13 +51,9 @@ do_step_required() {
 
 skip_step() { SUMMARY+=("[проп.]   $1"); }
 
-# Строка отчёта ровной колонкой ("метка" дополняется пробелами до 21 символа)
-row() {
-    local label="$1"; shift
-    local n=$(( 21 - ${#label} )); (( n < 1 )) && n=1
-    local pad; printf -v pad '%*s' "$n" ''
-    printf '  %s%s%s\n' "$label" "$pad" "$*"
-}
+# Строка отчёта ровной колонкой. Длина метки считается в символах, а не в
+# байтах: при кириллице иначе колонки разъезжаются.
+row() { ui_kv "$@"; }
 
 # Версии всего, что поставили: пакеты apt + то, что ставится мимо apt
 collect_versions() {
@@ -69,63 +77,92 @@ collect_versions() {
     return 0
 }
 
-# Финальный отчёт: чистит экран и печатает всё одним куском + кладёт в файл
+# Финальный отчёт.
+#
+# Экран чистим ТОЛЬКО когда всё прошло: при сбоях на нём остались объяснения
+# упавших шагов, и стирать их — значит отправить человека искать причину в логе
+# ради того, чтобы отчёт выглядел опрятнее.
 print_summary() {
-    local out node_state
-    node_state=$(docker inspect -f '{{.State.Status}} (restarts={{.RestartCount}})' remnanode 2>/dev/null || echo "контейнер не найден")
+    local out node_state fails elapsed
+    node_state=$(docker inspect -f '{{.State.Status}} (перезапусков {{.RestartCount}})' remnanode 2>/dev/null | head -1 | tr -d '\r\n')
+    [[ -z "$node_state" ]] && node_state="контейнер не найден"
+    fails=$(ui_fail_count "${SUMMARY[@]}")
+    elapsed=$(ui_mmss $(( SECONDS - ${RH_T0:-0} )))
+
+    if [[ "$fails" -eq 0 && -t 1 ]]; then clear || true; fi
+
+    if [[ "$fails" -eq 0 ]]; then
+        ui_title "Нода ${FULL_DOMAIN:-$(hostname)} готова" \
+                 "заняло $elapsed · $(date '+%Y-%m-%d %H:%M %Z')"
+    else
+        ui_title "Установка закончилась с ошибками: $fails" \
+                 "заняло $elapsed · подробности выше и в $SETUP_LOG"
+    fi
+
+    ui_section "Доступ по SSH"
+    ui_kv "команда входа" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+    ui_kv "учётка" "$ADMIN_USER (sudo без пароля)"
+    case "$ADMIN_PASS_SOURCE" in
+        manual) ui_kv "пароль учётки" "задан вами вручную (в отчёт не пишу)" ;;
+        kept)   ui_kv "пароль учётки" "не менялся — пользователь уже существовал" ;;
+        *)      ui_kv "пароль учётки" "${ADMIN_PASS:-—}"
+                ui_info "нужен только для аварийной консоли хостера" ;;
+    esac
+    ui_kv "root и пароли" "вход запрещён"
+    if [[ -n "$SSH_PENDING_REBOOT" ]]; then
+        ui_warn "порт $SSH_PORT заработает только после перезагрузки"
+        ui_info "до неё заходите по старому порту — он открыт в UFW"
+    elif [[ -z "$SSH_HARDENED" ]]; then
+        ui_err "харденинг SSH не применился — смотрите шаги ниже"
+    fi
+
+    ui_section "Нода"
+    ui_kv "домен" "${FULL_DOMAIN:-—}"
+    ui_kv "IP сервера" "${SERVER_IP:-—}"
+    ui_kv "контейнер" "$node_state"
+    ui_kv "порт для панели" "$NODE_PORT (только с ${PANEL_IP:-—})"
+
+    ui_section "Фаервол"
+    ui_kv "открыто" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80, 443"
+    ui_kv "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
+
+    ui_section "Шаги"
+    ui_summary "${SUMMARY[@]}"
+
+    ui_section "Где что лежит"
+    ui_kv "этот отчёт" "$REPORT_FILE"
+    ui_kv "полный лог" "$SETUP_LOG"
+    ui_kv "ответы установки" "$INSTALL_STATE"
+    ui_kv "compose ноды" "/opt/remnanode/docker-compose.yml"
+    [[ -f "$NOTIFY_ENV" ]] && ui_kv "telegram" "$NOTIFY_ENV"
+    ui_rule
+
+    # В файл — то же самое, но без цвета и с версиями пакетов: его читают
+    # глазами через неделю, когда экрана уже нет.
     out=$(
-        echo "=========================================="
-        echo "  УСТАНОВКА ЗАВЕРШЕНА — $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "=========================================="
+        echo "=== ОТЧЁТ ОБ УСТАНОВКЕ — $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+        echo "Заняло: $elapsed, сбоев: $fails"
         echo
-        echo "--- ДОСТУП ПО SSH ---"
-        row "Команда входа:" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
-        row "Учётка:" "$ADMIN_USER (sudo без пароля)"
+        echo "Вход:            ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+        echo "Учётка:          $ADMIN_USER (sudo без пароля)"
         case "$ADMIN_PASS_SOURCE" in
-            manual)    row "Пароль учётки:" "задан вами вручную (в отчёт не пишу)" ;;
-            kept)      row "Пароль учётки:" "не менялся — пользователь уже существовал" ;;
-            *)         row "Пароль учётки:" "${ADMIN_PASS:-—}"
-                       row "" "(сгенерирован; нужен только для аварийной консоли хостера)" ;;
+            manual) echo "Пароль учётки:   задан вами вручную" ;;
+            kept)   echo "Пароль учётки:   не менялся" ;;
+            *)      echo "Пароль учётки:   ${ADMIN_PASS:-—}" ;;
         esac
-        row "Root по SSH:" "запрещён"
-        row "Вход по паролю:" "запрещён"
-        if [[ -n "$SSH_PENDING_REBOOT" ]]; then
-            row "ВНИМАНИЕ:" "порт $SSH_PORT заработает ТОЛЬКО ПОСЛЕ ПЕРЕЗАГРУЗКИ"
-            row "" "до неё заходи по старому порту — он открыт в UFW (см. ниже)"
-        elif [[ -z "$SSH_HARDENED" ]]; then
-            row "ВНИМАНИЕ:" "харденинг SSH не применился — смотри шаги ниже"
-        fi
+        echo "Домен:           ${FULL_DOMAIN:-—}"
+        echo "IP сервера:      ${SERVER_IP:-—}"
+        echo "Порт панели:     $NODE_PORT (только с ${PANEL_IP:-—})"
+        echo "UFW:             ${UFW_SSH_PORTS:-$SSH_PORT/tcp}, 80/tcp, 443/tcp"
         echo
-        echo "--- НОДА ---"
-        row "Домен:" "${FULL_DOMAIN:-—}"
-        row "IP сервера:" "${SERVER_IP:-—}"
-        row "Контейнер:" "$node_state"
-        row "Порт для панели:" "$NODE_PORT (открыт только для ${PANEL_IP:-—})"
-        echo
-        echo "--- ФАЕРВОЛ (UFW) ---"
-        row "Открыто:" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80/tcp, 443/tcp"
-        row "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
-        echo
-        echo "--- ШАГИ УСТАНОВКИ ---"
+        echo "--- ШАГИ ---"
         printf '%s\n' "${SUMMARY[@]}"
         echo
-        echo "--- УСТАНОВЛЕННЫЕ ПАКЕТЫ И ВЕРСИИ ---"
+        echo "--- ПАКЕТЫ И ВЕРСИИ ---"
         collect_versions
-        echo
-        echo "--- ГДЕ ЧТО ЛЕЖИТ ---"
-        row "Этот отчёт:" "$REPORT_FILE"
-        row "Полный лог:" "$SETUP_LOG"
-        row "Ответы установки:" "$INSTALL_STATE"
-        row "Compose ноды:" "/opt/remnanode/docker-compose.yml"
-        row "Конфиг nginx:" "$NGINX_AVAIL/${FULL_DOMAIN:-—}"
-        [[ -f "$NOTIFY_ENV" ]] && row "Telegram:" "$NOTIFY_ENV"
-        echo "=========================================="
     )
     printf '%s\n' "$out" > "$REPORT_FILE" 2>/dev/null || true
     chmod 600 "$REPORT_FILE" 2>/dev/null || true
-    # чистим экран от простыни установки — всё важное уже в $out и в файле
-    if [[ -t 1 ]]; then clear || true; fi
-    printf '%s\n' "$out"
-    { echo; echo "=== ОТЧЁТ ($(date)) ==="; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
+    { echo; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
     return 0
 }

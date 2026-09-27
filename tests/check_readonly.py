@@ -75,6 +75,11 @@ def strip_noise(line: str) -> str:
     return "".join(out)
 
 
+# Арифметика — не перенаправление. (( pad > 0 )) выглядело для проверки записью
+# в файл с именем «0», и она краснела на ровном месте.
+ARITH = re.compile(r"\(\(.*?\)\)")
+
+
 def main() -> int:
     if not TARGET.exists():
         print(f"{TARGET.name} не найден", file=sys.stderr)
@@ -82,7 +87,7 @@ def main() -> int:
 
     problems: list[str] = []
     for n, raw in enumerate(TARGET.read_text(encoding="utf-8").split("\n"), 1):
-        line = strip_noise(raw)
+        line = ARITH.sub(" ", strip_noise(raw))
         if not line.strip():
             continue
         if any(a.search(line) for a in ALLOWED):

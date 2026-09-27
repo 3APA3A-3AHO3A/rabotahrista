@@ -67,7 +67,7 @@ WARP_PORT="6000"        # локальный прокси-порт Cloudflare WA
 # что зависит от пакетов: нода, сертификат, fail2ban, docker.
 APT_WAIT=(-o DPkg::Lock::Timeout=600)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)

@@ -167,6 +167,7 @@ EOF
     # Если на порту сидит чужой сервис, а sshd не поднялся, старый доступ уже закрыт.
     local i ok=""
     for i in $(seq 1 10); do
+        ui_step_status "SSH: жду порт $SSH_PORT ($i/10)"
         if sshd_listens_on "$SSH_PORT"; then ok=1; break; fi
         sleep 1
     done
@@ -281,6 +282,7 @@ EOF
     # на сервере с большим журналом это заметно дольше двух секунд.
     local i
     for i in $(seq 1 15); do
+        ui_step_status "fail2ban: жду джейл sshd ($i/15)"
         if fail2ban-client status sshd >>"$SETUP_LOG" 2>&1; then
             return 0
         fi

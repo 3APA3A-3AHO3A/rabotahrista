@@ -13,9 +13,9 @@
 menu_step() {
     local label="$1"; shift
     if "$@"; then
-        echo -e "\n[Готово] $label"
+        echo; ui_ok "$label"
     else
-        echo -e "\n[СБОЙ] $label — подробности в $SETUP_LOG"
+        echo; ui_err "$label — подробности в $SETUP_LOG"
     fi
     # Ответы, которые человек только что ввёл, надо запомнить: иначе на ноде
     # без install.conf их придётся вводить заново при каждой следующей правке.
@@ -54,7 +54,7 @@ menu_repair() {
 
 components_menu() {
     while true; do
-        echo -e "\n===== Компоненты (доустановить / переустановить) ====="
+        ui_title "Компоненты" "доустановить или переустановить по одному"
         echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
         echo " 4) Веб: серт + конфиг nginx (покажет и спросит)"
         echo " 5) UFW                    6) Sysctl-тюнинг"
@@ -68,8 +68,8 @@ components_menu() {
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
         echo "17) bench.sh   18) ipregion   19) проверка блокировок (censorcheck)"
-        echo " 0) Назад"
-        read -ep "Выбор: " c
+        echo "  0) Назад"
+        printf '\n'; read -ep "  Выбор: " c
         case "$c" in
              1) menu_step "Cloudflare WARP"      comp_warp ;;
              2) menu_step "Docker"               comp_docker ;;
@@ -102,18 +102,16 @@ components_menu() {
 
 main_menu() {
     while true; do
-        echo -e "\n=========================================="
-        echo "  Установщик ноды rabotahrista"
-        echo "=========================================="
+        ui_title "Установщик ноды rabotahrista" "нода Remnawave: установка, диагностика, починка"
         echo " 1) Полная установка (чистый сервер)"
         echo " 2) Доустановить/переустановить компонент"
         echo " 3) Диагностика — что не так с этой нодой (ничего не меняет)"
         echo " 4) Починка по итогам диагностики"
         echo " 5) Диагностика + реальный тест продления сертификата (до минуты)"
         echo " 0) Выход"
-        read -ep "Выбор: " m
+        printf '\n'; read -ep "  Выбор: " m
         case "$m" in
-            1) full_install ;;
+            1) full_install || true ;;   # остановка уже объяснена, меню живёт дальше
             2) components_menu ;;
             3) menu_check ;;
             4) menu_repair ;;

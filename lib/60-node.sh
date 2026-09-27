@@ -36,6 +36,7 @@ comp_docker() {
     if command -v docker >/dev/null 2>&1; then
         echo "  Docker уже установлен."
     else
+        ui_step_status "Docker: ставлю с get.docker.com"
         curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1 || true
     fi
     # Проверяем фактом. Скрипт get.docker.com ставит пакеты через apt и при
@@ -97,6 +98,7 @@ EOF
     echo "  Ожидание запуска ноды (порт $NODE_PORT, до 30 сек)..."
     local i up=""
     for i in $(seq 1 30); do
+        ui_step_status "Нода: жду порт $NODE_PORT ($i/30)"
         if port_is_listening "$NODE_PORT"; then up=1; break; fi
         sleep 1
     done

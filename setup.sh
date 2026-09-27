@@ -2,7 +2,7 @@
 # ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
 # Правки вносятся в lib/, затем: python3 build.py
 # Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
+# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
 
 # ===== lib/00-header.sh ================================================
 # ##########################################################################
@@ -73,7 +73,7 @@ WARP_PORT="6000"        # локальный прокси-порт Cloudflare WA
 # что зависит от пакетов: нода, сертификат, fail2ban, docker.
 APT_WAIT=(-o DPkg::Lock::Timeout=600)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)
@@ -101,32 +101,248 @@ fi
 
 SUMMARY=()
 
+# ===== lib/05-ui.sh ====================================================
+# ##########################################################################
+#  ОФОРМЛЕНИЕ
+#  Палитра, заголовки, строки-состояния и спиннер с таймером.
+#
+#  Зачем отдельный модуль: до него каждый шаг печатал ANSI-коды прямо в тексте,
+#  и вывод выглядел по-разному в установке, диагностике и починке. Здесь один
+#  набор примитивов на всё, и он сам решает, можно ли красить.
+#
+#  Красим только если вывод действительно в терминал. При перенаправлении в
+#  файл или в конвейер (`| tee`, `> log`) escape-последовательности превратили
+#  бы лог в мусор, поэтому там все C_* пустые, а спиннер печатает одну строку.
+#  Уважается общепринятая переменная NO_COLOR.
+# ##########################################################################
+
+RH_TTY=""
+[[ -t 1 ]] && RH_TTY=1
+
+# UTF-8 нужен для рамок и кадров спиннера. Без него — ASCII, но всё читается.
+RH_UTF=""
+case "${LC_ALL:-}${LC_CTYPE:-}${LANG:-}" in *[Uu][Tt][Ff]*) RH_UTF=1 ;; esac
+
+if [[ -n "$RH_TTY" && -z "${NO_COLOR:-}" && -z "${RH_NO_COLOR:-}" ]]; then
+    # 256 цветов там, где они есть: приглушённые оттенки читаются лучше базовых
+    if [[ "$(tput colors 2>/dev/null || echo 8)" -ge 256 ]]; then
+        C_ACC=$'\033[38;5;80m'    # бирюзовый — акцент, заголовки, активный шаг
+        C_OK=$'\033[38;5;78m'     # зелёный
+        C_WARN=$'\033[38;5;179m'  # песочный
+        C_ERR=$'\033[38;5;203m'   # коралловый
+        C_DIM=$'\033[38;5;245m'   # серый — второстепенное
+    else
+        C_ACC=$'\033[36m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'
+        C_ERR=$'\033[31m'; C_DIM=$'\033[90m'
+    fi
+    C_B=$'\033[1m'; C_R=$'\033[0m'
+else
+    C_ACC=""; C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_B=""; C_R=""
+fi
+
+# Символы состояния и рамок
+if [[ -n "$RH_UTF" ]]; then
+    S_OK="✓"; S_ERR="✗"; S_WARN="!"; S_SKIP="–"; S_DOT="•"; S_H="─"
+    RH_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+else
+    S_OK="OK"; S_ERR="XX"; S_WARN="!!"; S_SKIP="--"; S_DOT="*"; S_H="-"
+    RH_FRAMES=('|' '/' '-' '\')
+fi
+
+# Ширина: узкий терминал не растягиваем, широкий не распускаем до края
+ui_width() {
+    local w="${COLUMNS:-0}"
+    [[ "$w" -lt 20 ]] && w=$(tput cols 2>/dev/null || echo 78)
+    [[ "$w" -lt 52 ]] && w=52
+    [[ "$w" -gt 76 ]] && w=76
+    echo "$w"
+}
+
+# Подгонка строки под ширину колонки ПО СИМВОЛАМ.
+# printf считает точность (%-42.42s) в байтах, а кириллица двухбайтовая —
+# метка обрезалась по середине буквы и превращалась в «обновляю списо?».
+ui_fit() {
+    local s="$1" n="$2" pad
+    if [[ "${#s}" -gt "$n" ]]; then
+        s="${s:0:n-1}…"
+    fi
+    pad=$(( n - ${#s} ))
+    printf '%s' "$s"
+    (( pad > 0 )) && printf '%*s' "$pad" ''
+    return 0
+}
+
+ui_rule() {
+    local w; w=$(ui_width); local line=""
+    while [[ "${#line}" -lt "$w" ]]; do line+="$S_H"; done
+    printf '%s%s%s\n' "$C_DIM" "$line" "$C_R"
+    return 0
+}
+
+# Шапка: заголовок между двумя линиями, с необязательным подзаголовком
+ui_title() {
+    echo
+    ui_rule
+    printf '%s%s  %s%s\n' "$C_B" "$C_ACC" "$1" "$C_R"
+    [[ -n "${2:-}" ]] && printf '%s  %s%s\n' "$C_DIM" "$2" "$C_R"
+    ui_rule
+    return 0
+}
+
+ui_section() { printf '\n%s%s%s %s%s\n' "$C_B" "$C_ACC" "$S_DOT" "$1" "$C_R"; return 0; }
+
+ui_ok()   { printf '  %s%s%s  %s\n' "$C_OK"   "$S_OK"   "$C_R" "$*"; return 0; }
+ui_err()  { printf '  %s%s%s  %s\n' "$C_ERR"  "$S_ERR"  "$C_R" "$*"; return 0; }
+ui_warn() { printf '  %s%s%s  %s\n' "$C_WARN" "$S_WARN" "$C_R" "$*"; return 0; }
+ui_skip() { printf '  %s%s  %s%s\n' "$C_DIM"  "$S_SKIP" "$*" "$C_R"; return 0; }
+ui_info() { printf '     %s%s%s\n' "$C_DIM" "$*" "$C_R"; return 0; }
+ui_note() { printf '  %s\n' "$*"; return 0; }
+
+# Ключ-значение ровной колонкой. Длина считается в символах, а не байтах —
+# при кириллице иначе колонки разъезжаются.
+ui_kv() {
+    local key="$1"; shift
+    local pad=$(( 22 - ${#key} )); (( pad < 1 )) && pad=1
+    printf '  %s%s%s%*s%s\n' "$C_DIM" "$key" "$C_R" "$pad" "" "$*"
+    return 0
+}
+
+# Печать сводки шагов. SUMMARY хранит текстовые метки «[ OK ]» / «[СБОЙ]» /
+# «[проп.]» — они же уходят в файл отчёта, а на экран рисуем значками.
+ui_summary() {
+    local line rest
+    for line in "$@"; do
+        rest="${line#*]}"
+        while [[ "$rest" == " "* ]]; do rest="${rest# }"; done
+        case "$line" in
+            '[ OK ]'*) printf '  %s%s%s  %s\n' "$C_OK"  "$S_OK"   "$C_R" "$rest" ;;
+            '[СБОЙ]'*) printf '  %s%s%s  %s\n' "$C_ERR" "$S_ERR"  "$C_R" "$rest" ;;
+            *)         printf '  %s%s  %s%s\n' "$C_DIM" "$S_SKIP" "$rest" "$C_R" ;;
+        esac
+    done
+    return 0
+}
+
+# Сколько шагов упало
+ui_fail_count() {
+    local line n=0
+    for line in "$@"; do
+        [[ "$line" == '[СБОЙ]'* ]] && n=$(( n + 1 ))
+    done
+    echo "$n"
+    return 0
+}
+
+# ===== lib/06-spinner.sh ===============================================
+# ##########################################################################
+#  СПИННЕР
+#
+#  Отдельным модулем от остального оформления по одной причине: он создаёт
+#  временный файл для живой подписи, а из lib/05-ui.sh собирается ещё и
+#  check.sh, который обязан не писать на диск вообще ничего. Тест это проверяет,
+#  и правильный ответ на его замечание — разделить модули, а не ослабить тест.
+# ##########################################################################
+
+RH_SPIN_PID=""
+RH_SPIN_LABEL=""
+RH_SPIN_T0=0
+# Метка живёт в файле, а не в переменной: анимация крутится в подоболочке и
+# изменения переменных родителя не видит. Через файл шаг может рассказывать,
+# что он делает прямо сейчас, — иначе двухминутная проверка выглядит зависанием.
+RH_SPIN_FILE=""
+
+ui_mmss() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); return 0; }
+
+ui_spin_start() {
+    RH_SPIN_LABEL="$1"
+    RH_SPIN_T0=$SECONDS
+    RH_SPIN_FILE=$(mktemp 2>/dev/null || echo "")
+    [[ -n "$RH_SPIN_FILE" ]] && printf '%s' "$1" > "$RH_SPIN_FILE"
+    if [[ -z "$RH_TTY" ]]; then
+        printf '  %s  %s\n' "$S_DOT" "$1"
+        return 0
+    fi
+    (
+        local i=0 el lbl="$RH_SPIN_LABEL"
+        while :; do
+            el=$(( SECONDS - RH_SPIN_T0 ))
+            [[ -n "$RH_SPIN_FILE" ]] && lbl=$(cat "$RH_SPIN_FILE" 2>/dev/null || printf '%s' "$lbl")
+            printf '\r\033[K  %s%s%s  %s %s%5s%s' \
+                "$C_ACC" "${RH_FRAMES[i % ${#RH_FRAMES[@]}]}" "$C_R" \
+                "$(ui_fit "$lbl" 42)" "$C_DIM" "$(ui_mmss "$el")" "$C_R"
+            i=$(( i + 1 ))
+            sleep 0.12
+        done
+    ) &
+    RH_SPIN_PID=$!
+    return 0
+}
+
+# Шаг рассказывает, чем занят сейчас. Без спиннера — тихо, чтобы не сорить
+# в лог и не мешать подробному выводу в меню.
+ui_step_status() {
+    [[ -n "$RH_SPIN_FILE" ]] && printf '%s' "$1" > "$RH_SPIN_FILE" 2>/dev/null
+    return 0
+}
+
+# ui_spin_stop <код> — снимает анимацию и печатает итог той же строкой
+ui_spin_stop() {
+    local rc="${1:-0}" el mark col
+    el=$(( SECONDS - RH_SPIN_T0 ))
+    if [[ -n "$RH_SPIN_PID" ]]; then
+        kill "$RH_SPIN_PID" 2>/dev/null || true
+        wait "$RH_SPIN_PID" 2>/dev/null || true
+        RH_SPIN_PID=""
+    fi
+    [[ -n "$RH_SPIN_FILE" ]] && { rm -f "$RH_SPIN_FILE"; RH_SPIN_FILE=""; }
+    if [[ "$rc" -eq 0 ]]; then mark="$S_OK"; col="$C_OK"; else mark="$S_ERR"; col="$C_ERR"; fi
+    if [[ -n "$RH_TTY" ]]; then
+        printf '\r\033[K  %s%s%s  %s %s%5s%s\n' \
+            "$col" "$mark" "$C_R" "$(ui_fit "$RH_SPIN_LABEL" 42)" "$C_DIM" "$(ui_mmss "$el")" "$C_R"
+    else
+        printf '  %s  %s  (%s)\n' "$mark" "$RH_SPIN_LABEL" "$(ui_mmss "$el")"
+    fi
+    return 0
+}
+
 # ===== lib/10-helpers.sh ===============================================
 # ##########################################################################
 #  ХЕЛПЕРЫ
 #  Сводка шагов и печать итогового отчёта
 # ##########################################################################
 
-# Запуск шага: вывод идёт и на экран, и в лог.
+# Запуск шага.
 #
-# Раньше объяснение шага оставалось только на экране, а print_summary экран
-# очищал — и причина сбоя исчезала навсегда, хотя в сводке было написано
-# «см. лог». Именно так пропало объяснение, почему не применился харденинг SSH.
+# На экране — одна живая строка: кадр спиннера, что делается, сколько идёт.
+# Весь вывод шага уходит в $SETUP_LOG: смотреть, как apt перечисляет двести
+# пакетов, никому не нужно, а при сбое причина всё равно печатается сразу,
+# последними строками — потому что итоговый отчёт очищает экран, и искать её
+# потом в логе было бы лишним шагом.
 #
-# Подстановка процесса, а не конвейер: в конвейере функция выполнялась бы в
-# подоболочке, и её переменные (SSH_HARDENED, ADMIN_PASS, FULL_DOMAIN,
-# UFW_SSH_PORTS) не дошли бы до итогового отчёта.
-# Только stdout: приглашения read идут в stderr и должны появляться сразу.
+# Шаг выполняется в ТЕКУЩЕЙ оболочке, в фоне только анимация. Через конвейер
+# (`"$@" | tee`) шаг ушёл бы в подоболочку, и выставленные им переменные —
+# пароль учётки, домен, признак применённого харденинга — не дошли бы до отчёта.
 rh_step_exec() {
     local label="$1"; shift
+    local out rc=0
+    out=$(mktemp)
     { echo; echo "=== ШАГ: $label — $(date '+%H:%M:%S') ==="; } >>"$SETUP_LOG" 2>/dev/null || true
-    if "$@" > >(tee -a "$SETUP_LOG"); then
+    ui_spin_start "$label"
+    # stdin от /dev/null: если какой-то шаг всё же задаст вопрос, read получит
+    # конец ввода и шаг упадёт с понятной ошибкой. Иначе вопрос ушёл бы в лог,
+    # а на экране крутился бы спиннер — установка «висела» бы без объяснений.
+    "$@" >"$out" 2>&1 </dev/null || rc=$?
+    ui_spin_stop "$rc"
+    cat "$out" >>"$SETUP_LOG" 2>/dev/null || true
+    if [[ "$rc" -ne 0 ]]; then
+        grep -v '^[[:space:]]*$' "$out" 2>/dev/null | tail -12 \
+            | sed "s/^/   ${C_DIM}/; s/\$/${C_R}/"
+        SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
+    else
         SUMMARY+=("[ OK ]    $label")
-        return 0
     fi
-    SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
-    echo "  [СБОЙ] $label — подробности в $SETUP_LOG"
-    return 1
+    rm -f "$out"
+    return "$rc"
 }
 
 # do_step "Метка" функция...  — обычный шаг: сбой не роняет установку
@@ -143,13 +359,9 @@ do_step_required() {
 
 skip_step() { SUMMARY+=("[проп.]   $1"); }
 
-# Строка отчёта ровной колонкой ("метка" дополняется пробелами до 21 символа)
-row() {
-    local label="$1"; shift
-    local n=$(( 21 - ${#label} )); (( n < 1 )) && n=1
-    local pad; printf -v pad '%*s' "$n" ''
-    printf '  %s%s%s\n' "$label" "$pad" "$*"
-}
+# Строка отчёта ровной колонкой. Длина метки считается в символах, а не в
+# байтах: при кириллице иначе колонки разъезжаются.
+row() { ui_kv "$@"; }
 
 # Версии всего, что поставили: пакеты apt + то, что ставится мимо apt
 collect_versions() {
@@ -173,64 +385,93 @@ collect_versions() {
     return 0
 }
 
-# Финальный отчёт: чистит экран и печатает всё одним куском + кладёт в файл
+# Финальный отчёт.
+#
+# Экран чистим ТОЛЬКО когда всё прошло: при сбоях на нём остались объяснения
+# упавших шагов, и стирать их — значит отправить человека искать причину в логе
+# ради того, чтобы отчёт выглядел опрятнее.
 print_summary() {
-    local out node_state
-    node_state=$(docker inspect -f '{{.State.Status}} (restarts={{.RestartCount}})' remnanode 2>/dev/null || echo "контейнер не найден")
+    local out node_state fails elapsed
+    node_state=$(docker inspect -f '{{.State.Status}} (перезапусков {{.RestartCount}})' remnanode 2>/dev/null | head -1 | tr -d '\r\n')
+    [[ -z "$node_state" ]] && node_state="контейнер не найден"
+    fails=$(ui_fail_count "${SUMMARY[@]}")
+    elapsed=$(ui_mmss $(( SECONDS - ${RH_T0:-0} )))
+
+    if [[ "$fails" -eq 0 && -t 1 ]]; then clear || true; fi
+
+    if [[ "$fails" -eq 0 ]]; then
+        ui_title "Нода ${FULL_DOMAIN:-$(hostname)} готова" \
+                 "заняло $elapsed · $(date '+%Y-%m-%d %H:%M %Z')"
+    else
+        ui_title "Установка закончилась с ошибками: $fails" \
+                 "заняло $elapsed · подробности выше и в $SETUP_LOG"
+    fi
+
+    ui_section "Доступ по SSH"
+    ui_kv "команда входа" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+    ui_kv "учётка" "$ADMIN_USER (sudo без пароля)"
+    case "$ADMIN_PASS_SOURCE" in
+        manual) ui_kv "пароль учётки" "задан вами вручную (в отчёт не пишу)" ;;
+        kept)   ui_kv "пароль учётки" "не менялся — пользователь уже существовал" ;;
+        *)      ui_kv "пароль учётки" "${ADMIN_PASS:-—}"
+                ui_info "нужен только для аварийной консоли хостера" ;;
+    esac
+    ui_kv "root и пароли" "вход запрещён"
+    if [[ -n "$SSH_PENDING_REBOOT" ]]; then
+        ui_warn "порт $SSH_PORT заработает только после перезагрузки"
+        ui_info "до неё заходите по старому порту — он открыт в UFW"
+    elif [[ -z "$SSH_HARDENED" ]]; then
+        ui_err "харденинг SSH не применился — смотрите шаги ниже"
+    fi
+
+    ui_section "Нода"
+    ui_kv "домен" "${FULL_DOMAIN:-—}"
+    ui_kv "IP сервера" "${SERVER_IP:-—}"
+    ui_kv "контейнер" "$node_state"
+    ui_kv "порт для панели" "$NODE_PORT (только с ${PANEL_IP:-—})"
+
+    ui_section "Фаервол"
+    ui_kv "открыто" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80, 443"
+    ui_kv "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
+
+    ui_section "Шаги"
+    ui_summary "${SUMMARY[@]}"
+
+    ui_section "Где что лежит"
+    ui_kv "этот отчёт" "$REPORT_FILE"
+    ui_kv "полный лог" "$SETUP_LOG"
+    ui_kv "ответы установки" "$INSTALL_STATE"
+    ui_kv "compose ноды" "/opt/remnanode/docker-compose.yml"
+    [[ -f "$NOTIFY_ENV" ]] && ui_kv "telegram" "$NOTIFY_ENV"
+    ui_rule
+
+    # В файл — то же самое, но без цвета и с версиями пакетов: его читают
+    # глазами через неделю, когда экрана уже нет.
     out=$(
-        echo "=========================================="
-        echo "  УСТАНОВКА ЗАВЕРШЕНА — $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "=========================================="
+        echo "=== ОТЧЁТ ОБ УСТАНОВКЕ — $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+        echo "Заняло: $elapsed, сбоев: $fails"
         echo
-        echo "--- ДОСТУП ПО SSH ---"
-        row "Команда входа:" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
-        row "Учётка:" "$ADMIN_USER (sudo без пароля)"
+        echo "Вход:            ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+        echo "Учётка:          $ADMIN_USER (sudo без пароля)"
         case "$ADMIN_PASS_SOURCE" in
-            manual)    row "Пароль учётки:" "задан вами вручную (в отчёт не пишу)" ;;
-            kept)      row "Пароль учётки:" "не менялся — пользователь уже существовал" ;;
-            *)         row "Пароль учётки:" "${ADMIN_PASS:-—}"
-                       row "" "(сгенерирован; нужен только для аварийной консоли хостера)" ;;
+            manual) echo "Пароль учётки:   задан вами вручную" ;;
+            kept)   echo "Пароль учётки:   не менялся" ;;
+            *)      echo "Пароль учётки:   ${ADMIN_PASS:-—}" ;;
         esac
-        row "Root по SSH:" "запрещён"
-        row "Вход по паролю:" "запрещён"
-        if [[ -n "$SSH_PENDING_REBOOT" ]]; then
-            row "ВНИМАНИЕ:" "порт $SSH_PORT заработает ТОЛЬКО ПОСЛЕ ПЕРЕЗАГРУЗКИ"
-            row "" "до неё заходи по старому порту — он открыт в UFW (см. ниже)"
-        elif [[ -z "$SSH_HARDENED" ]]; then
-            row "ВНИМАНИЕ:" "харденинг SSH не применился — смотри шаги ниже"
-        fi
+        echo "Домен:           ${FULL_DOMAIN:-—}"
+        echo "IP сервера:      ${SERVER_IP:-—}"
+        echo "Порт панели:     $NODE_PORT (только с ${PANEL_IP:-—})"
+        echo "UFW:             ${UFW_SSH_PORTS:-$SSH_PORT/tcp}, 80/tcp, 443/tcp"
         echo
-        echo "--- НОДА ---"
-        row "Домен:" "${FULL_DOMAIN:-—}"
-        row "IP сервера:" "${SERVER_IP:-—}"
-        row "Контейнер:" "$node_state"
-        row "Порт для панели:" "$NODE_PORT (открыт только для ${PANEL_IP:-—})"
-        echo
-        echo "--- ФАЕРВОЛ (UFW) ---"
-        row "Открыто:" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80/tcp, 443/tcp"
-        row "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
-        echo
-        echo "--- ШАГИ УСТАНОВКИ ---"
+        echo "--- ШАГИ ---"
         printf '%s\n' "${SUMMARY[@]}"
         echo
-        echo "--- УСТАНОВЛЕННЫЕ ПАКЕТЫ И ВЕРСИИ ---"
+        echo "--- ПАКЕТЫ И ВЕРСИИ ---"
         collect_versions
-        echo
-        echo "--- ГДЕ ЧТО ЛЕЖИТ ---"
-        row "Этот отчёт:" "$REPORT_FILE"
-        row "Полный лог:" "$SETUP_LOG"
-        row "Ответы установки:" "$INSTALL_STATE"
-        row "Compose ноды:" "/opt/remnanode/docker-compose.yml"
-        row "Конфиг nginx:" "$NGINX_AVAIL/${FULL_DOMAIN:-—}"
-        [[ -f "$NOTIFY_ENV" ]] && row "Telegram:" "$NOTIFY_ENV"
-        echo "=========================================="
     )
     printf '%s\n' "$out" > "$REPORT_FILE" 2>/dev/null || true
     chmod 600 "$REPORT_FILE" 2>/dev/null || true
-    # чистим экран от простыни установки — всё важное уже в $out и в файле
-    if [[ -t 1 ]]; then clear || true; fi
-    printf '%s\n' "$out"
-    { echo; echo "=== ОТЧЁТ ($(date)) ==="; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
+    { echo; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
     return 0
 }
 
@@ -678,9 +919,39 @@ comp_swap() {
     return 0
 }
 
-# Кто прямо сейчас держит apt/dpkg. Только смотрит и рассказывает.
+# Кто держит apt/dpkg прямо сейчас. Только смотрит.
+#
+# Смотрим на сами файлы блокировок, а не на имена процессов. Раньше искали
+# «unattended-upgrade» по командной строке — а на Ubuntu постоянно висит демон
+# unattended-upgrade-shutdown, который ждёт выключения сервера и к apt в данный
+# момент отношения не имеет. Поиск считал apt занятым всегда, и установка
+# стояла бы по 10 минут на каждом сервере. Так и было, проверено.
+RH_APT_LOCKS=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+              /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+
+apt_lock_pids() {
+    if command -v fuser >/dev/null 2>&1; then
+        # fuser печатает PID в stdout, имена файлов — в stderr
+        fuser "${RH_APT_LOCKS[@]}" 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | sort -u
+    else
+        # Без fuser — по точному имени процесса, и демон ожидания выключения
+        # отсеиваем по полной командной строке
+        pgrep -a -x 'apt-get|apt|dpkg|aptitude|unattended-upgr' 2>/dev/null \
+            | grep -v 'unattended-upgrade-shutdown' | awk '{print $1}'
+    fi
+    return 0
+}
+
+rh_apt_busy() {
+    [[ -n "$(apt_lock_pids)" ]] && return 0
+    return 1
+}
+
 apt_busy_who() {
-    pgrep -a -f 'apt-get|unattended-upgrade|/usr/bin/dpkg' 2>/dev/null | head -3
+    local pid
+    for pid in $(apt_lock_pids); do
+        ps -o pid=,args= -p "$pid" 2>/dev/null | sed 's/^ *//' | cut -c1-70
+    done | head -3
     return 0
 }
 
@@ -695,14 +966,18 @@ comp_packages() {
         echo "  Обычно это первое после загрузки автообновление, оно закончится само."
     fi
     local rc=0
-    {
-        apt-get "${APT_WAIT[@]}" clean
-        apt-get "${APT_WAIT[@]}" update
-        apt-get "${APT_WAIT[@]}" -y upgrade
-        apt-get "${APT_WAIT[@]}" -y dist-upgrade
-        apt-get "${APT_WAIT[@]}" -y autoremove --purge
-        apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES
-    } >>"$SETUP_LOG" 2>&1 || rc=$?
+    ui_step_status "Пакеты: обновляю список"
+    { apt-get "${APT_WAIT[@]}" clean && apt-get "${APT_WAIT[@]}" update; } >>"$SETUP_LOG" 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        ui_step_status "Пакеты: обновляю систему"
+        { apt-get "${APT_WAIT[@]}" -y upgrade
+          apt-get "${APT_WAIT[@]}" -y dist-upgrade
+          apt-get "${APT_WAIT[@]}" -y autoremove --purge; } >>"$SETUP_LOG" 2>&1 || rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+        ui_step_status "Пакеты: ставлю нужное скрипту"
+        apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES >>"$SETUP_LOG" 2>&1 || rc=$?
+    fi
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
     if [[ $rc -ne 0 ]]; then
         echo "  [СБОЙ] apt завершился с ошибкой (см. $SETUP_LOG)."
@@ -850,6 +1125,186 @@ comp_os_update() {
         echo "  [СБОЙ] apt-обновление завершилось с ошибкой — перезагрузка отменена."
         return 1
     fi
+}
+
+# ===== lib/45-preflight.sh =============================================
+# ##########################################################################
+#  ПРОВЕРКИ ПЕРЕД СТАРТОМ И УСТОЙЧИВОСТЬ К ОБРЫВУ СВЯЗИ
+#
+#  Два разных урока, оба с живых нод.
+#
+#  Первый: на только что созданном сервере cloud-init ещё дорабатывает и держит
+#  apt первым автообновлением. Установщик падал на первой же команде, а за ним
+#  сыпалось всё, что зависит от пакетов. Лечится ожиданием, а не спешкой.
+#
+#  Второй: установка идёт минуты, а ssh рвётся. Если процесс висит на терминале,
+#  обрыв уносит установку на середине — пакеты доставлены, нода нет, sshd уже
+#  перезапущен на новом порту. Поэтому работаем внутри tmux: сессия переживает
+#  обрыв, и к ней можно вернуться.
+# ##########################################################################
+
+RH_SESSION="rabotahrista"
+RH_LOCK="/run/rabotahrista.lock"
+
+
+# Ждём чужой apt. Молча ждать нельзя: человек должен понимать, почему пауза.
+rh_wait_apt() {
+    local max="${1:-600}" waited=0
+    rh_apt_busy || return 0
+    ui_spin_start "Ждём чужой apt (автообновление сервера)"
+    while rh_apt_busy && [[ "$waited" -lt "$max" ]]; do
+        ui_step_status "Ждём чужой apt — $(apt_busy_who | head -1 | cut -c1-40)"
+        sleep 3
+        waited=$(( waited + 3 ))
+    done
+    if rh_apt_busy; then
+        ui_spin_stop 1
+        ui_info "apt занят уже $(ui_mmss "$waited") — дальше пойдём с ожиданием блокировки"
+        return 1
+    fi
+    ui_spin_stop 0
+    return 0
+}
+
+# cloud-init на облачных образах сам ставит обновления при первой загрузке.
+# Дождаться его — самый честный способ не драться с ним за dpkg.
+rh_wait_cloud_init() {
+    command -v cloud-init >/dev/null 2>&1 || return 0
+    cloud-init status 2>/dev/null | grep -q 'status: done' && return 0
+    ui_spin_start "Ждём cloud-init (первичная настройка сервера)"
+    timeout 420 cloud-init status --wait >/dev/null 2>&1 || true
+    ui_spin_stop 0
+    return 0
+}
+
+# Проверки, после которых понятно, можно ли вообще начинать.
+# Только читает: ничего не ставит и не правит.
+rh_preflight() {
+    local rc=0 v
+    ui_section "Проверка сервера"
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        ui_err "нет apt-get — скрипт рассчитан на Debian/Ubuntu"
+        return 1
+    fi
+    ui_ok "система: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") | ядро $(uname -r)"
+
+    # Диск. Docker с образом ноды и пакеты — это единицы гигабайт.
+    v=$(df -BM --output=avail / 2>/dev/null | tail -1 | tr -cd '0-9')
+    v="${v:-0}"
+    if [[ "$v" -lt 2048 ]]; then
+        ui_err "на / свободно ${v} МБ — этого не хватит даже на пакеты"
+        rc=1
+    elif [[ "$v" -lt 5120 ]]; then
+        ui_warn "на / свободно ${v} МБ — впритык, образ ноды и логи могут упереться"
+    else
+        ui_ok "на / свободно ${v} МБ"
+    fi
+
+    v=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+    v="${v:-0}"
+    if [[ "$v" -lt 700 ]]; then
+        ui_warn "памяти ${v} МБ — мало, но swap 2 ГБ скрипт создаст сам"
+    else
+        ui_ok "памяти ${v} МБ"
+    fi
+
+    if getent hosts archive.ubuntu.com >/dev/null 2>&1 \
+       || getent hosts deb.debian.org >/dev/null 2>&1; then
+        ui_ok "DNS и сеть отвечают"
+    else
+        ui_err "не резолвятся репозитории — без сети ставить нечего"
+        rc=1
+    fi
+
+    if command -v sshd >/dev/null 2>&1; then
+        ui_ok "sshd на месте"
+    else
+        ui_warn "sshd не найден — харденинг SSH будет нечего настраивать"
+    fi
+
+    # Съехавшие часы — это провал выпуска сертификата с невнятной ошибкой
+    v=$(date +%Y)
+    if [[ "$v" -lt 2024 ]]; then
+        ui_warn "часы показывают $v год — Let's Encrypt откажет, поправьте время"
+    fi
+
+    rh_wait_cloud_init
+    rh_wait_apt 600 || true
+
+    if [[ "$rc" -ne 0 ]]; then
+        ui_note ""
+        ui_err "Сервер к установке не готов — смотрите строки выше."
+        return 1
+    fi
+    return 0
+}
+
+# ##########################################################################
+#  Один запуск на сервер и жизнь после обрыва ssh
+# ##########################################################################
+
+# Второй установщик на том же сервере — это два apt, два перезапуска sshd и
+# гонка за одни и те же файлы. Пускаем ровно один.
+rh_take_lock() {
+    command -v flock >/dev/null 2>&1 || return 0
+    # Фигурные скобки обязательны. «exec 9>файл 2>/dev/null» без них значит не
+    # «открой файл, скрыв ошибку», а «отправь stderr всего скрипта в никуда
+    # навсегда» — и пропадают все приглашения read (bash пишет их в stderr) и
+    # аварийные сообщения. Так и было, проверено.
+    { exec 9>"$RH_LOCK"; } 2>/dev/null || return 0
+    if ! flock -n 9; then
+        echo
+        echo "  На этом сервере уже работает другой запуск установщика."
+        echo "  Если он идёт в отключённой сессии — подключитесь к ней:"
+        echo "      sudo tmux attach -t $RH_SESSION"
+        echo "  Если это остаток от оборвавшегося запуска — проверьте: pgrep -a setup.sh"
+        echo
+        exit 1
+    fi
+    return 0
+}
+
+rh_in_multiplexer() {
+    [[ -n "${TMUX:-}" || -n "${STY:-}" ]] && return 0
+    return 1
+}
+
+# Перезапуск себя внутри tmux. Вопросы при этом работают как обычно — это
+# тот же терминал, просто пережимающий обрыв связи.
+rh_session_guard() {
+    [[ -n "${RH_LIB_ONLY:-}" || -n "${RH_NO_TMUX:-}" ]] && return 0
+    [[ -t 0 && -t 1 ]] || return 0
+    rh_in_multiplexer && return 0
+    # На «тупом» терминале tmux не запустится, а exec уже заменил бы процесс —
+    # и установка не началась бы вовсе. Лучше без tmux, чем никак.
+    [[ -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] || return 0
+
+    if ! command -v tmux >/dev/null 2>&1; then
+        # Короткий таймаут: ждать десять минут ради tmux бессмысленно,
+        # без него установка тоже пройдёт — просто менее живучей.
+        ui_info "ставлю tmux, чтобы установка пережила обрыв ssh (до минуты)..."
+        apt-get -o DPkg::Lock::Timeout=30 install -y tmux >/dev/null 2>&1 \
+            || { apt-get -o DPkg::Lock::Timeout=30 update -qq >/dev/null 2>&1 \
+                 && apt-get -o DPkg::Lock::Timeout=30 install -y tmux >/dev/null 2>&1; } \
+            || true
+    fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        ui_warn "tmux поставить не удалось — установка не переживёт обрыв ssh"
+        ui_info "не закрывайте окно до конца установки"
+        return 0
+    fi
+
+    local cmd a
+    cmd="bash $(printf '%q' "$0")"
+    for a in "$@"; do cmd+=" $(printf '%q' "$a")"; done
+    # После выхода скрипта окно не закрываем: иначе итоговый отчёт с паролем
+    # учётки мелькнёт и исчезнет вместе с сессией.
+    cmd+='; printf "\n  Готово. Enter — закрыть окно. "; read -r _'
+
+    ui_title "Работаю внутри tmux" "если ssh оборвётся: sudo tmux attach -t $RH_SESSION"
+    sleep 2
+    exec tmux new-session -A -s "$RH_SESSION" "$cmd"
 }
 
 # ===== lib/50-security.sh ==============================================
@@ -1022,6 +1477,7 @@ EOF
     # Если на порту сидит чужой сервис, а sshd не поднялся, старый доступ уже закрыт.
     local i ok=""
     for i in $(seq 1 10); do
+        ui_step_status "SSH: жду порт $SSH_PORT ($i/10)"
         if sshd_listens_on "$SSH_PORT"; then ok=1; break; fi
         sleep 1
     done
@@ -1136,6 +1592,7 @@ EOF
     # на сервере с большим журналом это заметно дольше двух секунд.
     local i
     for i in $(seq 1 15); do
+        ui_step_status "fail2ban: жду джейл sshd ($i/15)"
         if fail2ban-client status sshd >>"$SETUP_LOG" 2>&1; then
             return 0
         fi
@@ -1184,6 +1641,7 @@ comp_docker() {
     if command -v docker >/dev/null 2>&1; then
         echo "  Docker уже установлен."
     else
+        ui_step_status "Docker: ставлю с get.docker.com"
         curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1 || true
     fi
     # Проверяем фактом. Скрипт get.docker.com ставит пакеты через apt и при
@@ -1245,6 +1703,7 @@ EOF
     echo "  Ожидание запуска ноды (порт $NODE_PORT, до 30 сек)..."
     local i up=""
     for i in $(seq 1 30); do
+        ui_step_status "Нода: жду порт $NODE_PORT ($i/30)"
         if port_is_listening "$NODE_PORT"; then up=1; break; fi
         sleep 1
     done
@@ -1349,6 +1808,7 @@ acme_reachable() {
     fi
     echo "  Проверяю доступность ACME-пути снаружи (до 2 минут)..."
     for i in $(seq 1 20); do
+        ui_step_status "Сертификат: проверяю ACME-путь ($i/20)"
         got=$(curl -fsSL --max-time 10 "$url" 2>/dev/null || true)
         if [[ "$got" == "$token" ]]; then
             echo "  ОК: запрос дошёл до этого сервера (попытка $i). Let's Encrypt тоже дойдёт."
@@ -1623,6 +2083,7 @@ comp_web() {
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
     get_server_ip
 
+    ui_step_status "Веб: заглушка сайта"
     echo ">>> Заглушка сайта..."
     mkdir -p /var/www/stub
     wget -qO /var/www/stub/index.html "$INDEX_URL"
@@ -1684,6 +2145,7 @@ comp_web() {
             cf_restore_proxy
             return 1
         fi
+        ui_step_status "Сертификат: выпускаю через Let's Encrypt"
         if ! certbot certonly --webroot -w /var/lib/letsencrypt -d "$FULL_DOMAIN" \
                 --register-unsafely-without-email --agree-tos --non-interactive \
                 --keep-until-expiring >>"$SETUP_LOG" 2>&1; then
@@ -2234,9 +2696,17 @@ run_censor() { echo ">>> Проверка блокировок/DPI/DNS (censorch
 #  ПОЛНАЯ УСТАНОВКА
 # ##########################################################################
 full_install() {
-    echo -e "\n========== ПОЛНАЯ УСТАНОВКА =========="
+    ui_title "Установка ноды Remnawave" "вопросы сейчас, потом работа без участия"
+    # Проверки до вопросов: незачем тратить время человека, если сервер не готов
+    if ! rh_preflight; then
+        return 1
+    fi
+    RH_T0=$SECONDS
     if [[ -n "$STATE_LOADED" && -z "$NONINTERACTIVE" ]]; then
-        echo "Найдены данные прошлой установки: ${SUBDOMAIN}.${DOMAIN}, панель ${PANEL_IP}, учётка ${ADMIN_USER}, порт SSH ${SSH_PORT}"
+        ui_section "Найдены ответы прошлой установки"
+        ui_kv "домен" "${SUBDOMAIN}.${DOMAIN}"
+        ui_kv "панель" "${PANEL_IP}"
+        ui_kv "учётка и порт" "${ADMIN_USER}, ${SSH_PORT}"
         read -ep "Обновить с этими данными (без повторного ввода)? [Y/n]: " USE_SAVED || USE_SAVED=""
         if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
             DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
@@ -2247,20 +2717,21 @@ full_install() {
         fi
     fi
     # --- сбор всех ответов заранее ---
+    ui_section "Нода и панель"
     ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
 
-    echo -e "\n--- SSH ---"
+    ui_section "Доступ по SSH"
     ask_ssh_params
-    echo "Итого: учётка «$ADMIN_USER», порт SSH $SSH_PORT. Вход под root и вход по паролю будут отключены."
+    ui_info "учётка «$ADMIN_USER», порт $SSH_PORT; вход под root и по паролю будут закрыты"
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         ask_ssh_key
 
-        echo -e "\n--- Доп. компоненты ---"
+        ui_section "Дополнительно"
         [[ -z "$INSTALL_WARP" ]]      && read -ep "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
         [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Установить Speedtest CLI? [y/N]: " INSTALL_SPEEDTEST
 
-        echo -e "\n--- Telegram-уведомления ---"
+        ui_section "Telegram-уведомления"
         [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [y/N]: " SETUP_TG
         [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && ask_telegram
     fi
@@ -2268,7 +2739,8 @@ full_install() {
 
     save_state   # запомнить ответы для будущих обновлений
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
-    echo -e "\nСтавлю ноду для $FULL_DOMAIN. Тяжёлый вывод — в $SETUP_LOG\n"; sleep 2
+    ui_title "Ставлю ноду $FULL_DOMAIN" "вопросов больше не будет · подробный лог: $SETUP_LOG"
+    sleep 1
 
     # --- выполнение (каждый шаг пишет результат в сводку) ---
     do_step "Swap" comp_swap
@@ -2322,8 +2794,8 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         echo
-        echo "Отчёт выше сохранён в $REPORT_FILE (в нём же пароль учётки)."
-        echo "Отключение IPv6 (GRUB) применится только после перезагрузки."
+        ui_info "отчёт сохранён в $REPORT_FILE, там же пароль учётки"
+        ui_info "отключение IPv6 применится только после перезагрузки"
         read -ep "Доустановить/переустановить что-то в меню перед ребутом? [y/N]: " ADDC || ADDC=""
         [[ "$ADDC" =~ ^[Yy]$ ]] && components_menu
         read -ep "Перезагрузить сервер сейчас? [Y/n]: " RB || RB=""
@@ -2469,7 +2941,7 @@ repair_build_plan() {
 
 repair_print_plan() {
     local line fn label what n=0
-    echo "  БУДЕТ СДЕЛАНО:"
+    ui_section "БУДЕТ СДЕЛАНО"
     for line in "${REPAIR_PLAN[@]}"; do
         n=$((n+1))
         IFS='|' read -r fn label what <<< "$line"
@@ -2477,12 +2949,12 @@ repair_print_plan() {
         printf '      %s\n' "$what"
     done
     if [[ ${#REPAIR_SKIPS[@]} -gt 0 ]]; then
-        echo
-        echo "  ПРОПУЩУ:"
-        printf '      %s\n' "${REPAIR_SKIPS[@]}"
+        ui_section "ПРОПУЩУ"
+        local s
+        for s in "${REPAIR_SKIPS[@]}"; do ui_skip "$s"; done
     fi
     echo
-    echo "  НЕ ТРОНУ: фаервол, контейнер ноды, пакеты, nginx. Перезагрузки не будет."
+    ui_info "не тронет: фаервол, контейнер ноды, пакеты, nginx; перезагрузки не будет"
     echo
     return 0
 }
@@ -2507,18 +2979,14 @@ repair_pick_steps() {
 
 run_repair() {
     SUMMARY=()
-    echo
-    echo "=========================================="
-    echo "  ПОЧИНКА УЖЕ НАСТРОЕННОЙ НОДЫ"
-    echo "=========================================="
+    ui_title "Починка настроенной ноды" "типовые поломки; nginx не трогается"
 
     FULL_DOMAIN=""
     [[ -n "${SUBDOMAIN:-}" && -n "${DOMAIN:-}" ]] && FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
-    echo "  Нода:     ${FULL_DOMAIN:-не определена}"
-    echo "  Панель:   ${PANEL_IP:-не определена}"
-    echo "  Учётка:   ${ADMIN_USER:-?} | порт SSH: ${SSH_PORT:-?}"
-    echo "  Telegram: $([[ -n "${TG_BOT_TOKEN:-}" ]] && echo "настроен" || echo "не настроен")"
-    echo
+    ui_kv "нода" "${FULL_DOMAIN:-не определена}"
+    ui_kv "панель" "${PANEL_IP:-не определена}"
+    ui_kv "учётка и порт" "${ADMIN_USER:-?}, ${SSH_PORT:-?}"
+    ui_kv "telegram" "$([[ -n "${TG_BOT_TOKEN:-}" ]] && echo "настроен" || echo "не настроен")"
 
     repair_build_plan
     repair_print_plan
@@ -2532,6 +3000,11 @@ run_repair() {
             *)    echo "  Отменено. Ничего не изменено."; return 0 ;;
         esac
     fi
+
+    # Дальше — работа без вопросов. Шаги идут под спиннером, их вывод уходит
+    # в лог, и приглашение ввода было бы невидимо: установка просто встала бы.
+    # Все ответы уже либо вычитаны с ноды, либо заданы.
+    local NONINTERACTIVE=1
 
     if [[ ${#REPAIR_PLAN[@]} -eq 0 ]]; then
         echo "  Не выбрано ни одного шага. Ничего не изменено."
@@ -2566,16 +3039,12 @@ run_repair() {
 
     save_state || true
 
+    ui_section "Итог"
+    ui_summary "${SUMMARY[@]}"
     echo
-    echo "=========================================="
-    echo "  ИТОГ ПОЧИНКИ"
-    echo "=========================================="
-    printf '%s\n' "${SUMMARY[@]}"
-    echo "=========================================="
-    echo
-    echo "Ответы ноды сохранены в $INSTALL_STATE"
-    echo "Проверьте результат:   sudo bash /tmp/setup.sh --check"
-    echo "Продление сертификата: sudo certbot renew --dry-run"
+    ui_kv "ответы ноды" "$INSTALL_STATE"
+    ui_kv "проверить" "sudo bash /tmp/setup.sh --check"
+    ui_kv "продление серта" "sudo certbot renew --dry-run"
     return 0
 }
 
@@ -2592,11 +3061,13 @@ run_repair() {
 #  самостоятельный check.sh для тех, кому нужна только проверка.
 # ##########################################################################
 
-rhc_ok()   { printf '  \033[32m[ ok ]\033[0m %s\n' "$*"; }
-rhc_warn() { printf '  \033[33m[ ?? ]\033[0m %s\n' "$*"; rhc_warnings=$((rhc_warnings+1)); }
-rhc_bad()  { printf '  \033[31m[ !! ]\033[0m %s\n' "$*"; rhc_problems=$((rhc_problems+1)); }
-rhc_info() { printf '         %s\n' "$*"; }
-rhc_sect() { printf '\n\033[1m── %s\033[0m\n' "$*"; }
+# Значки и цвета — общие с установщиком (lib/05-ui.sh), чтобы диагностика
+# не выглядела отдельной программой.
+rhc_ok()   { ui_ok "$*"; }
+rhc_warn() { ui_warn "$*"; rhc_warnings=$((rhc_warnings+1)); return 0; }
+rhc_bad()  { ui_err "$*";  rhc_problems=$((rhc_problems+1)); return 0; }
+rhc_info() { ui_info "$*"; }
+rhc_sect() { ui_section "$*"; }
 rhc_fix()  { rhc_fixes+=("$*"); }
 
 # Порты, на которых сейчас слушает SSH. При socket-активации слушателем
@@ -2651,9 +3122,7 @@ rh_check() {
         return 1
     fi
 
-    printf '\033[1m==========================================\n'
-    printf '  ДИАГНОСТИКА НОДЫ  —  %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-    printf '==========================================\033[0m\n'
+    ui_title "Диагностика ноды" "$(date '+%Y-%m-%d %H:%M:%S %Z') · ничего не меняется"
 
     # ----------------------------------------------------------------------
     rhc_sect "Система"
@@ -3072,14 +3541,18 @@ rh_check() {
     fi
 
     # ----------------------------------------------------------------------
-    printf '\n\033[1m==========================================\n'
-    printf '  ИТОГ: проблем %s, предупреждений %s\n' "$rhc_problems" "$rhc_warnings"
-    printf '==========================================\033[0m\n'
+    if [[ "$rhc_problems" -eq 0 && "$rhc_warnings" -eq 0 ]]; then
+        ui_title "Проблем не найдено"
+    else
+        ui_title "Проблем: $rhc_problems, предупреждений: $rhc_warnings"
+    fi
     if [[ ${#rhc_fixes[@]} -gt 0 ]]; then
-        printf '\nЧто чинить (по убыванию важности):\n'
-        printf '  • %s\n' "${rhc_fixes[@]}"
-        printf '\nПолную установку заново запускать НЕ НУЖНО: она сбрасывает правила ufw,\n'
-        printf 'пересоздаёт контейнер и уходит в перезагрузку. Лечите точечно.\n'
+        ui_section "Что чинить, по убыванию важности"
+        local f
+        for f in "${rhc_fixes[@]}"; do printf '  %s%s%s  %s\n' "$C_ACC" "$S_DOT" "$C_R" "$f"; done
+        echo
+        ui_info "полную установку заново запускать не нужно: она сбрасывает ufw,"
+        ui_info "пересоздаёт контейнер и уходит в перезагрузку. Лечите точечно."
     fi
 
     [[ "$rhc_problems" -eq 0 ]] && return 0
@@ -3102,9 +3575,9 @@ rh_check() {
 menu_step() {
     local label="$1"; shift
     if "$@"; then
-        echo -e "\n[Готово] $label"
+        echo; ui_ok "$label"
     else
-        echo -e "\n[СБОЙ] $label — подробности в $SETUP_LOG"
+        echo; ui_err "$label — подробности в $SETUP_LOG"
     fi
     # Ответы, которые человек только что ввёл, надо запомнить: иначе на ноде
     # без install.conf их придётся вводить заново при каждой следующей правке.
@@ -3143,7 +3616,7 @@ menu_repair() {
 
 components_menu() {
     while true; do
-        echo -e "\n===== Компоненты (доустановить / переустановить) ====="
+        ui_title "Компоненты" "доустановить или переустановить по одному"
         echo " 1) Cloudflare WARP        2) Docker          3) Нода (передеплой)"
         echo " 4) Веб: серт + конфиг nginx (покажет и спросит)"
         echo " 5) UFW                    6) Sysctl-тюнинг"
@@ -3157,8 +3630,8 @@ components_menu() {
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
         echo "17) bench.sh   18) ipregion   19) проверка блокировок (censorcheck)"
-        echo " 0) Назад"
-        read -ep "Выбор: " c
+        echo "  0) Назад"
+        printf '\n'; read -ep "  Выбор: " c
         case "$c" in
              1) menu_step "Cloudflare WARP"      comp_warp ;;
              2) menu_step "Docker"               comp_docker ;;
@@ -3191,18 +3664,16 @@ components_menu() {
 
 main_menu() {
     while true; do
-        echo -e "\n=========================================="
-        echo "  Установщик ноды rabotahrista"
-        echo "=========================================="
+        ui_title "Установщик ноды rabotahrista" "нода Remnawave: установка, диагностика, починка"
         echo " 1) Полная установка (чистый сервер)"
         echo " 2) Доустановить/переустановить компонент"
         echo " 3) Диагностика — что не так с этой нодой (ничего не меняет)"
         echo " 4) Починка по итогам диагностики"
         echo " 5) Диагностика + реальный тест продления сертификата (до минуты)"
         echo " 0) Выход"
-        read -ep "Выбор: " m
+        printf '\n'; read -ep "  Выбор: " m
         case "$m" in
-            1) full_install ;;
+            1) full_install || true ;;   # остановка уже объяснена, меню живёт дальше
             2) components_menu ;;
             3) menu_check ;;
             4) menu_repair ;;
@@ -3236,6 +3707,17 @@ if [[ "${1:-}" == "--check" ]]; then
     if ( rh_check "${2:-}" ); then exit 0; else exit 1; fi
 fi
 
+# Дальше начинается работа, а не чтение: уходим в tmux, чтобы обрыв ssh не
+# бросил установку на середине, и берём замок от второго запуска.
+#
+# Порядок важен. Если взять замок ДО tmux, дескриптор замка унаследует клиент
+# tmux и продержит его всю сессию — и установщик внутри tmux упрётся в
+# собственный замок: «уже работает другой запуск». Так и было, проверено.
+# А второй интерактивный запуск при таком порядке просто подключится к уже
+# идущей сессии tmux (new-session -A) — это ровно то, что нужно.
+rh_session_guard "$@"
+rh_take_lock
+
 # Починка уже настроенной ноды: без вопросов, без переустановки
 if [[ "${1:-}" == "--repair" ]]; then
     NONINTERACTIVE=1
@@ -3260,7 +3742,9 @@ fi
 
 if [[ -n "$NONINTERACTIVE" ]] || { [[ -n "$DOMAIN" ]] && [[ -n "$SUBDOMAIN" ]] && [[ -n "$REMNA_SECRET" ]]; }; then
     NONINTERACTIVE=1
-    full_install
+    # Через if: остановленная установка уже объяснила причину сама, а голый
+    # вызов под set -e поверх её объяснения напечатал бы аварийную рамку.
+    if ! full_install; then exit 1; fi
 else
     # Интерактив: подхватить сохранённые данные прошлой установки как значения по умолчанию
     if [[ -f "$INSTALL_STATE" ]]; then

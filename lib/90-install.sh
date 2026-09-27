@@ -7,9 +7,17 @@
 #  ПОЛНАЯ УСТАНОВКА
 # ##########################################################################
 full_install() {
-    echo -e "\n========== ПОЛНАЯ УСТАНОВКА =========="
+    ui_title "Установка ноды Remnawave" "вопросы сейчас, потом работа без участия"
+    # Проверки до вопросов: незачем тратить время человека, если сервер не готов
+    if ! rh_preflight; then
+        return 1
+    fi
+    RH_T0=$SECONDS
     if [[ -n "$STATE_LOADED" && -z "$NONINTERACTIVE" ]]; then
-        echo "Найдены данные прошлой установки: ${SUBDOMAIN}.${DOMAIN}, панель ${PANEL_IP}, учётка ${ADMIN_USER}, порт SSH ${SSH_PORT}"
+        ui_section "Найдены ответы прошлой установки"
+        ui_kv "домен" "${SUBDOMAIN}.${DOMAIN}"
+        ui_kv "панель" "${PANEL_IP}"
+        ui_kv "учётка и порт" "${ADMIN_USER}, ${SSH_PORT}"
         read -ep "Обновить с этими данными (без повторного ввода)? [Y/n]: " USE_SAVED || USE_SAVED=""
         if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
             DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
@@ -20,20 +28,21 @@ full_install() {
         fi
     fi
     # --- сбор всех ответов заранее ---
+    ui_section "Нода и панель"
     ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
 
-    echo -e "\n--- SSH ---"
+    ui_section "Доступ по SSH"
     ask_ssh_params
-    echo "Итого: учётка «$ADMIN_USER», порт SSH $SSH_PORT. Вход под root и вход по паролю будут отключены."
+    ui_info "учётка «$ADMIN_USER», порт $SSH_PORT; вход под root и по паролю будут закрыты"
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         ask_ssh_key
 
-        echo -e "\n--- Доп. компоненты ---"
+        ui_section "Дополнительно"
         [[ -z "$INSTALL_WARP" ]]      && read -ep "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
         [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Установить Speedtest CLI? [y/N]: " INSTALL_SPEEDTEST
 
-        echo -e "\n--- Telegram-уведомления ---"
+        ui_section "Telegram-уведомления"
         [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [y/N]: " SETUP_TG
         [[ "$SETUP_TG" =~ ^[Yy]$ || -n "$TG_BOT_TOKEN" ]] && ask_telegram
     fi
@@ -41,7 +50,8 @@ full_install() {
 
     save_state   # запомнить ответы для будущих обновлений
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
-    echo -e "\nСтавлю ноду для $FULL_DOMAIN. Тяжёлый вывод — в $SETUP_LOG\n"; sleep 2
+    ui_title "Ставлю ноду $FULL_DOMAIN" "вопросов больше не будет · подробный лог: $SETUP_LOG"
+    sleep 1
 
     # --- выполнение (каждый шаг пишет результат в сводку) ---
     do_step "Swap" comp_swap
@@ -95,8 +105,8 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         echo
-        echo "Отчёт выше сохранён в $REPORT_FILE (в нём же пароль учётки)."
-        echo "Отключение IPv6 (GRUB) применится только после перезагрузки."
+        ui_info "отчёт сохранён в $REPORT_FILE, там же пароль учётки"
+        ui_info "отключение IPv6 применится только после перезагрузки"
         read -ep "Доустановить/переустановить что-то в меню перед ребутом? [y/N]: " ADDC || ADDC=""
         [[ "$ADDC" =~ ^[Yy]$ ]] && components_menu
         read -ep "Перезагрузить сервер сейчас? [Y/n]: " RB || RB=""
