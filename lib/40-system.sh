@@ -86,6 +86,23 @@ comp_packages() {
     if [[ $rc -eq 0 ]]; then
         ui_step_status "Пакеты: ставлю нужное скрипту"
         apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES >>"$SETUP_LOG" 2>&1 || rc=$?
+        # Стоковый сайт default уходит сразу после установки пакета. Если dpkg
+        # уже успел на нём упасть (IPv6 выключен, а default слушает [::]:80) —
+        # доконфигурируем и ставим недоставленное ещё раз. Две попытки: при самой
+        # первой настройке пакет может заново создать ссылку на удалённый файл,
+        # и вторая попытка её уберёт.
+        if nginx_default_remove && [[ $rc -ne 0 ]]; then
+            ui_step_status "Пакеты: чиню nginx без стокового сайта"
+            echo "  dpkg упал на стоковом сайте nginx — удалил его, доустанавливаю"
+            local attempt
+            for attempt in 1 2; do
+                rc=0
+                { dpkg --configure -a && apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES; } \
+                    >>"$SETUP_LOG" 2>&1 || rc=$?
+                [[ $rc -eq 0 ]] && break
+                nginx_default_remove >/dev/null || true
+            done
+        fi
     fi
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
     if [[ $rc -ne 0 ]]; then
@@ -151,12 +168,51 @@ EOF
     sysctl --system >>"$SETUP_LOG" 2>&1
 }
 
+# Стоковый сайт default из пакета nginx удаляем целиком, из обоих каталогов:
+#  * он слушает [::]:80, и без IPv6 nginx из-за него не стартует вовсе — а dpkg
+#    бросает пакет недонастроенным, и встаёт вся установка пакетов (так и было);
+#  * он занимает default_server на 80 и отдаёт «Welcome to nginx» по голому IP.
+#
+# Проверено по пакету nginx-common: sites-available/default — его conffile, и
+# удалённый conffile dpkg при обновлениях обратно не кладёт. Ссылку в
+# sites-enabled пакет создаёт только при самой первой настройке, не проверяя,
+# есть ли файл, — висячую ссылку тоже убираем.
+# Копия — в $RH_BACKUP_DIR: вдруг default кто-то переделал под себя.
+# Возвращает 0, если что-то удалил, 1 — если удалять было нечего.
+nginx_default_remove() {
+    local avail="$NGINX_AVAIL/default" enabled="$NGINX_ENABLED/default" stamp
+    [[ -e "$avail" || -e "$enabled" || -L "$enabled" ]] || return 1
+    stamp=$(date +%Y%m%d%H%M%S)
+    mkdir -p "$RH_BACKUP_DIR"
+    if [[ -f "$avail" ]]; then
+        cp -a "$avail" "$RH_BACKUP_DIR/nginx-default.$stamp"
+    fi
+    # Отдельный файл (не ссылка) в sites-enabled — сохраняем и его
+    if [[ -f "$enabled" && ! -L "$enabled" ]]; then
+        cp -a "$enabled" "$RH_BACKUP_DIR/nginx-default-enabled.$stamp"
+    fi
+    rm -f "$enabled" "$avail"
+    echo "  Стоковый сайт nginx default удалён (копия в $RH_BACKUP_DIR)."
+    return 0
+}
+
 comp_ipv6() {
     echo ">>> Отключение IPv6 в GRUB..."
-    if ! grep -q "ipv6.disable=1" /etc/default/grub; then
-        sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' /etc/default/grub
+    if ! grep -q "ipv6.disable=1" "$RH_GRUB_DEFAULT"; then
+        sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' "$RH_GRUB_DEFAULT"
         update-grub >>"$SETUP_LOG" 2>&1
     fi
+    # IPv6 пропадёт на следующей загрузке, а с ним и nginx, если хоть один сайт
+    # слушает [::]. Стоковый default удаляем сразу; чужие сайты только называем.
+    nginx_default_remove || true
+    local other
+    other=$(nginx_ipv6_listeners | tr '\n' ' ')
+    if [[ -n "$other" ]]; then
+        echo "  [СБОЙ] после перезагрузки nginx не стартует: listen [::] остался в: $other"
+        echo "         это не стоковые сайты, скрипт их не правит — уберите строки listen [::] сами"
+        return 1
+    fi
+    return 0
 }
 
 comp_disk() {

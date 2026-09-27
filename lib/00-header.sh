@@ -51,6 +51,11 @@ NGINX_AVAIL="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
 LE_LIVE="/etc/letsencrypt/live"
 LE_RENEWAL="/etc/letsencrypt/renewal"
+# Признаки выключенного IPv6: стека нет в ядре или флаг уже стоит в GRUB
+RH_IPV6_PROC="/proc/sys/net/ipv6"
+RH_GRUB_DEFAULT="/etc/default/grub"
+# Копии того, что скрипт удаляет. Не в каталогах nginx: оттуда он читает всё подряд
+RH_BACKUP_DIR="/etc/rabotahrista/backup"
 # Метка «этот конфиг nginx писали мы». По ней установщик отличает свой файл от
 # чужого сайта, живущего на той же ноде: чужой не перезаписывается без копии и
 # никогда не снимается с публикации.

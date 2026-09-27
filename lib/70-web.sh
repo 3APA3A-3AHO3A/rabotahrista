@@ -233,6 +233,16 @@ nginx_report_state() {
     if [[ -n "$other" ]]; then
         echo "  Заглушка:    default_server на 8443 держит $other — свою не добавляю"
     fi
+    if [[ -e "$NGINX_AVAIL/default" || -e "$NGINX_ENABLED/default" ]]; then
+        echo "  Стоковый:    сайт default из пакета будет удалён (копия в $RH_BACKUP_DIR)"
+    fi
+    if ipv6_off_or_pending; then
+        other=$(nginx_ipv6_listeners | grep -vx default | tr '\n' ' ')
+        if [[ -n "$other" ]]; then
+            echo "  IPv6:        выключен, а listen [::] есть в ваших сайтах: $other"
+            echo "               nginx из-за них не стартует — эти строки уберите сами"
+        fi
+    fi
     return 0
 }
 
@@ -301,6 +311,9 @@ nginx_apply_site() {
 
     nginx_render_site "$dom" "$mode" > "$site"
     ln -sf "$site" "$NGINX_ENABLED"/
+    # Стоковый default мешает всегда: слушает [::]:80 (без IPv6 nginx не
+    # стартует) и занимает default_server на 80. В плане это показано.
+    nginx_default_remove || true
     if ! nginx -t >>"$SETUP_LOG" 2>&1; then
         echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"
         if [[ -n "$backup" ]]; then

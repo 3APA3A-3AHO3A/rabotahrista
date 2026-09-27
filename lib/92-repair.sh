@@ -46,6 +46,30 @@ repair_ssh_hardening() {
     comp_ssh
 }
 
+# nginx лежит, потому что IPv6 выключен, а стоковый сайт default слушает [::].
+# Это следствие нашего же шага «Отключение IPv6», поэтому чиним — но только
+# стоковый default и только после подтверждения плана.
+repair_nginx_default() {
+    nginx_default_remove || true
+    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] nginx -t всё ещё не проходит:"
+        nginx -t 2>&1 | tail -3 | sed 's/^/    /'
+        local other; other=$(nginx_ipv6_listeners | tr '\n' ' ')
+        if [[ -n "$other" ]]; then
+            echo "  listen [::] остался в ваших сайтах: $other — их скрипт не правит"
+        fi
+        return 1
+    fi
+    dpkg --configure -a >>"$SETUP_LOG" 2>&1 || true
+    systemctl restart nginx >>"$SETUP_LOG" 2>&1 || true
+    if ! systemctl is-active --quiet nginx; then
+        echo "  [СБОЙ] nginx так и не запустился (см. $SETUP_LOG)"
+        return 1
+    fi
+    echo "  nginx снова работает."
+    return 0
+}
+
 repair_perms() {
     local rc=0 f
     if [[ -d /opt/remnanode ]]; then
@@ -122,6 +146,11 @@ repair_build_plan() {
         repair_note "Сторож панели — нода не дежурная"
     fi
 
+    if ipv6_off_or_pending && nginx_ipv6_listeners | grep -qx default; then
+        repair_add repair_nginx_default "nginx: убрать стоковый сайт default" \
+            "удалит default из sites-available и sites-enabled (копия в $RH_BACKUP_DIR): без IPv6 nginx из-за него не стартует; перезапустит nginx"
+    fi
+
     repair_add repair_verify "Проверка служебных скриптов" \
         "ничего не меняет, только читает первую строку каждого скрипта"
     return 0
@@ -142,7 +171,7 @@ repair_print_plan() {
         for s in "${REPAIR_SKIPS[@]}"; do ui_skip "$s"; done
     fi
     echo
-    ui_info "не тронет: фаервол, контейнер ноды, пакеты, nginx; перезагрузки не будет"
+    ui_info "не тронет: фаервол, контейнер ноды, пакеты, ваши сайты nginx; перезагрузки не будет"
     echo
     return 0
 }

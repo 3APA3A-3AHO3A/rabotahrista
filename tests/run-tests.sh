@@ -1015,7 +1015,7 @@ INST=$(printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
     done
     full_install || true
 ' 2>&1 || true)
-if grep -q "УСТАНОВКА ОСТАНОВЛЕНА" <<< "$INST"; then
+if grep -q "Установка остановлена" <<< "$INST"; then
     ok "установка останавливается на провале пакетов"
 else
     bad "установка пошла дальше:"; tail -12 <<< "$INST" | sed 's/^/      /'
@@ -1232,8 +1232,169 @@ else
     bad "шаг ждёт ввода с терминала под спиннером — установка зависнет"
 fi
 
+# Сообщение об остановке само говорит, в apt ли дело. Раньше оно предлагало
+# набрать «pgrep -a '...'», а тот искал apt по имени процесса и показал бы
+# постоянный демон ожидания выключения — человек ждал бы вечно.
+stopmsg() {   # $1 — что вернёт apt_busy_who
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        DOMAIN="example.com"; SUBDOMAIN="n1"; PANEL_IP="1.2.3.4"; REMNA_SECRET="s"
+        SSH_PUBLIC_KEY="'"$TESTKEY"'"; ADMIN_USER="deploy"; SSH_PORT="45123"
+        INSTALL_WARP="n"; INSTALL_SPEEDTEST="n"; SETUP_CF="n"; SETUP_TG="n"
+        NONINTERACTIVE=1
+        INSTALL_STATE=$(mktemp); SETUP_LOG=$(mktemp); REPORT_FILE=$(mktemp)
+        rh_preflight() { return 0; }; comp_swap() { return 0; }
+        comp_packages() { return 1; }
+        apt_busy_who() { printf "%s" "'"$1"'"; }
+        full_install || true
+    ' 2>&1 || true
+}
+R=$(stopmsg "")
+if grep -q "apt сейчас свободен" <<< "$R" && ! grep -q "pgrep -a" <<< "$R"; then
+    ok "при свободном apt сообщение так и говорит — ждать нечего"
+else
+    bad "сообщение об остановке не говорит, свободен ли apt:"; tail -8 <<< "$R" | sed 's/^/      /'
+fi
+R=$(stopmsg "4242 apt-get -y upgrade")
+if grep -q "4242 apt-get -y upgrade" <<< "$R"; then
+    ok "при занятом apt сообщение называет, кто держит"
+else
+    bad "сообщение не называет держателя apt"
+fi
+
 # --------------------------------------------------------------------------
-head_ "29. shellcheck (если установлен)"
+head_ "29. Стоковый сайт nginx default"
+# --------------------------------------------------------------------------
+# Живая нода: IPv6 выключен в ядре, apt ставит nginx, пакет стартует его со
+# стоковым сайтом, где «listen [::]:80», — «Address family not supported»,
+# dpkg бросает nginx недонастроенным, встаёт вся установка пакетов.
+# На свежей установке то же случалось бы после финальной перезагрузки.
+# Решение — стоковый default удаляется целиком из обоих каталогов.
+v6tree() {   # $1 — каталог; стоковый default как в пакете Ubuntu
+    mkdir -p "$1/avail" "$1/enabled" "$1/proc_v6"
+    printf 'server {\n\tlisten 80 default_server;\n\tlisten [::]:80 default_server;\n\troot /var/www/html;\n}\n' \
+        > "$1/avail/default"
+    ln -sf "$1/avail/default" "$1/enabled/default"
+    : > "$1/grub"
+}
+v6run() {    # $1 — каталог, $2 — "off" | "pending" | "on", $3 — код
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        T="'"$1"'"
+        NGINX_AVAIL="$T/avail"; NGINX_ENABLED="$T/enabled"; RH_GRUB_DEFAULT="$T/grub"
+        RH_BACKUP_DIR="$T/backup"
+        case "'"$2"'" in
+            off)     RH_IPV6_PROC="$T/нет-такого" ;;
+            pending) RH_IPV6_PROC="$T/proc_v6"; echo "GRUB_CMDLINE_LINUX=\"ipv6.disable=1\"" > "$T/grub" ;;
+            on)      RH_IPV6_PROC="$T/proc_v6" ;;
+        esac
+        SETUP_LOG=/dev/null
+        '"$3"'
+    ' 2>&1 || true
+}
+
+T=$(mktemp -d); v6tree "$T"
+v6run "$T" on 'nginx_default_remove' >/dev/null
+if [[ ! -e "$T/avail/default" && ! -e "$T/enabled/default" && ! -L "$T/enabled/default" ]]; then
+    ok "стоковый default удалён из sites-available и sites-enabled"
+else
+    bad "стоковый default остался:"; ls -la "$T/avail" "$T/enabled" | sed 's/^/      /'
+fi
+if ls "$T/backup"/nginx-default.* >/dev/null 2>&1 \
+   && ! ls "$T/avail"/*default* "$T/enabled"/*default* >/dev/null 2>&1; then
+    ok "копия лежит вне каталогов nginx"
+else
+    bad "копии нет или она в каталоге, который читает nginx"
+fi
+R=$(v6run "$T" on 'nginx_default_remove && echo УДАЛИЛ || echo НЕЧЕГО')
+[[ "$R" == *НЕЧЕГО* ]] && ok "повторный вызов ничего не делает" \
+                       || bad "повторное удаление ведёт себя странно: $R"
+rm -rf "$T"
+
+# Пакет при первой настройке создаёт ссылку, не проверяя, есть ли файл.
+# Висячая ссылка роняет nginx так же, как [::] — её тоже убираем.
+T=$(mktemp -d); mkdir -p "$T/avail" "$T/enabled"
+ln -sf "$T/avail/default" "$T/enabled/default"
+v6run "$T" on 'nginx_default_remove' >/dev/null
+if [[ ! -L "$T/enabled/default" ]]; then ok "висячая ссылка на удалённый default убирается"
+else bad "висячая ссылка осталась — nginx на ней упадёт"; fi
+rm -rf "$T"
+
+# Настоящий случай с fr-1: первая установка dpkg бросила, повтор обязан дожить
+T=$(mktemp -d); v6tree "$T"
+R=$(v6run "$T" off '
+    APT_PACKAGES="nginx"
+    apt-get() { case "$*" in *install*) [[ -e "$NGINX_ENABLED/default" ]] && return 100; return 0 ;; esac; return 0; }
+    dpkg() { return 0; }
+    systemctl() { return 0; }
+    command() { return 0; }      # финальная проверка «всё ли встало» — не про это
+    comp_packages && echo "ПАКЕТЫ ВСТАЛИ" || echo "ПАКЕТЫ УПАЛИ"')
+if grep -q "ПАКЕТЫ ВСТАЛИ" <<< "$R"; then
+    ok "установка пакетов доживает до конца, когда nginx падает на стоковом сайте"
+else
+    bad "пакеты не встают из-за стокового сайта:"; sed 's/^/      /' <<< "$R"
+fi
+rm -rf "$T"
+
+# Свежая установка: стоковый default уходит сразу после установки пакетов,
+# а не только когда что-то сломалось
+T=$(mktemp -d); v6tree "$T"
+R=$(v6run "$T" on 'APT_PACKAGES="nginx"; apt-get() { return 0; }; systemctl() { return 0; }
+    command() { return 0; }
+    comp_packages && echo OK || echo FAIL')
+if [[ ! -e "$T/avail/default" ]] && grep -q OK <<< "$R"; then
+    ok "на свежей установке стоковый default удаляется сразу"
+else
+    bad "после установки пакетов стоковый default остался — nginx умрёт после перезагрузки"
+fi
+rm -rf "$T"
+
+# Отключение IPv6 из меню на ноде, поставленной старой версией
+T=$(mktemp -d); v6tree "$T"
+echo 'GRUB_CMDLINE_LINUX=""' > "$T/grub"
+R=$(v6run "$T" on 'update-grub() { return 0; }; comp_ipv6 && echo ШАГ-OK || echo ШАГ-СБОЙ')
+if grep -q 'ipv6.disable=1' "$T/grub" && [[ ! -e "$T/avail/default" ]] && grep -q ШАГ-OK <<< "$R"; then
+    ok "отключение IPv6 сразу убирает стоковый default"
+else
+    bad "после отключения IPv6 стоковый default остался:"; sed 's/^/      /' <<< "$R"
+fi
+rm -rf "$T"
+
+# Чужой сайт со [::] не трогаем, но и молча не проходим мимо
+T=$(mktemp -d); v6tree "$T"
+printf 'server {\n    listen [::]:443 ssl;\n    server_name gateway.example.com;\n}\n' > "$T/avail/gateway"
+ln -sf "$T/avail/gateway" "$T/enabled/gateway"
+cp "$T/avail/gateway" "$T/gateway.before"
+R=$(v6run "$T" on 'update-grub() { return 0; }; comp_ipv6 && echo ШАГ-OK || echo ШАГ-СБОЙ')
+if cmp -s "$T/avail/gateway" "$T/gateway.before" && [[ -e "$T/enabled/gateway" ]] \
+   && grep -q ШАГ-СБОЙ <<< "$R" && grep -q gateway <<< "$R"; then
+    ok "чужой сайт со [::] не тронут, но назван, и шаг красный"
+else
+    bad "с чужим сайтом со [::] поступили не так:"; sed 's/^/      /' <<< "$R"
+fi
+rm -rf "$T"
+
+# Починка предлагает шаг ровно тогда, когда nginx из-за default лежит
+T=$(mktemp -d); v6tree "$T"
+R=$(v6run "$T" pending 'SSH_HARDEN_FILE=/нет; NOTIFY_ENV=/нет; PANEL_ENV=/нет; getent() { return 1; }
+    repair_build_plan; printf "%s\n" "${REPAIR_PLAN[@]}"')
+if grep -q repair_nginx_default <<< "$R"; then
+    ok "при выключенном IPv6 починка предлагает убрать стоковый default"
+else
+    bad "починка не видит упавший из-за стокового сайта nginx"
+fi
+: > "$T/grub"                  # предыдущий прогон поставил флаг IPv6 в GRUB
+R=$(v6run "$T" on 'SSH_HARDEN_FILE=/нет; NOTIFY_ENV=/нет; PANEL_ENV=/нет; getent() { return 1; }
+    repair_build_plan; printf "%s\n" "${REPAIR_PLAN[@]}"')
+if ! grep -q repair_nginx_default <<< "$R"; then
+    ok "при живом IPv6 починка nginx не трогает"
+else
+    bad "починка лезет в nginx, хотя ничего не сломано"
+fi
+rm -rf "$T"
+
+# --------------------------------------------------------------------------
+head_ "30. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then

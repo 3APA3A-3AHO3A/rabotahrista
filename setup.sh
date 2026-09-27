@@ -2,7 +2,7 @@
 # ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
 # Правки вносятся в lib/, затем: python3 build.py
 # Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
+# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
 
 # ===== lib/00-header.sh ================================================
 # ##########################################################################
@@ -57,6 +57,11 @@ NGINX_AVAIL="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
 LE_LIVE="/etc/letsencrypt/live"
 LE_RENEWAL="/etc/letsencrypt/renewal"
+# Признаки выключенного IPv6: стека нет в ядре или флаг уже стоит в GRUB
+RH_IPV6_PROC="/proc/sys/net/ipv6"
+RH_GRUB_DEFAULT="/etc/default/grub"
+# Копии того, что скрипт удаляет. Не в каталогах nginx: оттуда он читает всё подряд
+RH_BACKUP_DIR="/etc/rabotahrista/backup"
 # Метка «этот конфиг nginx писали мы». По ней установщик отличает свой файл от
 # чужого сайта, живущего на той же ноде: чужой не перезаписывается без копии и
 # никогда не снимается с публикации.
@@ -302,6 +307,34 @@ ui_spin_stop() {
     else
         printf '  %s  %s  (%s)\n' "$mark" "$RH_SPIN_LABEL" "$(ui_mmss "$el")"
     fi
+    return 0
+}
+
+# ===== lib/07-probes.sh ================================================
+# ##########################################################################
+#  ЗОНДЫ
+#  Проверки состояния сервера, которые ТОЛЬКО ЧИТАЮТ. Общие для установщика и
+#  диагностики: check.sh собирается и из этого модуля, и тест следит, чтобы
+#  сюда не просочилось ничего пишущего.
+# ##########################################################################
+
+# IPv6 выключен в ядре — или выключится после перезагрузки: флаг уже в GRUB.
+# Второе важно: шаг «Отключение IPv6» лишь ставит флаг, а ломается всё, что
+# слушает [::], только на следующей загрузке.
+ipv6_off_or_pending() {
+    [[ ! -d "$RH_IPV6_PROC" ]] && return 0
+    grep -q 'ipv6.disable=1' "$RH_GRUB_DEFAULT" 2>/dev/null && return 0
+    return 1
+}
+
+# Включённые сайты nginx, которые слушают [::]. Без IPv6 из-за любого такого
+# сайта nginx не стартует вообще.
+nginx_ipv6_listeners() {
+    local f
+    for f in "$NGINX_ENABLED"/*; do
+        [[ -e "$f" ]] || continue
+        grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]' "$f" 2>/dev/null && basename "$f"
+    done
     return 0
 }
 
@@ -977,6 +1010,23 @@ comp_packages() {
     if [[ $rc -eq 0 ]]; then
         ui_step_status "Пакеты: ставлю нужное скрипту"
         apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES >>"$SETUP_LOG" 2>&1 || rc=$?
+        # Стоковый сайт default уходит сразу после установки пакета. Если dpkg
+        # уже успел на нём упасть (IPv6 выключен, а default слушает [::]:80) —
+        # доконфигурируем и ставим недоставленное ещё раз. Две попытки: при самой
+        # первой настройке пакет может заново создать ссылку на удалённый файл,
+        # и вторая попытка её уберёт.
+        if nginx_default_remove && [[ $rc -ne 0 ]]; then
+            ui_step_status "Пакеты: чиню nginx без стокового сайта"
+            echo "  dpkg упал на стоковом сайте nginx — удалил его, доустанавливаю"
+            local attempt
+            for attempt in 1 2; do
+                rc=0
+                { dpkg --configure -a && apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES; } \
+                    >>"$SETUP_LOG" 2>&1 || rc=$?
+                [[ $rc -eq 0 ]] && break
+                nginx_default_remove >/dev/null || true
+            done
+        fi
     fi
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
     if [[ $rc -ne 0 ]]; then
@@ -1042,12 +1092,51 @@ EOF
     sysctl --system >>"$SETUP_LOG" 2>&1
 }
 
+# Стоковый сайт default из пакета nginx удаляем целиком, из обоих каталогов:
+#  * он слушает [::]:80, и без IPv6 nginx из-за него не стартует вовсе — а dpkg
+#    бросает пакет недонастроенным, и встаёт вся установка пакетов (так и было);
+#  * он занимает default_server на 80 и отдаёт «Welcome to nginx» по голому IP.
+#
+# Проверено по пакету nginx-common: sites-available/default — его conffile, и
+# удалённый conffile dpkg при обновлениях обратно не кладёт. Ссылку в
+# sites-enabled пакет создаёт только при самой первой настройке, не проверяя,
+# есть ли файл, — висячую ссылку тоже убираем.
+# Копия — в $RH_BACKUP_DIR: вдруг default кто-то переделал под себя.
+# Возвращает 0, если что-то удалил, 1 — если удалять было нечего.
+nginx_default_remove() {
+    local avail="$NGINX_AVAIL/default" enabled="$NGINX_ENABLED/default" stamp
+    [[ -e "$avail" || -e "$enabled" || -L "$enabled" ]] || return 1
+    stamp=$(date +%Y%m%d%H%M%S)
+    mkdir -p "$RH_BACKUP_DIR"
+    if [[ -f "$avail" ]]; then
+        cp -a "$avail" "$RH_BACKUP_DIR/nginx-default.$stamp"
+    fi
+    # Отдельный файл (не ссылка) в sites-enabled — сохраняем и его
+    if [[ -f "$enabled" && ! -L "$enabled" ]]; then
+        cp -a "$enabled" "$RH_BACKUP_DIR/nginx-default-enabled.$stamp"
+    fi
+    rm -f "$enabled" "$avail"
+    echo "  Стоковый сайт nginx default удалён (копия в $RH_BACKUP_DIR)."
+    return 0
+}
+
 comp_ipv6() {
     echo ">>> Отключение IPv6 в GRUB..."
-    if ! grep -q "ipv6.disable=1" /etc/default/grub; then
-        sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' /etc/default/grub
+    if ! grep -q "ipv6.disable=1" "$RH_GRUB_DEFAULT"; then
+        sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' "$RH_GRUB_DEFAULT"
         update-grub >>"$SETUP_LOG" 2>&1
     fi
+    # IPv6 пропадёт на следующей загрузке, а с ним и nginx, если хоть один сайт
+    # слушает [::]. Стоковый default удаляем сразу; чужие сайты только называем.
+    nginx_default_remove || true
+    local other
+    other=$(nginx_ipv6_listeners | tr '\n' ' ')
+    if [[ -n "$other" ]]; then
+        echo "  [СБОЙ] после перезагрузки nginx не стартует: listen [::] остался в: $other"
+        echo "         это не стоковые сайты, скрипт их не правит — уберите строки listen [::] сами"
+        return 1
+    fi
+    return 0
 }
 
 comp_disk() {
@@ -1968,6 +2057,16 @@ nginx_report_state() {
     if [[ -n "$other" ]]; then
         echo "  Заглушка:    default_server на 8443 держит $other — свою не добавляю"
     fi
+    if [[ -e "$NGINX_AVAIL/default" || -e "$NGINX_ENABLED/default" ]]; then
+        echo "  Стоковый:    сайт default из пакета будет удалён (копия в $RH_BACKUP_DIR)"
+    fi
+    if ipv6_off_or_pending; then
+        other=$(nginx_ipv6_listeners | grep -vx default | tr '\n' ' ')
+        if [[ -n "$other" ]]; then
+            echo "  IPv6:        выключен, а listen [::] есть в ваших сайтах: $other"
+            echo "               nginx из-за них не стартует — эти строки уберите сами"
+        fi
+    fi
     return 0
 }
 
@@ -2036,6 +2135,9 @@ nginx_apply_site() {
 
     nginx_render_site "$dom" "$mode" > "$site"
     ln -sf "$site" "$NGINX_ENABLED"/
+    # Стоковый default мешает всегда: слушает [::]:80 (без IPv6 nginx не
+    # стартует) и занимает default_server на 80. В плане это показано.
+    nginx_default_remove || true
     if ! nginx -t >>"$SETUP_LOG" 2>&1; then
         echo "  [СБОЙ] nginx -t не прошёл (см. $SETUP_LOG)"
         if [[ -n "$backup" ]]; then
@@ -2749,23 +2851,27 @@ full_install() {
     # в котором половина строк врёт. Останавливаемся здесь: SSH ещё не тронут,
     # сервер в том же состоянии, что и до запуска.
     if ! do_step_required "Пакеты и обновление системы" comp_packages; then
+        # Скрипт сам смотрит, в apt ли дело, а не отправляет человека набирать
+        # команды. Прежняя подсказка «pgrep -a '...'» к тому же искала apt по
+        # имени процесса и показывала бы постоянный демон ожидания выключения
+        # как держателя блокировки — ждать пришлось бы вечно.
+        local who; who=$(apt_busy_who)
+        ui_title "Установка остановлена" "пакеты не установились — без них не будет ни ноды, ни сертификата"
+        if [[ -n "$who" ]]; then
+            ui_warn "apt до сих пор занят другим процессом:"
+            printf '%s\n' "$who" | sed 's/^/        /'
+            ui_info "обычно это автообновление после первой загрузки; дождитесь его"
+            ui_info "или притормозите на время установки:"
+            ui_info "  systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer"
+        else
+            ui_ok "apt сейчас свободен — значит, дело не в блокировке"
+            ui_info "причина — в строках под упавшим шагом выше; целиком в логе:"
+            ui_info "  grep -A40 '=== ШАГ: Пакеты' $SETUP_LOG"
+        fi
         echo
-        echo "=========================================="
-        echo "  УСТАНОВКА ОСТАНОВЛЕНА"
-        echo "=========================================="
-        echo "  Пакеты не установились. Продолжать нечем: без них не будет ни ноды,"
-        echo "  ни сертификата, ни fail2ban."
-        echo
-        echo "  Чаще всего apt занят автообновлением после первой загрузки сервера."
-        echo "  Посмотреть, кто держит:"
-        echo "    pgrep -a 'apt-get|unattended-upgr|dpkg'"
-        echo "  Притормозить на время установки:"
-        echo "    systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer"
-        echo
-        echo "  Затем запустите установку заново. Ничего не сломано: доступ по SSH"
-        echo "  не менялся, сервер в том же состоянии, что и до запуска."
-        echo "  Полный лог: $SETUP_LOG"
-        echo "=========================================="
+        ui_info "ничего не сломано: SSH не менялся, сервер в том же состоянии,"
+        ui_info "что и до запуска. Разберитесь с причиной и запустите установку заново."
+        ui_rule
         return 1
     fi
     do_step "Пользователь $ADMIN_USER" comp_user
@@ -2858,6 +2964,30 @@ repair_ssh_hardening() {
     comp_ssh
 }
 
+# nginx лежит, потому что IPv6 выключен, а стоковый сайт default слушает [::].
+# Это следствие нашего же шага «Отключение IPv6», поэтому чиним — но только
+# стоковый default и только после подтверждения плана.
+repair_nginx_default() {
+    nginx_default_remove || true
+    if ! nginx -t >>"$SETUP_LOG" 2>&1; then
+        echo "  [СБОЙ] nginx -t всё ещё не проходит:"
+        nginx -t 2>&1 | tail -3 | sed 's/^/    /'
+        local other; other=$(nginx_ipv6_listeners | tr '\n' ' ')
+        if [[ -n "$other" ]]; then
+            echo "  listen [::] остался в ваших сайтах: $other — их скрипт не правит"
+        fi
+        return 1
+    fi
+    dpkg --configure -a >>"$SETUP_LOG" 2>&1 || true
+    systemctl restart nginx >>"$SETUP_LOG" 2>&1 || true
+    if ! systemctl is-active --quiet nginx; then
+        echo "  [СБОЙ] nginx так и не запустился (см. $SETUP_LOG)"
+        return 1
+    fi
+    echo "  nginx снова работает."
+    return 0
+}
+
 repair_perms() {
     local rc=0 f
     if [[ -d /opt/remnanode ]]; then
@@ -2934,6 +3064,11 @@ repair_build_plan() {
         repair_note "Сторож панели — нода не дежурная"
     fi
 
+    if ipv6_off_or_pending && nginx_ipv6_listeners | grep -qx default; then
+        repair_add repair_nginx_default "nginx: убрать стоковый сайт default" \
+            "удалит default из sites-available и sites-enabled (копия в $RH_BACKUP_DIR): без IPv6 nginx из-за него не стартует; перезапустит nginx"
+    fi
+
     repair_add repair_verify "Проверка служебных скриптов" \
         "ничего не меняет, только читает первую строку каждого скрипта"
     return 0
@@ -2954,7 +3089,7 @@ repair_print_plan() {
         for s in "${REPAIR_SKIPS[@]}"; do ui_skip "$s"; done
     fi
     echo
-    ui_info "не тронет: фаервол, контейнер ноды, пакеты, nginx; перезагрузки не будет"
+    ui_info "не тронет: фаервол, контейнер ноды, пакеты, ваши сайты nginx; перезагрузки не будет"
     echo
     return 0
 }
@@ -3423,6 +3558,16 @@ rh_check() {
     done
     if [[ "$rhc_enabled" -eq 0 ]]; then
         rhc_bad "в sites-enabled пусто — nginx ничего не обслуживает"
+    fi
+    # IPv6 выключен (или выключится при перезагрузке), а сайт слушает [::] —
+    # nginx не стартует вовсе. Так на живой ноде встала установка пакетов.
+    local rhc_v6=""
+    if ipv6_off_or_pending; then
+        rhc_v6=$(nginx_ipv6_listeners | tr '\n' ' ')
+        if [[ -n "$rhc_v6" ]]; then
+            rhc_bad "IPv6 выключен, а listen [::] есть в: $rhc_v6— nginx не стартует или не стартует после перезагрузки"
+            rhc_fix "nginx: меню, пункт 4 (починка) удалит стоковый default; в своих сайтах уберите listen [::]"
+        fi
     fi
     # Их может быть только один на весь nginx, иначе nginx -t падает на duplicate
     if [[ $(wc -w <<< "$rhc_defs") -gt 1 ]]; then

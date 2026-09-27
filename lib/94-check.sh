@@ -373,6 +373,16 @@ rh_check() {
     if [[ "$rhc_enabled" -eq 0 ]]; then
         rhc_bad "в sites-enabled пусто — nginx ничего не обслуживает"
     fi
+    # IPv6 выключен (или выключится при перезагрузке), а сайт слушает [::] —
+    # nginx не стартует вовсе. Так на живой ноде встала установка пакетов.
+    local rhc_v6=""
+    if ipv6_off_or_pending; then
+        rhc_v6=$(nginx_ipv6_listeners | tr '\n' ' ')
+        if [[ -n "$rhc_v6" ]]; then
+            rhc_bad "IPv6 выключен, а listen [::] есть в: $rhc_v6— nginx не стартует или не стартует после перезагрузки"
+            rhc_fix "nginx: меню, пункт 4 (починка) удалит стоковый default; в своих сайтах уберите listen [::]"
+        fi
+    fi
     # Их может быть только один на весь nginx, иначе nginx -t падает на duplicate
     if [[ $(wc -w <<< "$rhc_defs") -gt 1 ]]; then
         rhc_bad "default_server на 8443 объявлен больше одного раза:$rhc_defs"

@@ -31,6 +31,7 @@ OUT = ROOT / "setup.sh"
 CHECK_OUT = ROOT / "check.sh"
 CHECK_MOD = LIB / "94-check.sh"
 UI_MOD = LIB / "05-ui.sh"
+PROBES_MOD = LIB / "07-probes.sh"
 HEADER_MOD = LIB / "00-header.sh"
 
 # Границы блока с путями и портами внутри 00-header.sh. Диагностике нужны те же
@@ -117,7 +118,7 @@ def assemble_check() -> str:
     parts: list[str] = [
         "#!/bin/bash",
         BANNER,
-        f"# Собрано из: {HEADER_MOD.name} (блок настроек), {UI_MOD.name}, {CHECK_MOD.name}",
+        f"# Собрано из: {HEADER_MOD.name} (блок настроек), {UI_MOD.name}, {PROBES_MOD.name}, {CHECK_MOD.name}",
         "",
         CHECK_DOC,
         "",
@@ -130,6 +131,8 @@ def assemble_check() -> str:
         'if locale -a 2>/dev/null | grep -qix \'C\\.UTF-*8\'; then export LC_ALL=C.UTF-8; fi',
         "",
         strip_shebang(UI_MOD.read_text(encoding="utf-8")),
+        "",
+        strip_shebang(PROBES_MOD.read_text(encoding="utf-8")),
         "",
         'if [[ "$EUID" -ne 0 ]]; then',
         '    # "sudo bash <(curl ...)" не работает: sudo закрывает лишние дескрипторы',
