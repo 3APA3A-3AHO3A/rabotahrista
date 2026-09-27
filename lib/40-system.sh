@@ -28,21 +28,36 @@ comp_swap() {
     return 0
 }
 
+# Кто прямо сейчас держит apt/dpkg. Только смотрит и рассказывает.
+apt_busy_who() {
+    pgrep -a -f 'apt-get|unattended-upgrade|/usr/bin/dpkg' 2>/dev/null | head -3
+    return 0
+}
+
 comp_packages() {
     echo ">>> Обновление системы и установка пакетов (в фоне, лог: $SETUP_LOG)..."
+    # На свежем сервере cloud-init только что запустил автообновление, и apt
+    # занят. Раньше это был мгновенный сбой; теперь ждём, но говорим, чего ждём.
+    local who; who=$(apt_busy_who)
+    if [[ -n "$who" ]]; then
+        echo "  apt сейчас занят другим процессом — подожду до 10 минут:"
+        printf '    %s\n' "$who"
+        echo "  Обычно это первое после загрузки автообновление, оно закончится само."
+    fi
     local rc=0
     {
-        apt-get clean
-        apt-get update
-        apt-get -y upgrade
-        apt-get -y dist-upgrade
-        apt-get -y autoremove --purge
-        apt-get -y install $APT_PACKAGES
+        apt-get "${APT_WAIT[@]}" clean
+        apt-get "${APT_WAIT[@]}" update
+        apt-get "${APT_WAIT[@]}" -y upgrade
+        apt-get "${APT_WAIT[@]}" -y dist-upgrade
+        apt-get "${APT_WAIT[@]}" -y autoremove --purge
+        apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES
     } >>"$SETUP_LOG" 2>&1 || rc=$?
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
     if [[ $rc -ne 0 ]]; then
         echo "  [СБОЙ] apt завершился с ошибкой (см. $SETUP_LOG)."
-        echo "         Без пакетов следующие шаги тоже посыплются — разберитесь с apt и повторите."
+        who=$(apt_busy_who)
+        [[ -n "$who" ]] && printf '         apt всё ещё занят: %s\n' "$who"
         return 1
     fi
     # Проверяем не «apt отработал», а что ключевое реально на месте
@@ -148,7 +163,7 @@ EOF
 
 comp_autoupdates() {
     echo ">>> Автообновления безопасности..."
-    apt-get install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
+    apt-get "${APT_WAIT[@]}" install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
     cat <<'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -173,7 +188,9 @@ EOF
 
 comp_os_update() {
     echo ">>> Полное обновление системы (apt). Вывод — на экран."
-    if apt-get clean && apt-get update && apt-get -y upgrade && apt-get -y dist-upgrade && apt-get -y autoremove --purge; then
+    if apt-get "${APT_WAIT[@]}" clean && apt-get "${APT_WAIT[@]}" update \
+       && apt-get "${APT_WAIT[@]}" -y upgrade && apt-get "${APT_WAIT[@]}" -y dist-upgrade \
+       && apt-get "${APT_WAIT[@]}" -y autoremove --purge; then
         echo "  Обновление завершено успешно."
         notify_telegram "🧰 ОС обновлена, ухожу в перезагрузку ($(date '+%H:%M:%S'))"
         echo "  Перезагрузка через 5 секунд (Ctrl+C — отменить)..."

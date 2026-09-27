@@ -797,6 +797,8 @@ R=$(RH_LIB_ONLY=1 bash -c '
     source "'"$ROOT"'/setup.sh"
     SETUP_LOG=/dev/null
     command() { [[ "${2:-}" == "docker" ]] && return 0; return 1; }
+    systemctl() { return 0; }
+    docker() { return 0; }          # демон отвечает
     docker_group_member() { echo "ГРУППА ПРОВЕРЕНА"; }
     comp_docker
 ' 2>&1 || true)
@@ -804,6 +806,21 @@ if grep -q "ГРУППА ПРОВЕРЕНА" <<< "$R"; then
     ok "при уже установленном Docker группа всё равно проверяется"
 else
     bad "comp_docker выходит, не проверив группу:"; sed 's/^/      /' <<< "$R"
+fi
+
+# Скрипт get.docker.com возвращает успех, ничего не установив, если apt занят.
+# Шаг светился зелёным, а следом «docker: command not found».
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/dev/null
+    curl() { return 0; }; sh() { return 0; }; systemctl() { return 0; }
+    command() { return 1; }          # docker так и не появился
+    comp_docker && echo "ЗЕЛЁНЫЙ" || echo "КРАСНЫЙ"
+' 2>&1 || true)
+if grep -q "КРАСНЫЙ" <<< "$R"; then
+    ok "шаг Docker краснеет, если докера в системе так и нет"
+else
+    bad "шаг Docker зелёный без докера:"; sed 's/^/      /' <<< "$R"
 fi
 
 # И починка обязана это чинить: на старых нодах это типовая находка
@@ -928,7 +945,89 @@ else
     bad "план не показывает, что пропускается"
 fi
 
-head_ "23. shellcheck (если установлен)"
+# --------------------------------------------------------------------------
+head_ "23. Объяснение сбоя попадает в лог"
+# --------------------------------------------------------------------------
+# Настоящий случай: харденинг SSH не применился, объяснение напечаталось на
+# экран, print_summary экран очистил — и в сводке осталось «см. лог», а в логе
+# про sshd ни строчки. Вывод шага обязан оседать в логе.
+LOGT=$(mktemp)
+STEP=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG="'"$LOGT"'"; SUMMARY=()
+    падучий() { echo "  [СБОЙ] порт применился, но харденинг — нет"; return 1; }
+    do_step "Харденинг SSH" падучий
+    printf "%s\n" "${SUMMARY[@]}"
+' 2>&1 || true)
+sleep 1   # tee пишет в отдельном процессе
+if grep -q "харденинг — нет" "$LOGT"; then
+    ok "вывод упавшего шага сохраняется в логе"
+else
+    bad "объяснение сбоя в лог не попало:"; sed 's/^/      /' "$LOGT"
+fi
+if grep -q "харденинг — нет" <<< "$STEP"; then
+    ok "и на экране он тоже остаётся"
+else
+    bad "вывод шага пропал с экрана"
+fi
+rm -f "$LOGT"
+
+# Переменные, которые шаг выставил, обязаны дожить до отчёта: если запускать
+# шаг через конвейер, он уйдёт в подоболочку и отчёт получит пустоту.
+VARS=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    SETUP_LOG=/dev/null; SUMMARY=()
+    ставит_переменную() { SSH_HARDENED=1; ADMIN_PASS="секрет"; return 0; }
+    do_step "шаг" ставит_переменную
+    echo "HARDENED=${SSH_HARDENED:-пусто} PASS=${ADMIN_PASS:-пусто}"
+' 2>&1 || true)
+if grep -q "HARDENED=1 PASS=секрет" <<< "$VARS"; then
+    ok "переменные шага доживают до отчёта"
+else
+    bad "шаг выполняется в подоболочке, отчёт останется пустым: $VARS"
+fi
+
+# --------------------------------------------------------------------------
+head_ "24. Провал пакетов останавливает установку"
+# --------------------------------------------------------------------------
+# На свежем сервере apt был занят автообновлением. Пакеты не встали, а
+# установка пошла дальше и выдала шесть сбоев по одной причине плюс отчёт,
+# в котором половина строк неправда.
+INST=$(printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    DOMAIN="example.com"; SUBDOMAIN="n1"; PANEL_IP="1.2.3.4"
+    REMNA_SECRET="s"; SSH_PUBLIC_KEY="'"$TESTKEY"'"
+    ADMIN_USER="deploy"; SSH_PORT="45123"
+    INSTALL_WARP="n"; INSTALL_SPEEDTEST="n"; SETUP_CF="n"; CF_PROXY_CHOICE="n"
+    SETUP_TG="n"
+    INSTALL_STATE=$(mktemp); SETUP_LOG=$(mktemp); REPORT_FILE=$(mktemp)
+    comp_swap() { return 0; }
+    comp_packages() { echo "  [СБОЙ] apt занят"; return 1; }
+    for f in comp_user comp_ssh comp_fail2ban comp_autoupdates comp_ipv6 comp_ufw \
+             comp_sysctl comp_docker comp_disk comp_node comp_web comp_telegram \
+             notify_telegram print_summary reboot components_menu; do
+        eval "$f(){ echo \"НЕ ДОЛЖНО ВЫПОЛНЯТЬСЯ: $f\"; return 0; }"
+    done
+    full_install || true
+' 2>&1 || true)
+if grep -q "УСТАНОВКА ОСТАНОВЛЕНА" <<< "$INST"; then
+    ok "установка останавливается на провале пакетов"
+else
+    bad "установка пошла дальше:"; tail -12 <<< "$INST" | sed 's/^/      /'
+fi
+if grep -q "НЕ ДОЛЖНО ВЫПОЛНЯТЬСЯ" <<< "$INST"; then
+    bad "после провала пакетов продолжились шаги:"; grep "НЕ ДОЛЖНО" <<< "$INST" | sed 's/^/      /'
+else
+    ok "ни один следующий шаг не запустился"
+fi
+# Останов обязан случиться ДО того, как тронут SSH
+if grep -q "НЕ ДОЛЖНО ВЫПОЛНЯТЬСЯ: comp_ssh" <<< "$INST"; then
+    bad "SSH успели тронуть до останова"
+else
+    ok "доступ по SSH при останове не менялся"
+fi
+
+head_ "25. shellcheck (если установлен)"
 # --------------------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s bash -S warning -e SC1090,SC1091,SC2034 setup.sh check.sh changedomain.sh; then

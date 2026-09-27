@@ -61,6 +61,11 @@ NGINX_MARK="# rabotahrista: конфиг ноды, перезаписывает�
 SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/01-hardening.conf"
 NODE_PORT="2222"        # порт, на который к ноде ходит панель
 WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
+# apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
+# свежем сервере установщик встречался с первым после загрузки
+# unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
+# что зависит от пакетов: нода, сертификат, fail2ban, docker.
+APT_WAIT=(-o DPkg::Lock::Timeout=600)
 # Пакеты из apt — один список на установку и на отчёт о версиях
 APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================

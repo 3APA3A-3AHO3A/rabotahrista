@@ -9,8 +9,8 @@ comp_warp() {
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
 
-        apt-get update
-        apt-get install -y cloudflare-warp
+        apt-get "${APT_WAIT[@]}" update
+        apt-get "${APT_WAIT[@]}" install -y cloudflare-warp
 
         warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
 
@@ -26,9 +26,9 @@ comp_speedtest() {
     {
         curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
         if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
-            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get update
+            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get "${APT_WAIT[@]}" update
         fi
-        apt-get install -y speedtest
+        apt-get "${APT_WAIT[@]}" install -y speedtest
     } >>"$SETUP_LOG" 2>&1 || { echo "  Speedtest не установился (см. $SETUP_LOG)"; return 1; }
 }
 

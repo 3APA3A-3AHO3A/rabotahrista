@@ -67,6 +67,11 @@ NGINX_MARK="# rabotahrista: конфиг ноды, перезаписывает�
 SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/01-hardening.conf"
 NODE_PORT="2222"        # порт, на который к ноде ходит панель
 WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
+# apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
+# свежем сервере установщик встречался с первым после загрузки
+# unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
+# что зависит от пакетов: нода, сертификат, fail2ban, docker.
+APT_WAIT=(-o DPkg::Lock::Timeout=600)
 # Пакеты из apt — один список на установку и на отчёт о версиях
 APT_PACKAGES="sudo curl wget unzip git ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
@@ -102,16 +107,38 @@ SUMMARY=()
 #  Сводка шагов и печать итогового отчёта
 # ##########################################################################
 
-# do_step "Метка" функция...  — запускает шаг, пишет результат в сводку (не роняет процесс)
-do_step() {
+# Запуск шага: вывод идёт и на экран, и в лог.
+#
+# Раньше объяснение шага оставалось только на экране, а print_summary экран
+# очищал — и причина сбоя исчезала навсегда, хотя в сводке было написано
+# «см. лог». Именно так пропало объяснение, почему не применился харденинг SSH.
+#
+# Подстановка процесса, а не конвейер: в конвейере функция выполнялась бы в
+# подоболочке, и её переменные (SSH_HARDENED, ADMIN_PASS, FULL_DOMAIN,
+# UFW_SSH_PORTS) не дошли бы до итогового отчёта.
+# Только stdout: приглашения read идут в stderr и должны появляться сразу.
+rh_step_exec() {
     local label="$1"; shift
-    if "$@"; then
+    { echo; echo "=== ШАГ: $label — $(date '+%H:%M:%S') ==="; } >>"$SETUP_LOG" 2>/dev/null || true
+    if "$@" > >(tee -a "$SETUP_LOG"); then
         SUMMARY+=("[ OK ]    $label")
-    else
-        SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
-        echo "  [СБОЙ] $label — подробности в $SETUP_LOG"
+        return 0
     fi
+    SUMMARY+=("[СБОЙ]    $label  (см. $SETUP_LOG)")
+    echo "  [СБОЙ] $label — подробности в $SETUP_LOG"
+    return 1
+}
+
+# do_step "Метка" функция...  — обычный шаг: сбой не роняет установку
+do_step() {
+    rh_step_exec "$@" || true
     return 0
+}
+
+# Шаг, без которого остальное бессмысленно: установка на нём останавливается,
+# а не плодит ещё шесть сбоев по одной и той же причине.
+do_step_required() {
+    rh_step_exec "$@"
 }
 
 skip_step() { SUMMARY+=("[проп.]   $1"); }
@@ -651,21 +678,36 @@ comp_swap() {
     return 0
 }
 
+# Кто прямо сейчас держит apt/dpkg. Только смотрит и рассказывает.
+apt_busy_who() {
+    pgrep -a -f 'apt-get|unattended-upgrade|/usr/bin/dpkg' 2>/dev/null | head -3
+    return 0
+}
+
 comp_packages() {
     echo ">>> Обновление системы и установка пакетов (в фоне, лог: $SETUP_LOG)..."
+    # На свежем сервере cloud-init только что запустил автообновление, и apt
+    # занят. Раньше это был мгновенный сбой; теперь ждём, но говорим, чего ждём.
+    local who; who=$(apt_busy_who)
+    if [[ -n "$who" ]]; then
+        echo "  apt сейчас занят другим процессом — подожду до 10 минут:"
+        printf '    %s\n' "$who"
+        echo "  Обычно это первое после загрузки автообновление, оно закончится само."
+    fi
     local rc=0
     {
-        apt-get clean
-        apt-get update
-        apt-get -y upgrade
-        apt-get -y dist-upgrade
-        apt-get -y autoremove --purge
-        apt-get -y install $APT_PACKAGES
+        apt-get "${APT_WAIT[@]}" clean
+        apt-get "${APT_WAIT[@]}" update
+        apt-get "${APT_WAIT[@]}" -y upgrade
+        apt-get "${APT_WAIT[@]}" -y dist-upgrade
+        apt-get "${APT_WAIT[@]}" -y autoremove --purge
+        apt-get "${APT_WAIT[@]}" -y install $APT_PACKAGES
     } >>"$SETUP_LOG" 2>&1 || rc=$?
     systemctl enable --now chrony >/dev/null 2>&1 || systemctl enable --now chronyd >/dev/null 2>&1 || true
     if [[ $rc -ne 0 ]]; then
         echo "  [СБОЙ] apt завершился с ошибкой (см. $SETUP_LOG)."
-        echo "         Без пакетов следующие шаги тоже посыплются — разберитесь с apt и повторите."
+        who=$(apt_busy_who)
+        [[ -n "$who" ]] && printf '         apt всё ещё занят: %s\n' "$who"
         return 1
     fi
     # Проверяем не «apt отработал», а что ключевое реально на месте
@@ -771,7 +813,7 @@ EOF
 
 comp_autoupdates() {
     echo ">>> Автообновления безопасности..."
-    apt-get install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
+    apt-get "${APT_WAIT[@]}" install -y unattended-upgrades >>"$SETUP_LOG" 2>&1 || true
     cat <<'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -796,7 +838,9 @@ EOF
 
 comp_os_update() {
     echo ">>> Полное обновление системы (apt). Вывод — на экран."
-    if apt-get clean && apt-get update && apt-get -y upgrade && apt-get -y dist-upgrade && apt-get -y autoremove --purge; then
+    if apt-get "${APT_WAIT[@]}" clean && apt-get "${APT_WAIT[@]}" update \
+       && apt-get "${APT_WAIT[@]}" -y upgrade && apt-get "${APT_WAIT[@]}" -y dist-upgrade \
+       && apt-get "${APT_WAIT[@]}" -y autoremove --purge; then
         echo "  Обновление завершено успешно."
         notify_telegram "🧰 ОС обновлена, ухожу в перезагрузку ($(date '+%H:%M:%S'))"
         echo "  Перезагрузка через 5 секунд (Ctrl+C — отменить)..."
@@ -1140,7 +1184,19 @@ comp_docker() {
     if command -v docker >/dev/null 2>&1; then
         echo "  Docker уже установлен."
     else
-        curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
+        curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1 || true
+    fi
+    # Проверяем фактом. Скрипт get.docker.com ставит пакеты через apt и при
+    # занятой блокировке возвращает успех, ничего не установив: шаг светился
+    # зелёным, а следом «docker: command not found» и нода не разворачивалась.
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "  [СБОЙ] docker не установился (см. $SETUP_LOG)"
+        return 1
+    fi
+    systemctl enable --now docker >>"$SETUP_LOG" 2>&1 || true
+    if ! docker info >/dev/null 2>&1; then
+        echo "  [СБОЙ] docker установлен, но демон не отвечает (см. $SETUP_LOG)"
+        return 1
     fi
     docker_group_member
 }
@@ -2139,8 +2195,8 @@ comp_warp() {
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
 
-        apt-get update
-        apt-get install -y cloudflare-warp
+        apt-get "${APT_WAIT[@]}" update
+        apt-get "${APT_WAIT[@]}" install -y cloudflare-warp
 
         warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
 
@@ -2156,9 +2212,9 @@ comp_speedtest() {
     {
         curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
         if grep -q "noble" /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
-            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get update
+            sed -i 's/noble/jammy/g' /etc/apt/sources.list.d/ookla_speedtest-cli.list; apt-get "${APT_WAIT[@]}" update
         fi
-        apt-get install -y speedtest
+        apt-get "${APT_WAIT[@]}" install -y speedtest
     } >>"$SETUP_LOG" 2>&1 || { echo "  Speedtest не установился (см. $SETUP_LOG)"; return 1; }
 }
 
@@ -2216,7 +2272,30 @@ full_install() {
 
     # --- выполнение (каждый шаг пишет результат в сводку) ---
     do_step "Swap" comp_swap
-    do_step "Пакеты и обновление системы" comp_packages
+    # Пакеты — фундамент. Без них не встанут ни нода, ни сертификат, ни fail2ban,
+    # ни docker, и человек получает шесть сбоев по одной причине плюс отчёт,
+    # в котором половина строк врёт. Останавливаемся здесь: SSH ещё не тронут,
+    # сервер в том же состоянии, что и до запуска.
+    if ! do_step_required "Пакеты и обновление системы" comp_packages; then
+        echo
+        echo "=========================================="
+        echo "  УСТАНОВКА ОСТАНОВЛЕНА"
+        echo "=========================================="
+        echo "  Пакеты не установились. Продолжать нечем: без них не будет ни ноды,"
+        echo "  ни сертификата, ни fail2ban."
+        echo
+        echo "  Чаще всего apt занят автообновлением после первой загрузки сервера."
+        echo "  Посмотреть, кто держит:"
+        echo "    pgrep -a 'apt-get|unattended-upgr|dpkg'"
+        echo "  Притормозить на время установки:"
+        echo "    systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer"
+        echo
+        echo "  Затем запустите установку заново. Ничего не сломано: доступ по SSH"
+        echo "  не менялся, сервер в том же состоянии, что и до запуска."
+        echo "  Полный лог: $SETUP_LOG"
+        echo "=========================================="
+        return 1
+    fi
     do_step "Пользователь $ADMIN_USER" comp_user
     do_step "Харденинг SSH" comp_ssh
     do_step "fail2ban" comp_fail2ban

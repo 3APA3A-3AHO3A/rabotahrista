@@ -36,7 +36,19 @@ comp_docker() {
     if command -v docker >/dev/null 2>&1; then
         echo "  Docker уже установлен."
     else
-        curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1
+        curl -fsSL https://get.docker.com | sh >>"$SETUP_LOG" 2>&1 || true
+    fi
+    # Проверяем фактом. Скрипт get.docker.com ставит пакеты через apt и при
+    # занятой блокировке возвращает успех, ничего не установив: шаг светился
+    # зелёным, а следом «docker: command not found» и нода не разворачивалась.
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "  [СБОЙ] docker не установился (см. $SETUP_LOG)"
+        return 1
+    fi
+    systemctl enable --now docker >>"$SETUP_LOG" 2>&1 || true
+    if ! docker info >/dev/null 2>&1; then
+        echo "  [СБОЙ] docker установлен, но демон не отвечает (см. $SETUP_LOG)"
+        return 1
     fi
     docker_group_member
 }
