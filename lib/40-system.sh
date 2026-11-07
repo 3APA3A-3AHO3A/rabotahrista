@@ -129,6 +129,11 @@ comp_sysctl() {
     echo ">>> Тюнинг ядра (sysctl)..."
     echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
     modprobe tcp_bbr || true
+    # Ключи nf_conntrack существуют, только пока модуль загружен. При загрузке
+    # sysctl применяется раньше, чем ufw подтянет модуль, — поэтому грузим его
+    # сами (modules-load срабатывает до sysctl), иначе лимит молча не встанет.
+    echo "nf_conntrack" > /etc/modules-load.d/conntrack.conf
+    modprobe nf_conntrack || true
     cat <<EOF > /etc/sysctl.d/99-vpn-tune.conf
 fs.file-max=1048576
 
@@ -152,6 +157,20 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
 EOF
+    # Таблица соединений фаервола. По умолчанию 65536 записей, а запись об
+    # установленном соединении живёт 5 суток: на загруженной ноде таблица
+    # переполняется, и ядро молча отбрасывает новые подключения клиентов.
+    # 262144 записи — около 80 МБ памяти; 2 часа жизни с keepalive в 5 минут
+    # живые соединения не рвут, а мёртвые вычищаются.
+    if modinfo nf_conntrack >/dev/null 2>&1; then
+        cat <<EOF >> /etc/sysctl.d/99-vpn-tune.conf
+
+# Таблица соединений (conntrack)
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_buckets = 65536
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+EOF
+    fi
     # Ключи ipv6 существуют, только пока стек ipv6 в ядре жив. После ipv6.disable=1
     # из GRUB их нет, и sysctl --system падает с ошибкой на пустом месте.
     if [[ -d /proc/sys/net/ipv6 ]]; then

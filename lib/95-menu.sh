@@ -23,6 +23,18 @@ menu_step() {
     return 0
 }
 
+# Передеплой из меню — с вопросом о версии: так ноду и откатывают, и возвращают
+comp_node_menu() {
+    ask_node_version
+    comp_node
+}
+
+# Из меню ключ спрашиваем на месте: в полной установке его спросили заранее
+comp_agent_menu() {
+    ask_agent_key
+    comp_agent
+}
+
 # Пункт 8 делает два шага подряд — оборачиваем, чтобы тоже шло через menu_step
 comp_user_and_ssh() { comp_user && comp_ssh; }
 
@@ -63,7 +75,9 @@ components_menu() {
         echo "--- Безопасность / обслуживание ---"
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "21) Сторож панели вкл.    22) Сторож панели выкл."
-        echo "23) Сменить домен ноды"
+        echo "23) Сменить домен ноды      24) Учётка ИИ-агента"
+        echo "25) Geo-базы Loyalsoldier + ежедневное обновление"
+        echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -73,7 +87,7 @@ components_menu() {
         case "$c" in
              1) menu_step "Cloudflare WARP"      comp_warp ;;
              2) menu_step "Docker"               comp_docker ;;
-             3) menu_step "Нода (передеплой)"    comp_node ;;
+             3) menu_step "Нода (передеплой)"    comp_node_menu ;;
              4) menu_step "Веб (серт + конфиг nginx)" comp_web_menu ;;
              5) menu_step "UFW"                  comp_ufw ;;
              6) menu_step "Sysctl-тюнинг"        comp_sysctl ;;
@@ -94,6 +108,10 @@ components_menu() {
             21) menu_step "Сторож панели"        comp_panel_watch ;;
             22) menu_step "Отключение сторожа"   comp_panel_watch_off ;;
             23) menu_step "Смена домена ноды"     comp_change_domain ;;
+            24) menu_step "Учётка ИИ-агента"      comp_agent_menu ;;
+            25) menu_step "Geo-базы"              comp_geodata ;;
+            26) menu_step "warp-native"           comp_warp_native_menu ;;
+            27) menu_step "Psiphon"               comp_psiphon_menu ;;
              0) return ;;
              *) echo "Нет такого пункта." ;;
         esac

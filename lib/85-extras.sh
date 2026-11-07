@@ -13,12 +13,25 @@ comp_warp() {
         apt-get "${APT_WAIT[@]}" install -y cloudflare-warp
 
         warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
+        # На случай, если служба после регистрации подключилась сама
+        warp-cli --accept-tos disconnect || true
 
         warp-cli --accept-tos mode proxy || warp-cli mode proxy
         warp-cli --accept-tos proxy port "$WARP_PORT" || warp-cli proxy port "$WARP_PORT"
-
-        warp-cli --accept-tos connect || warp-cli connect
     } >>"$SETUP_LOG" 2>&1 || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
+
+    # connect разрешаем только в режиме прокси. В обычном режиме WARP заворачивает
+    # в туннель весь трафик сервера, включая ответы SSH, — и сервер пропадает
+    # из сети насовсем. Раньше команды шли подряд, и неудачное переключение
+    # режима молча заканчивалось именно этим.
+    if ! warp-cli --accept-tos settings 2>>"$SETUP_LOG" | grep -qiE 'mode:.*proxy'; then
+        echo "  [СБОЙ] WARP не переключился в режим прокси — не подключаю, иначе пропадёт доступ к серверу"
+        warp-cli --accept-tos settings 2>&1 | grep -i 'mode' >>"$SETUP_LOG" || true
+        return 1
+    fi
+    warp-cli --accept-tos connect >>"$SETUP_LOG" 2>&1 \
+        || { echo "  Ошибка подключения WARP (см. $SETUP_LOG)"; return 1; }
+    return 0
 }
 
 comp_speedtest() {

@@ -69,6 +69,16 @@ comp_change_domain() {
         echo "  допишите конфиг сами по образцу выше, нода останется на прежнем домене до этого."
         return 0
     fi
+    # Старый сайт снимаем с публикации ДО записи нового. Иначе он оставался
+    # включённым (а сообщение ниже уверяло, что отключён), а после удаления его
+    # файла в sites-enabled висела битая ссылка — и nginx не стартовал на
+    # следующей перезагрузке. Заодно новый конфиг получит заглушку
+    # default_server: её держал старый. Чужой конфиг не трогаем.
+    if [[ -n "$old_domain" && -L "$NGINX_ENABLED/$old_domain" ]] \
+       && rh_owns_nginx_site "$NGINX_AVAIL/$old_domain"; then
+        rm -f "$NGINX_ENABLED/$old_domain"
+        echo "  Старый сайт $old_domain снят с публикации."
+    fi
     if ! nginx_apply_site "$FULL_DOMAIN"; then
         echo "  [СБОЙ] nginx не принял конфиг нового домена."
         if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" ]]; then
@@ -104,7 +114,9 @@ comp_change_domain() {
             echo "  Сертификат $old_domain оставлен."
         fi
     fi
-    if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" && -z "$NONINTERACTIVE" ]]; then
+    if [[ -n "$old_domain" && -e "$NGINX_ENABLED/$old_domain" ]]; then
+        echo "  Старый конфиг $old_domain писали не мы — он остаётся включённым, решите сами."
+    elif [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" && -z "$NONINTERACTIVE" ]]; then
         read -ep "  Удалить старый конфиг nginx $NGINX_AVAIL/$old_domain? [y/N]: " DELCONF || DELCONF=""
         if [[ "$DELCONF" =~ ^[Yy]$ ]]; then
             rm -f "$NGINX_AVAIL/$old_domain"

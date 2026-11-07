@@ -168,8 +168,9 @@ head_ "7. Повторная установка доходит до конца (
 E2E=$(mktemp)
 # Важно: режим именно ИНТЕРАКТИВНЫЙ (NONINTERACTIVE пустой) — в неинтерактивном
 # блок с вызовом ask_telegram пропускается, и баг не воспроизводится.
-# На stdin три Enter (учётка/пароль/порт) и два "n" в конце.
-printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
+# На stdin Enter на каждый вопрос (учётка/пароль/порт, ключи, warp-native,
+# Psiphon и его страна, geo-базы) и "n" в конце.
+printf '\n\n\n\n\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
     set -e
     source "'"$ROOT"'/setup.sh"
     DOMAIN="example.com"; SUBDOMAIN="node-1"; PANEL_IP="1.2.3.4"
@@ -181,8 +182,8 @@ printf '\n\n\n\n\n\nn\nn\nn\n' | RH_LIB_ONLY=1 bash -c '
     INSTALL_STATE=$(mktemp); SETUP_LOG=$(mktemp); REPORT_FILE=$(mktemp)
     # rh_preflight тоже заглушка: он честно проверяет, что под ногами Ubuntu,
     # а тесты гоняются и на Windows, где apt-get нет вовсе
-    for f in rh_preflight comp_swap comp_packages comp_user comp_ssh comp_fail2ban comp_autoupdates \
-             comp_ipv6 comp_ufw comp_sysctl comp_docker comp_disk comp_speedtest \
+    for f in rh_preflight comp_swap comp_packages comp_user comp_agent comp_hostkeys comp_ssh comp_fail2ban comp_autoupdates \
+             comp_geodata comp_warp_native comp_psiphon comp_ipv6 comp_ufw comp_sysctl comp_docker comp_disk comp_speedtest \
              comp_warp comp_node comp_web comp_telegram notify_telegram reboot \
              components_menu; do
         eval "$f(){ return 0; }"
@@ -1392,6 +1393,113 @@ else
     bad "починка лезет в nginx, хотя ничего не сломано"
 fi
 rm -rf "$T"
+
+# --------------------------------------------------------------------------
+head_ "31. Geo-базы: обновление без риска"
+# --------------------------------------------------------------------------
+# «Сервер» с базами — локальный каталог, curl ходит в него через file://.
+# Проверяем три вещи: первая загрузка кладёт файлы; повторная без изменений
+# их не трогает; битый файл (сумма не сходится) не подменяет рабочий.
+if command -v sha256sum >/dev/null 2>&1 && curl -fsS "file:///dev/null" >/dev/null 2>&1; then
+    GD=$(mktemp -d); SRV="$GD/srv"; DST="$GD/dst"; mkdir -p "$SRV" "$DST"
+    for f in geoip.dat geosite.dat; do
+        head -c 4096 /dev/urandom > "$SRV/$f"
+        (cd "$SRV" && sha256sum "$f" > "$f.sha256sum")
+    done
+    RH_LIB_ONLY=1 bash -c '
+        source "'"$ROOT"'/setup.sh"
+        GEODATA_DIR="'"$DST"'"; GEODATA_URL="file://'"$SRV"'"; GEODATA_BIN="'"$GD"'/upd.sh"
+        geodata_write_updater
+        sed -i "s|LOG=/var/log/rh-geodata.log|LOG='"$GD"'/log|" "$GEODATA_BIN"
+    ' >/dev/null 2>&1
+    bash "$GD/upd.sh" --no-restart >/dev/null 2>&1
+    if cmp -s "$SRV/geoip.dat" "$DST/geoip.dat" && cmp -s "$SRV/geosite.dat" "$DST/geosite.dat"; then
+        ok "первая загрузка кладёт обе базы"
+    else
+        bad "базы не скачались:"; sed 's/^/      /' "$GD/log" 2>/dev/null
+    fi
+    : > "$GD/log"; bash "$GD/upd.sh" --no-restart >/dev/null 2>&1
+    if ! grep -q 'обновлён' "$GD/log"; then ok "без изменений на сервере ничего не перекачивает"
+    else bad "перекачивает одинаковые базы"; fi
+    cp "$DST/geosite.dat" "$GD/good"
+    # На сервере объявлена новая сумма, а лежит файл, который ей не соответствует
+    head -c 4096 /dev/urandom > "$SRV/geosite.dat"
+    printf '%064d  geosite.dat\n' 1 > "$SRV/geosite.dat.sha256sum"
+    : > "$GD/log"; bash "$GD/upd.sh" --no-restart >/dev/null 2>&1 || true
+    if cmp -s "$GD/good" "$DST/geosite.dat" && grep -q 'сумма не совпала' "$GD/log"; then
+        ok "битый файл не подменяет рабочий"
+    else
+        bad "битая база попала в ноду"
+    fi
+    rm -rf "$GD"
+else
+    printf '  — нет sha256sum или curl без file://, пропускаю\n'
+fi
+
+# --------------------------------------------------------------------------
+head_ "32. Учётка ИИ-агента и неинтерактивный Cloudflare"
+# --------------------------------------------------------------------------
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    ADMIN_USER="vadim"
+    AGENT_USER="vadim"; validate_agent_params >/dev/null; echo "1:$AGENT_USER"
+    AGENT_USER="";      validate_agent_params >/dev/null; echo "2:$AGENT_USER"
+    AGENT_USER="claude"; validate_agent_params >/dev/null; echo "3:$AGENT_USER"
+    AGENT_USER="root";  validate_agent_params >/dev/null; echo "4:$AGENT_USER"
+    ADMIN_USER="agent"; AGENT_USER=""; validate_agent_params >/dev/null; echo "5:$AGENT_USER"
+' 2>&1)
+if grep -qx '1:agent' <<< "$R" && grep -qx '2:agent' <<< "$R" && grep -qx '3:claude' <<< "$R" && grep -qx '4:agent' <<< "$R" && grep -qx '5:ai-agent' <<< "$R"; then
+    ok "имя учётки агента проверяется (не root и не админ-учётка)"
+else
+    bad "проверка имени агента:"; sed 's/^/      /' <<< "$R"
+fi
+# Учётку агента ищут по группе, а sudoers у неё 91-*: админ-учётку человека
+# установщик находит по 90-*, и агент не должен её подменить.
+if grep -q '91-agent-' lib/50-security.sh && ! grep -q '/etc/sudoers.d/90-agent' lib/50-security.sh; then
+    ok "sudoers агента не путается с админ-учёткой"
+else
+    bad "sudoers агента назван так, что его примут за админ-учётку"
+fi
+if grep -q 'AGENT_GROUP_PLACEHOLDER' lib/80-notify.sh && grep -q 'Вход ИИ-агента' lib/80-notify.sh; then
+    ok "уведомление о входе отличает агента от человека"
+else
+    bad "уведомление о входе не различает агента"
+fi
+R=$(timeout 10 env RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    NONINTERACTIVE=1; SETUP_CF="y"; CF_API_TOKEN=""
+    if ask_cf < /dev/null; then echo ПРОШЛО; else echo ОСТАНОВИЛСЯ; fi
+' 2>&1 || echo "ЗАВИС")
+if grep -q 'ОСТАНОВИЛСЯ' <<< "$R"; then
+    ok "SETUP_CF=y без токена останавливает установку, а не виснет"
+else
+    bad "SETUP_CF=y без токена:"; sed 's/^/      /' <<< "$R"
+fi
+
+# Версия ноды: пусто — latest, мусор — latest, тег — как есть; с ноды,
+# откатанной на старую версию, версия вычитывается из compose.
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    REMNANODE_VERSION="";       validate_node_version >/dev/null; echo "1:$REMNANODE_VERSION"
+    REMNANODE_VERSION="3.4.3";  validate_node_version >/dev/null; echo "2:$REMNANODE_VERSION"
+    REMNANODE_VERSION="3.4;rm"; validate_node_version >/dev/null; echo "3:$REMNANODE_VERSION"
+' 2>&1)
+if grep -qx '1:latest' <<< "$R" && grep -qx '2:3.4.3' <<< "$R" && grep -qx '3:latest' <<< "$R"; then
+    ok "версия ноды: пусто и мусор — latest, тег — как есть"
+else
+    bad "проверка версии ноды:"; sed 's/^/      /' <<< "$R"
+fi
+CV=$(mktemp -d)
+printf 'services:\n  remnanode:\n    image: remnawave/node:3.4.3\n' > "$CV/c.yml"
+R=$(RH_LIB_ONLY=1 bash -c '
+    source "'"$ROOT"'/setup.sh"
+    v=$(grep -m1 -E "^[[:space:]]*image:[[:space:]]*remnawave/node" "'"$CV/c.yml"'" \
+        | sed -E "s/.*remnawave\/node:?//" | tr -d "\"'"'"' \r\n")
+    echo "${v:-latest}"
+' 2>&1)
+rm -rf "$CV"
+if [[ "$R" == "3.4.3" ]]; then ok "закреплённая версия вычитывается из compose"
+else bad "версия из compose прочиталась как '$R'"; fi
 
 # --------------------------------------------------------------------------
 head_ "30. shellcheck (если установлен)"

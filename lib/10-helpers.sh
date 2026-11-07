@@ -99,8 +99,12 @@ print_summary() {
                  "заняло $elapsed · подробности выше и в $SETUP_LOG"
     fi
 
+    # Вход — по IP: за оранжевым облаком Cloudflare домен ведёт на Cloudflare,
+    # и SSH по нему не пройдёт. Отпечаток — тот, что ssh спросит при первом входе.
+    local fp outb login_host="${SERVER_IP:-${FULL_DOMAIN:-$(hostname)}}"
+    fp=$(hostkey_fingerprint)
     ui_section "Доступ по SSH"
-    ui_kv "команда входа" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+    ui_kv "команда входа" "ssh -p $SSH_PORT $ADMIN_USER@$login_host"
     ui_kv "учётка" "$ADMIN_USER (sudo без пароля)"
     case "$ADMIN_PASS_SOURCE" in
         manual) ui_kv "пароль учётки" "задан вами вручную (в отчёт не пишу)" ;;
@@ -109,6 +113,7 @@ print_summary() {
                 ui_info "нужен только для аварийной консоли хостера" ;;
     esac
     ui_kv "root и пароли" "вход запрещён"
+    [[ -n "$fp" ]] && ui_kv "отпечаток сервера" "$fp (ED25519)"
     if [[ -n "$SSH_PENDING_REBOOT" ]]; then
         ui_warn "порт $SSH_PORT заработает только после перезагрузки"
         ui_info "до неё заходите по старому порту — он открыт в UFW"
@@ -120,14 +125,25 @@ print_summary() {
     ui_kv "домен" "${FULL_DOMAIN:-—}"
     ui_kv "IP сервера" "${SERVER_IP:-—}"
     ui_kv "контейнер" "$node_state"
+    ui_kv "версия ноды" "remnawave/node:${REMNANODE_VERSION:-latest}"
     ui_kv "порт для панели" "$NODE_PORT (только с ${PANEL_IP:-—})"
 
     ui_section "Фаервол"
-    ui_kv "открыто" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80, 443"
+    ui_kv "открыто" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80/tcp, 443/tcp, 443/udp"
     ui_kv "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
 
     ui_section "Шаги"
     ui_summary "${SUMMARY[@]}"
+
+    outb=$(egress_outbounds_json)
+    if [[ -n "$outb" ]]; then
+        ui_section "Outbound'ы Xray для профиля ноды"
+        printf '%s\n' "$outb" | sed 's/^/  /'
+    fi
+
+    ui_section "Профиль для ssh-mcp (config.toml)"
+    ssh_mcp_profile | sed 's/^/  /'
+    ui_info "keyRef — путь к ключу агента на вашем компьютере"
 
     ui_section "Где что лежит"
     ui_kv "этот отчёт" "$REPORT_FILE"
@@ -143,7 +159,7 @@ print_summary() {
         echo "=== ОТЧЁТ ОБ УСТАНОВКЕ — $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
         echo "Заняло: $elapsed, сбоев: $fails"
         echo
-        echo "Вход:            ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+        echo "Вход:            ssh -p $SSH_PORT $ADMIN_USER@$login_host"
         echo "Учётка:          $ADMIN_USER (sudo без пароля)"
         case "$ADMIN_PASS_SOURCE" in
             manual) echo "Пароль учётки:   задан вами вручную" ;;
@@ -153,10 +169,19 @@ print_summary() {
         echo "Домен:           ${FULL_DOMAIN:-—}"
         echo "IP сервера:      ${SERVER_IP:-—}"
         echo "Порт панели:     $NODE_PORT (только с ${PANEL_IP:-—})"
-        echo "UFW:             ${UFW_SSH_PORTS:-$SSH_PORT/tcp}, 80/tcp, 443/tcp"
+        echo "UFW:             ${UFW_SSH_PORTS:-$SSH_PORT/tcp}, 80/tcp, 443/tcp, 443/udp"
+        [[ -n "$fp" ]] && echo "Отпечаток:       $fp (ED25519)"
         echo
         echo "--- ШАГИ ---"
         printf '%s\n' "${SUMMARY[@]}"
+        if [[ -n "$outb" ]]; then
+            echo
+            echo "--- OUTBOUND'Ы XRAY ДЛЯ ПРОФИЛЯ НОДЫ ---"
+            printf '%s\n' "$outb"
+        fi
+        echo
+        echo "--- ПРОФИЛЬ ДЛЯ SSH-MCP (config.toml) ---"
+        ssh_mcp_profile
         echo
         echo "--- ПАКЕТЫ И ВЕРСИИ ---"
         collect_versions
@@ -164,5 +189,15 @@ print_summary() {
     printf '%s\n' "$out" > "$REPORT_FILE" 2>/dev/null || true
     chmod 600 "$REPORT_FILE" 2>/dev/null || true
     { echo; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
+    return 0
+}
+
+# В Ubuntu 22.10+ SSH поднимается по требованию через ssh.socket, и каталог
+# /run/sshd существует, только пока служба запущена. Без него sshd -t и sshd -T
+# падают с «Missing privilege separation directory», хотя конфиг в порядке, —
+# и харденинг откатывался как будто из-за битого конфига. Создаём каталог так
+# же, как его создаёт сама служба (RuntimeDirectory=sshd, права 755).
+sshd_rundir() {
+    [[ -d /run/sshd ]] || install -d -m 755 /run/sshd 2>/dev/null || true
     return 0
 }

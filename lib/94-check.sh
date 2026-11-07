@@ -168,7 +168,12 @@ rh_check() {
     rhc_root=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
     rhc_pass=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
     if [[ -z "$rhc_root$rhc_pass" ]]; then
-        rhc_warn "не удалось прочитать настройки sshd (sshd -T) — sshd не установлен?"
+        if [[ ! -d /run/sshd ]] && systemctl is-active --quiet ssh.socket 2>/dev/null; then
+            # Диагностика ничего не меняет, поэтому каталог не создаём, а объясняем
+            rhc_warn "настройки sshd не прочитать: SSH запущен по требованию (ssh.socket), а без /run/sshd sshd -T не работает — это не поломка"
+        else
+            rhc_warn "не удалось прочитать настройки sshd (sshd -T) — sshd не установлен?"
+        fi
     else
         if [[ "$rhc_root" == "no" ]]; then
             rhc_ok "вход под root запрещён"
@@ -195,6 +200,38 @@ rh_check() {
         fi
     fi
 
+    # Учётки ИИ-агентов: узнаются по группе, а не по имени
+    local rhc_agents rhc_a
+    rhc_agents=$(getent group "$AGENT_GROUP" 2>/dev/null | cut -d: -f4 | tr ',' ' ')
+    if [[ -z "$rhc_agents" ]]; then
+        rhc_info "учёток ИИ-агентов нет"
+    fi
+    for rhc_a in $rhc_agents; do
+        rhc_home=$(getent passwd "$rhc_a" | cut -d: -f6)
+        rhc_keys=$(rhc_num "$(grep -cvE '^[[:space:]]*(#|$)' "$rhc_home/.ssh/authorized_keys" 2>/dev/null)")
+        if [[ "$rhc_keys" -eq 0 ]]; then
+            rhc_warn "учётка агента $rhc_a без ключей — войти в неё нельзя"
+        elif [[ -f "/etc/sudoers.d/91-agent-$rhc_a" ]]; then
+            rhc_ok "учётка ИИ-агента $rhc_a: ключей $rhc_keys, sudo есть"
+        else
+            rhc_warn "учётка ИИ-агента $rhc_a без sudo — чинить и ставить ничего не сможет"
+            rhc_fix "агент: меню, пункт 2 -> 24"
+        fi
+    done
+
+    # Ключи сервера от образа хостера (одинаковые у всех его серверов)
+    local rhc_f rhc_c rhc_tpl=""
+    for rhc_f in /etc/ssh/ssh_host_*_key.pub; do
+        [[ -e "$rhc_f" ]] || continue
+        rhc_c=$(awk '{print $3}' "$rhc_f"); rhc_c="${rhc_c#*@}"
+        [[ -z "$rhc_c" || "$rhc_c" == "$(hostname)" || "$rhc_c" == "$(hostname -s)" ]] && continue
+        rhc_tpl+=" $(basename "$rhc_f" .pub)"
+    done
+    if [[ -n "$rhc_tpl" && ! -f /etc/rabotahrista/hostkeys.done ]]; then
+        rhc_warn "ключи сервера, похоже, от образа хостера (подписаны чужим именем):$rhc_tpl"
+        rhc_fix "ключи сервера: полная установка перевыпустит их (шаг «Ключи сервера»)"
+    fi
+
     # ----------------------------------------------------------------------
     rhc_sect "Фаервол"
     # ----------------------------------------------------------------------
@@ -215,6 +252,39 @@ rh_check() {
             rhc_bad "порт ноды $rhc_np не открыт — панель не достучится"
             rhc_fix "ufw: меню, пункт 2 -> 5"
         fi
+        # TCP-порты, которые слушает ядро ноды на всех адресах, но которых нет в
+        # ufw: клиенты на них не достучатся. Только TCP: UDP-сокеты ядро держит
+        # и для исходящих соединений на случайных портах, и отличить по ним
+        # входящий порт (Hysteria2) от исходящего снаружи нельзя.
+        local rhc_l rhc_closed=""
+        while read -r rhc_l; do
+            [[ -z "$rhc_l" ]] && continue
+            ufw status 2>/dev/null | grep -qE "^${rhc_l}([[:space:]]|$)" && continue
+            # ufw allow 443 (без протокола) открывает и tcp, и udp
+            ufw status 2>/dev/null | grep -qE "^${rhc_l%/*}([[:space:]]|$)" && continue
+            rhc_closed+=" $rhc_l"
+        done < <(ss -H -lntp 2>/dev/null | sed 's/^/tcp /' | grep -E 'users:\(\("(rw-core|xray)"' \
+                 | awk '$5 ~ /^(0\.0\.0\.0|\*|\[::\]):/ {split($5,a,":"); print a[length(a)] "/" $1}' | sort -u)
+        if [[ -n "$rhc_closed" ]]; then
+            rhc_warn "ядро ноды слушает TCP-порты, закрытые фаерволом:$rhc_closed — клиенты на них не подключатся"
+            rhc_fix "ufw: sudo ufw allow <порт>/<tcp|udp> (учтите: шаг UFW при переустановке сбросит ручные правила)"
+        fi
+        # Заполненность таблицы соединений: при переполнении ядро молча
+        # отбрасывает новые подключения клиентов
+        local rhc_ct rhc_ctmax
+        rhc_ct=$(rhc_num "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)")
+        rhc_ctmax=$(rhc_num "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)")
+        if [[ "$rhc_ctmax" -gt 0 ]]; then
+            if (( rhc_ct * 100 / rhc_ctmax >= 80 )); then
+                rhc_bad "таблица соединений заполнена на $(( rhc_ct * 100 / rhc_ctmax ))% ($rhc_ct из $rhc_ctmax) — скоро начнутся отказы клиентам"
+                rhc_fix "conntrack: меню, пункт 2 -> 6 (Sysctl-тюнинг поднимет лимит)"
+            elif [[ "$rhc_ctmax" -lt 262144 ]]; then
+                rhc_warn "лимит таблицы соединений $rhc_ctmax (занято $rhc_ct) — для VPN-ноды мало"
+                rhc_fix "conntrack: меню, пункт 2 -> 6 (Sysctl-тюнинг)"
+            else
+                rhc_ok "таблица соединений: занято $rhc_ct из $rhc_ctmax"
+            fi
+        fi
         rhc_ipv6=$(grep -E '^IPV6=' /etc/default/ufw 2>/dev/null | cut -d= -f2)
         if [[ -d /proc/sys/net/ipv6 ]]; then
             if [[ "$rhc_ipv6" == "yes" ]]; then
@@ -234,7 +304,7 @@ rh_check() {
     local rhc_banned
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
         if fail2ban-client status sshd >/dev/null 2>&1; then
-            rhc_banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/{print $2}' | tr -d ' ')
+            rhc_banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/{print $2}' | tr -d '[:space:]')
             rhc_ok "fail2ban работает, джейл sshd активен (забанено сейчас: ${rhc_banned:-0})"
         else
             rhc_bad "fail2ban запущен, но джейл sshd НЕ поднялся — брутфорс никто не блокирует"
@@ -288,6 +358,58 @@ rh_check() {
                 rhc_warn "$ADMIN_USER не в группе docker — docker ps ответит permission denied"
                 rhc_fix "docker: меню, пункт 4 (починка); применится в новой сессии SSH"
             fi
+        fi
+
+        # Geo-базы: свои (Loyalsoldier, обновляются cron) или встроенные в образ
+        local rhc_age f
+        if grep -q "$GEODATA_DIR/geosite.dat" "$rhc_compose" 2>/dev/null; then
+            for f in geoip.dat geosite.dat; do
+                if [[ ! -s "$GEODATA_DIR/$f" ]]; then
+                    rhc_bad "в compose подключён $GEODATA_DIR/$f, а файла нет — Xray не стартует"
+                    rhc_fix "geo-базы: меню, пункт 2 -> 25"
+                    continue
+                fi
+                rhc_age=$(( ( $(date +%s) - $(stat -c %Y "$GEODATA_DIR/$f") ) / 86400 ))
+                if [[ "$rhc_age" -gt 7 ]]; then
+                    rhc_warn "$f не обновлялся $rhc_age дн. — смотри /var/log/rh-geodata.log"
+                else
+                    rhc_ok "$f свежий (обновлён $rhc_age дн. назад)"
+                fi
+            done
+            if [[ -f "$GEODATA_CRON" && -x "$GEODATA_BIN" ]]; then
+                rhc_ok "ежедневное обновление geo-баз включено"
+            else
+                rhc_warn "geo-базы подключены, но ежедневного обновления нет"
+                rhc_fix "geo-базы: меню, пункт 2 -> 25"
+            fi
+        else
+            rhc_info "geo-базы: встроенные в образ ноды (свои не подключены)"
+        fi
+
+        # Выходы для Xray: warp-native (интерфейс warp) и Psiphon (SOCKS)
+        if [[ -d /opt/warp-native ]] || systemctl cat wg-quick@warp >/dev/null 2>&1; then
+            if ip link show warp >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@warp; then
+                if curl -fsS --max-time 10 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
+                    rhc_ok "warp-native: интерфейс warp работает (warp=on)"
+                else
+                    rhc_warn "warp-native: интерфейс warp поднят, но выход не через Cloudflare"
+                fi
+            else
+                rhc_bad "warp-native установлен, но интерфейс warp не работает"
+                rhc_fix "warp-native: меню, пункт 2 -> 26"
+            fi
+        else
+            rhc_info "warp-native не установлен"
+        fi
+        if [[ -f /etc/default/vps-psiphon ]]; then
+            if systemctl is-active --quiet vps-psiphon && rhc_hasport "$PSIPHON_PORT"; then
+                rhc_ok "Psiphon работает, SOCKS на порту $PSIPHON_PORT"
+            else
+                rhc_bad "Psiphon установлен, но служба или порт $PSIPHON_PORT не работают"
+                rhc_fix "Psiphon: меню, пункт 2 -> 27; состояние: vps-psiphon"
+            fi
+        else
+            rhc_info "Psiphon не установлен"
         fi
     else
         rhc_bad "docker не установлен"

@@ -2,7 +2,7 @@
 # ЭТОТ ФАЙЛ СОБРАН АВТОМАТИЧЕСКИ ИЗ lib/*.sh — НЕ РЕДАКТИРУЙТЕ ЕГО ВРУЧНУЮ.
 # Правки вносятся в lib/, затем: python3 build.py
 # Любое изменение здесь будет затёрто при следующей сборке.
-# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 60-node.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
+# Собрано из: 00-header.sh, 05-ui.sh, 06-spinner.sh, 07-probes.sh, 10-helpers.sh, 20-prompts.sh, 30-state.sh, 40-system.sh, 45-preflight.sh, 50-security.sh, 60-node.sh, 62-geodata.sh, 70-web.sh, 75-domain.sh, 80-notify.sh, 82-panel.sh, 85-extras.sh, 86-egress.sh, 90-install.sh, 92-repair.sh, 94-check.sh, 95-menu.sh, 99-main.sh
 
 # ===== lib/00-header.sh ================================================
 # ##########################################################################
@@ -40,6 +40,9 @@ trap 'rh_on_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # === НАСТРОЙКИ ===
 INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/index.html"
+# Откуда скачивать сам установщик. Нужен, когда он запущен через bash <(curl ...):
+# такой «файл» — временный канал, и перезапустить себя внутри tmux по нему нельзя.
+SETUP_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/setup.sh"
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
 INSTALL_STATE="/etc/rabotahrista/install.conf"
 PANEL_ENV="/etc/rabotahrista/panel.env"
@@ -72,13 +75,29 @@ NGINX_MARK="# rabotahrista: конфиг ноды, перезаписывает�
 SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/01-hardening.conf"
 NODE_PORT="2222"        # порт, на который к ноде ходит панель
 WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
+PSIPHON_PORT="1080"     # SOCKS5 Psiphon (vps-psiphon), им пользуется Xray ноды
+# Сторонние установщики выходов — прямо из их репозиториев на GitHub
+WARP_NATIVE_URL="https://raw.githubusercontent.com/distillium/warp-native/main/install.sh"
+PSIPHON_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
+# Geo-базы для Xray внутри ноды (Loyalsoldier) и их ежедневное обновление
+GEODATA_DIR="/opt/remnanode/geodata"
+GEODATA_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+GEODATA_BIN="/usr/local/bin/rh-geodata-update.sh"
+GEODATA_CRON="/etc/cron.d/rh-geodata"
+# Группа, по которой скрипт узнаёт учётки ИИ-агентов (Claude и др. через MCP):
+# по ней уведомление о входе пишет «вход ИИ-агента», а не обычный вход.
+AGENT_GROUP="rh-agents"
 # apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
 # свежем сервере установщик встречался с первым после загрузки
 # unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
 # что зависит от пакетов: нода, сертификат, fail2ban, docker.
-APT_WAIT=(-o DPkg::Lock::Timeout=600)
+# confdef/confold: если файл настроек пакета менялся (sshd_config, например),
+# dpkg не спрашивает «чей оставить», а оставляет наш. Без этого обновление
+# без терминала падало на вопросе, на который некому ответить.
+APT_WAIT=(-o DPkg::Lock::Timeout=600
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git tmux ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)
@@ -440,8 +459,12 @@ print_summary() {
                  "заняло $elapsed · подробности выше и в $SETUP_LOG"
     fi
 
+    # Вход — по IP: за оранжевым облаком Cloudflare домен ведёт на Cloudflare,
+    # и SSH по нему не пройдёт. Отпечаток — тот, что ssh спросит при первом входе.
+    local fp outb login_host="${SERVER_IP:-${FULL_DOMAIN:-$(hostname)}}"
+    fp=$(hostkey_fingerprint)
     ui_section "Доступ по SSH"
-    ui_kv "команда входа" "ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+    ui_kv "команда входа" "ssh -p $SSH_PORT $ADMIN_USER@$login_host"
     ui_kv "учётка" "$ADMIN_USER (sudo без пароля)"
     case "$ADMIN_PASS_SOURCE" in
         manual) ui_kv "пароль учётки" "задан вами вручную (в отчёт не пишу)" ;;
@@ -450,6 +473,7 @@ print_summary() {
                 ui_info "нужен только для аварийной консоли хостера" ;;
     esac
     ui_kv "root и пароли" "вход запрещён"
+    [[ -n "$fp" ]] && ui_kv "отпечаток сервера" "$fp (ED25519)"
     if [[ -n "$SSH_PENDING_REBOOT" ]]; then
         ui_warn "порт $SSH_PORT заработает только после перезагрузки"
         ui_info "до неё заходите по старому порту — он открыт в UFW"
@@ -461,14 +485,25 @@ print_summary() {
     ui_kv "домен" "${FULL_DOMAIN:-—}"
     ui_kv "IP сервера" "${SERVER_IP:-—}"
     ui_kv "контейнер" "$node_state"
+    ui_kv "версия ноды" "remnawave/node:${REMNANODE_VERSION:-latest}"
     ui_kv "порт для панели" "$NODE_PORT (только с ${PANEL_IP:-—})"
 
     ui_section "Фаервол"
-    ui_kv "открыто" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80, 443"
+    ui_kv "открыто" "${UFW_SSH_PORTS:-$SSH_PORT/tcp} (SSH, rate limit), 80/tcp, 443/tcp, 443/udp"
     ui_kv "" "$NODE_PORT/tcp только с ${PANEL_IP:-—}"
 
     ui_section "Шаги"
     ui_summary "${SUMMARY[@]}"
+
+    outb=$(egress_outbounds_json)
+    if [[ -n "$outb" ]]; then
+        ui_section "Outbound'ы Xray для профиля ноды"
+        printf '%s\n' "$outb" | sed 's/^/  /'
+    fi
+
+    ui_section "Профиль для ssh-mcp (config.toml)"
+    ssh_mcp_profile | sed 's/^/  /'
+    ui_info "keyRef — путь к ключу агента на вашем компьютере"
 
     ui_section "Где что лежит"
     ui_kv "этот отчёт" "$REPORT_FILE"
@@ -484,7 +519,7 @@ print_summary() {
         echo "=== ОТЧЁТ ОБ УСТАНОВКЕ — $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
         echo "Заняло: $elapsed, сбоев: $fails"
         echo
-        echo "Вход:            ssh -p $SSH_PORT $ADMIN_USER@${FULL_DOMAIN:-${SERVER_IP:-$(hostname)}}"
+        echo "Вход:            ssh -p $SSH_PORT $ADMIN_USER@$login_host"
         echo "Учётка:          $ADMIN_USER (sudo без пароля)"
         case "$ADMIN_PASS_SOURCE" in
             manual) echo "Пароль учётки:   задан вами вручную" ;;
@@ -494,10 +529,19 @@ print_summary() {
         echo "Домен:           ${FULL_DOMAIN:-—}"
         echo "IP сервера:      ${SERVER_IP:-—}"
         echo "Порт панели:     $NODE_PORT (только с ${PANEL_IP:-—})"
-        echo "UFW:             ${UFW_SSH_PORTS:-$SSH_PORT/tcp}, 80/tcp, 443/tcp"
+        echo "UFW:             ${UFW_SSH_PORTS:-$SSH_PORT/tcp}, 80/tcp, 443/tcp, 443/udp"
+        [[ -n "$fp" ]] && echo "Отпечаток:       $fp (ED25519)"
         echo
         echo "--- ШАГИ ---"
         printf '%s\n' "${SUMMARY[@]}"
+        if [[ -n "$outb" ]]; then
+            echo
+            echo "--- OUTBOUND'Ы XRAY ДЛЯ ПРОФИЛЯ НОДЫ ---"
+            printf '%s\n' "$outb"
+        fi
+        echo
+        echo "--- ПРОФИЛЬ ДЛЯ SSH-MCP (config.toml) ---"
+        ssh_mcp_profile
         echo
         echo "--- ПАКЕТЫ И ВЕРСИИ ---"
         collect_versions
@@ -505,6 +549,16 @@ print_summary() {
     printf '%s\n' "$out" > "$REPORT_FILE" 2>/dev/null || true
     chmod 600 "$REPORT_FILE" 2>/dev/null || true
     { echo; printf '%s\n' "$out"; } >> "$SETUP_LOG" 2>&1 || true
+    return 0
+}
+
+# В Ubuntu 22.10+ SSH поднимается по требованию через ssh.socket, и каталог
+# /run/sshd существует, только пока служба запущена. Без него sshd -t и sshd -T
+# падают с «Missing privilege separation directory», хотя конфиг в порядке, —
+# и харденинг откатывался как будто из-за битого конфига. Создаём каталог так
+# же, как его создаёт сама служба (RuntimeDirectory=sshd, права 755).
+sshd_rundir() {
+    [[ -d /run/sshd ]] || install -d -m 755 /run/sshd 2>/dev/null || true
     return 0
 }
 
@@ -517,6 +571,7 @@ print_summary() {
 ask_domain() {
     DOMAIN=$(echo "${DOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] DOMAIN в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите основной домен (например, domain.com): " DOMAIN
         DOMAIN=$(echo "$DOMAIN" | tr -d '[:space:]')
         [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Только буквы, цифры, точки и дефисы."
@@ -527,6 +582,7 @@ ask_domain() {
 ask_subdomain() {
     SUBDOMAIN=$(echo "${SUBDOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] SUBDOMAIN в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите имя ноды/субдомена (например, node-nl-1): " SUBDOMAIN
         SUBDOMAIN=$(echo "$SUBDOMAIN" | tr -d '[:space:]')
         [[ "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Только буквы, цифры и дефисы (без точек)."
@@ -537,6 +593,7 @@ ask_subdomain() {
 ask_panel_ip() {
     PANEL_IP=$(echo "${PANEL_IP:-}" | tr -d '[:space:]')
     while [[ ! "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] PANEL_IP в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите IP-адрес мастер-панели (для UFW): " PANEL_IP
         PANEL_IP=$(echo "$PANEL_IP" | tr -d '[:space:]')
         [[ "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Введите корректный IPv4."
@@ -547,6 +604,7 @@ ask_panel_ip() {
 ask_secret() {
     REMNA_SECRET=$(echo "${REMNA_SECRET:-}" | tr -d '[:space:]')
     while [[ -z "$REMNA_SECRET" ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] REMNA_SECRET в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
         REMNA_SECRET=$(echo "$REMNA_SECRET" | tr -d '[:space:]')
     done
@@ -577,6 +635,93 @@ ask_ssh_key() {
         fi
         [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] SSH_PUBLIC_KEY в конфиге некорректен"; return 1; }
         read -ep "Публичный SSH-ключ (ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
+    done
+    return 0
+}
+
+# Дополнительные ключи той же учётке: второй компьютер, коллега, Claude.
+# Хранятся в SSH_EXTRA_KEYS по одному на строку. Основной ключ остаётся
+# обязательным, эти — по желанию; спрашиваем, только если их ещё нет.
+ask_extra_keys() {
+    [[ -n "$NONINTERACTIVE" || -n "${SSH_EXTRA_KEYS:-}" ]] && return 0
+    local k
+    while true; do
+        read -ep "Ещё один публичный ключ для этой учётки (Enter — не нужно): " k || k=""
+        k=$(echo "$k" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$k" ]] && break
+        if ssh_key_valid "$k"; then
+            SSH_EXTRA_KEYS+="${SSH_EXTRA_KEYS:+$'\n'}$k"
+            echo "  Ключ добавлен."
+        else
+            echo -e "\e[31m[Ошибка]\e[0m Это не похоже на публичный SSH-ключ — пропускаю."
+        fi
+    done
+    return 0
+}
+
+# --- Версия ноды ------------------------------------------------------------
+# Тег образа remnawave/node: latest или конкретная версия (3.4.3). Конкретная
+# нужна, когда свежая версия что-то ломает и ноду откатывают: с latest любая
+# переустановка вернула бы сломанную версию обратно.
+validate_node_version() {
+    REMNANODE_VERSION=$(echo "${REMNANODE_VERSION:-}" | tr -d '[:space:]')
+    if [[ -n "$REMNANODE_VERSION" && ! "$REMNANODE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "  [ВНИМАНИЕ] REMNANODE_VERSION='$REMNANODE_VERSION' — не похоже на тег образа, ставлю latest."
+        REMNANODE_VERSION=""
+    fi
+    [[ -z "$REMNANODE_VERSION" ]] && REMNANODE_VERSION="latest"
+    return 0
+}
+
+# Спрашивается при каждой интерактивной установке. Если нода уже стоит на
+# закреплённой версии, она предлагается по умолчанию — чтобы Enter не отменил
+# откат. На чистом сервере Enter — latest.
+ask_node_version() {
+    [[ -n "$NONINTERACTIVE" ]] && { validate_node_version; return 0; }
+    local v def="${REMNANODE_VERSION:-latest}"
+    read -ep "Версия ноды Remnawave, например 3.4.3 (Enter — $def): " v || v=""
+    v=$(echo "$v" | tr -d '[:space:]')
+    REMNANODE_VERSION="${v:-$def}"
+    validate_node_version
+    return 0
+}
+
+# --- Учётка ИИ-агента -----------------------------------------------------
+# Отдельный вход для Claude и других агентов, которые ходят на сервер по MCP.
+# Зачем отдельный: в уведомлении о входе видно, кто зашёл — человек или агент,
+# а доступ агента можно закрыть, не трогая свою учётку.
+validate_agent_params() {
+    # Запасное имя не должно совпасть с админ-учёткой, если её саму назвали agent
+    local fallback="agent"
+    [[ "${ADMIN_USER:-}" == "agent" ]] && fallback="ai-agent"
+    AGENT_USER=$(echo "${AGENT_USER:-}" | tr -d '[:space:]')
+    [[ -z "$AGENT_USER" ]] && AGENT_USER="$fallback"
+    if [[ ! "$AGENT_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || [[ "$AGENT_USER" == "root" ]] \
+       || [[ "$AGENT_USER" == "$ADMIN_USER" ]] || (( ${#AGENT_USER} > 32 )); then
+        echo "  [ВНИМАНИЕ] Некорректное AGENT_USER='$AGENT_USER' (или совпадает с админ-учёткой) — использую '$fallback'."
+        AGENT_USER="$fallback"
+    fi
+    return 0
+}
+
+ask_agent_key() {
+    [[ -n "$NONINTERACTIVE" || -n "${AGENT_SSH_KEYS:-}" ]] && return 0
+    local k
+    echo "  Учётка для ИИ-агентов (Claude и др. по MCP): свой ключ, sudo, в уведомлениях"
+    echo "  вход подписан как вход агента. Не нужна — просто Enter."
+    while true; do
+        read -ep "Публичный ключ агента (Enter — не создавать): " k || k=""
+        k=$(echo "$k" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$k" ]] && break
+        if ssh_key_valid "$k"; then
+            AGENT_SSH_KEYS="$k"
+            read -ep "Имя учётки агента [${AGENT_USER:-agent}]: " k || k=""
+            k=$(echo "$k" | tr -d '[:space:]')
+            [[ -n "$k" ]] && AGENT_USER="$k"
+            validate_agent_params
+            break
+        fi
+        echo -e "\e[31m[Ошибка]\e[0m Это не похоже на публичный SSH-ключ."
     done
     return 0
 }
@@ -700,6 +845,12 @@ ask_ssh_params() {
 ask_cf() {
     [[ -z "$SETUP_CF" && -z "$NONINTERACTIVE" ]] && read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
     if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
+        if [[ -n "$NONINTERACTIVE" ]]; then
+            # Спрашивать некому: без токена DNS не настроить — так и говорим
+            [[ -z "$CF_API_TOKEN" ]] && { echo "  [СБОЙ] SETUP_CF=y, а CF_API_TOKEN в конфиге пуст"; return 1; }
+            [[ "$CF_PROXY_CHOICE" =~ ^[Yy]$ ]] && CF_PROXIED="true" || CF_PROXIED="false"
+            return 0
+        fi
         while [[ -z "$CF_API_TOKEN" ]]; do
             read -ep "API Token Cloudflare (Edit DNS): " CF_API_TOKEN
             CF_API_TOKEN=$(echo "$CF_API_TOKEN" | tr -d '[:space:]')
@@ -827,6 +978,13 @@ detect_existing_setup() {
                    | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
     fi
 
+    # Версия ноды — тег образа из compose (чтобы не потерять откат на старую)
+    if [[ -z "${REMNANODE_VERSION:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
+        v=$(grep -m1 -E '^[[:space:]]*image:[[:space:]]*remnawave/node' /opt/remnanode/docker-compose.yml 2>/dev/null \
+            | sed -E 's/.*remnawave\/node:?//' | tr -d '"'"'"'" \r\n')
+        REMNANODE_VERSION="${v:-latest}"
+    fi
+
     # Секрет ноды — из compose (кавычки вокруг значения снимаем)
     if [[ -z "${REMNA_SECRET:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
         REMNA_SECRET=$(grep -m1 'SECRET_KEY=' /opt/remnanode/docker-compose.yml 2>/dev/null \
@@ -891,7 +1049,9 @@ save_state() {
     # и секрет вида a$(команда) иначе выполнился бы, а пароль с $ — молча испортился.
     {
         for _v in DOMAIN SUBDOMAIN PANEL_IP REMNA_SECRET SETUP_CF CF_API_TOKEN \
-                  CF_PROXY_CHOICE SETUP_SSH SSH_PUBLIC_KEY SSH_PORT ADMIN_USER \
+                  CF_PROXY_CHOICE SETUP_SSH SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
+                  AGENT_USER AGENT_SSH_KEYS GEODATA INSTALL_WARP_NATIVE INSTALL_PSIPHON PSIPHON_REGION \
+                  REMNANODE_VERSION \
                   USER_NODE_LABEL INSTALL_WARP INSTALL_SPEEDTEST SETUP_TG \
                   TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY PANEL_WATCH \
                   PANEL_PROBE_PORT PANEL_FAIL_CHECKS; do
@@ -1053,6 +1213,11 @@ comp_sysctl() {
     echo ">>> Тюнинг ядра (sysctl)..."
     echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
     modprobe tcp_bbr || true
+    # Ключи nf_conntrack существуют, только пока модуль загружен. При загрузке
+    # sysctl применяется раньше, чем ufw подтянет модуль, — поэтому грузим его
+    # сами (modules-load срабатывает до sysctl), иначе лимит молча не встанет.
+    echo "nf_conntrack" > /etc/modules-load.d/conntrack.conf
+    modprobe nf_conntrack || true
     cat <<EOF > /etc/sysctl.d/99-vpn-tune.conf
 fs.file-max=1048576
 
@@ -1076,6 +1241,20 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
 EOF
+    # Таблица соединений фаервола. По умолчанию 65536 записей, а запись об
+    # установленном соединении живёт 5 суток: на загруженной ноде таблица
+    # переполняется, и ядро молча отбрасывает новые подключения клиентов.
+    # 262144 записи — около 80 МБ памяти; 2 часа жизни с keepalive в 5 минут
+    # живые соединения не рвут, а мёртвые вычищаются.
+    if modinfo nf_conntrack >/dev/null 2>&1; then
+        cat <<EOF >> /etc/sysctl.d/99-vpn-tune.conf
+
+# Таблица соединений (conntrack)
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_buckets = 65536
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+EOF
+    fi
     # Ключи ipv6 существуют, только пока стек ipv6 в ядре жив. После ipv6.disable=1
     # из GRUB их нет, и sysctl --system падает с ошибкой на пустом месте.
     if [[ -d /proc/sys/net/ipv6 ]]; then
@@ -1384,8 +1563,23 @@ rh_session_guard() {
         return 0
     fi
 
+    # bash <(curl ...) — «файл» здесь временный канал /dev/fd/NN. Сервер tmux
+    # его не унаследует, и установка внутри tmux не стартовала вовсе (проверено
+    # на сервере). Поэтому в таком случае сохраняем установщик в файл.
+    local self="$0"
+    if [[ ! -f "$self" ]]; then
+        self="/root/rabotahrista-setup.sh"
+        if ! curl -fsSL --max-time 60 "$SETUP_URL" -o "$self" 2>/dev/null || ! bash -n "$self" 2>/dev/null; then
+            rm -f "$self"
+            ui_warn "не смог сохранить установщик в файл — работаю без tmux"
+            ui_info "не закрывайте окно до конца установки"
+            return 0
+        fi
+        chmod 700 "$self"
+    fi
+
     local cmd a
-    cmd="bash $(printf '%q' "$0")"
+    cmd="bash $(printf '%q' "$self")"
     for a in "$@"; do cmd+=" $(printf '%q' "$a")"; done
     # После выхода скрипта окно не закрываем: иначе итоговый отчёт с паролем
     # учётки мелькнёт и исчезнет вместе с сессией.
@@ -1447,6 +1641,9 @@ comp_user() {
     grep -qxF "$SSH_PUBLIC_KEY" "$H/.ssh/authorized_keys" || echo "$SSH_PUBLIC_KEY" >> "$H/.ssh/authorized_keys"
     chmod 600 "$H/.ssh/authorized_keys"
     chown -R "$ADMIN_USER:$ADMIN_USER" "$H/.ssh"
+    # Дополнительные ключи. Кривой пропускаем с предупреждением, а не роняем
+    # установку: вход уже обеспечен основным ключом.
+    [[ -n "${SSH_EXTRA_KEYS:-}" ]] && { add_keys_to_user "$ADMIN_USER" "$SSH_EXTRA_KEYS" || true; }
 
     [[ -s "$H/.ssh/authorized_keys" ]] || { echo "  [СБОЙ] authorized_keys пуст"; return 1; }
     echo "Пользователь готов."
@@ -1533,6 +1730,11 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 UsePAM yes
+# Ноде не нужен проброс графики; 3 попытки и 30 секунд на вход — меньше
+# простора для перебора и висящих неавторизованных соединений
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 30
 EOF
     chmod 644 "$SSH_HARDEN_FILE"
     # Облачные образы включают вход по паролю своими дроп-инами. Наш файл сортируется
@@ -1542,6 +1744,7 @@ EOF
 
     ssh_neutralize_conflicts
 
+    sshd_rundir
     sshd -t || {
         echo "  [СБОЙ] sshd -t не прошёл — убираю свой файл, SSH не трогаю"
         rm -f "$SSH_HARDEN_FILE"
@@ -1647,6 +1850,7 @@ comp_ufw() {
         for p in $ssh_ports; do ufw limit "$p/tcp" comment 'SSH Rate Limit'; done
         ufw allow 80/tcp comment 'HTTP'
         ufw allow 443/tcp comment 'HTTPS'
+        ufw allow 443/udp comment 'QUIC / Hysteria2'
         ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'API panel'
         ufw --force enable
     } >>"$SETUP_LOG" 2>&1
@@ -1655,7 +1859,7 @@ comp_ufw() {
 comp_fail2ban() {
     echo ">>> Настройка fail2ban..."
     # python3-systemd нужен для backend=systemd ниже; без него джейл sshd молча не стартует
-    apt-get install -y fail2ban python3-systemd >>"$SETUP_LOG" 2>&1 || true
+    apt-get "${APT_WAIT[@]}" install -y fail2ban python3-systemd >>"$SETUP_LOG" 2>&1 || true
     cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime  = 1h
@@ -1689,6 +1893,147 @@ EOF
     done
     echo "  [СБОЙ] джейл sshd в fail2ban не поднялся за 30 сек (см. $SETUP_LOG)"
     return 1
+}
+
+# Добавляет в authorized_keys учётки ключи из многострочной переменной: по
+# одному на строку, пустые и закомментированные строки пропускаются, кривые —
+# с предупреждением. Возвращает 0, если в файле есть хотя бы один ключ.
+add_keys_to_user() {
+    local user="$1" keys="$2" H k
+    H=$(getent passwd "$user" | cut -d: -f6)
+    [[ -n "$H" ]] || return 1
+    install -d -m 700 -o "$user" -g "$user" "$H/.ssh"
+    touch "$H/.ssh/authorized_keys"
+    while IFS= read -r k; do
+        k=$(echo "$k" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$k" || "$k" == \#* ]] && continue
+        if ssh_key_valid "$k"; then
+            grep -qxF "$k" "$H/.ssh/authorized_keys" || echo "$k" >> "$H/.ssh/authorized_keys"
+        else
+            echo "  [!] Строка не похожа на SSH-ключ, пропущена: ${k:0:40}..."
+        fi
+    done <<< "$keys"
+    chmod 600 "$H/.ssh/authorized_keys"
+    chown -R "$user:$user" "$H/.ssh"
+    [[ -s "$H/.ssh/authorized_keys" ]] && return 0
+    return 1
+}
+
+# Учётка ИИ-агента. Без пароля (вход только по ключу), sudo без пароля — агент
+# ставит и чинит то же, что и человек. Узнаётся по группе $AGENT_GROUP: по ней
+# уведомление о входе пишет «ИИ-агент», а не обычный вход. Файл sudoers назван
+# 91-agent-*, а не 90-*: по 90-* установщик находит админ-учётку человека.
+comp_agent() {
+    validate_agent_params
+    if [[ -z "${AGENT_SSH_KEYS:-}" ]]; then
+        echo "  Ключ агента не задан (AGENT_SSH_KEYS) — учётку не создаю."
+        return 0
+    fi
+    echo ">>> Учётка ИИ-агента $AGENT_USER..."
+    getent group "$AGENT_GROUP" >/dev/null 2>&1 || groupadd "$AGENT_GROUP"
+    if ! id "$AGENT_USER" &>/dev/null; then
+        adduser --disabled-password --gecos "AI agent (rabotahrista)" "$AGENT_USER" >>"$SETUP_LOG" 2>&1
+    fi
+    usermod -aG "$AGENT_GROUP" "$AGENT_USER"
+    getent group docker >/dev/null 2>&1 && usermod -aG docker "$AGENT_USER"
+
+    local sf="/etc/sudoers.d/91-agent-$AGENT_USER"
+    echo "$AGENT_USER ALL=(ALL) NOPASSWD:ALL" > "$sf"
+    chmod 440 "$sf"
+    if ! visudo -c >/dev/null 2>>"$SETUP_LOG"; then
+        echo "  [СБОЙ] sudoers не проходит проверку — убираю файл агента"
+        rm -f "$sf"
+        return 1
+    fi
+    if ! add_keys_to_user "$AGENT_USER" "$AGENT_SSH_KEYS"; then
+        echo "  [СБОЙ] у $AGENT_USER не оказалось ни одного рабочего ключа"
+        return 1
+    fi
+    echo "  Готово: вход ssh -p $SSH_PORT $AGENT_USER@сервер, sudo без пароля."
+    return 0
+}
+
+# Ключи сервера, доставшиеся от образа хостера.
+#
+# Пример с живого сервера: ключи RSA и DSA были подписаны root@ns31561980 —
+# именем машины, на которой собирали образ. Значит, у всех серверов из этого
+# образа они одинаковые, и любой такой сервер может выдать себя за ваш.
+# Признак — имя хоста в подписи ключа не совпадает с именем этого сервера.
+# Делается один раз за жизнь сервера (метка в /etc/rabotahrista): иначе после
+# смены hostname ключи перевыпускались бы при каждом запуске.
+comp_hostkeys() {
+    local marker="/etc/rabotahrista/hostkeys.done" f c bad="" stamp hn
+    if [[ -f "$marker" ]]; then
+        echo "  Ключи сервера уже проверялись — не трогаю."
+        return 0
+    fi
+    mkdir -p "$(dirname "$marker")"
+    hn=$(hostname)
+    for f in /etc/ssh/ssh_host_*_key.pub; do
+        [[ -e "$f" ]] || continue
+        c=$(awk '{print $3}' "$f"); c="${c#*@}"
+        [[ -z "$c" || "$c" == "$hn" || "$c" == "${hn%%.*}" ]] && continue
+        bad+=" $(basename "$f" .pub)(${c})"
+    done
+    if [[ -z "$bad" ]]; then
+        echo "  Ключи сервера выпущены на этом сервере — менять не нужно."
+        touch "$marker"
+        return 0
+    fi
+    echo ">>> Ключи сервера достались от образа хостера:$bad"
+    echo "    У всех серверов из этого образа они одинаковые — выпускаю свои."
+    stamp=$(date +%Y%m%d%H%M%S)
+    mkdir -p "$RH_BACKUP_DIR/ssh-hostkeys.$stamp"
+    cp -a /etc/ssh/ssh_host_* "$RH_BACKUP_DIR/ssh-hostkeys.$stamp/"
+    chmod 700 "$RH_BACKUP_DIR/ssh-hostkeys.$stamp"
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -A >>"$SETUP_LOG" 2>&1 || true
+    if [[ ! -s /etc/ssh/ssh_host_ed25519_key ]]; then
+        echo "  [СБОЙ] новые ключи не создались — возвращаю прежние"
+        cp -a "$RH_BACKUP_DIR/ssh-hostkeys.$stamp/"ssh_host_* /etc/ssh/
+        return 1
+    fi
+    touch "$marker"
+    # Уже открытые сессии не рвутся; новые подключения видят новые ключи
+    systemctl try-restart ssh >>"$SETUP_LOG" 2>&1 || true
+    echo "  Готово, прежние ключи — в $RH_BACKUP_DIR/ssh-hostkeys.$stamp"
+    echo "  Новые отпечатки (при первом входе ssh спросит подтверждение):"
+    for f in /etc/ssh/ssh_host_*_key.pub; do
+        ssh-keygen -lf "$f" 2>/dev/null | awk '{print "    " $2 "  " $NF}'
+    done
+    return 0
+}
+
+# Отпечаток ключа сервера ED25519 — тот, что ssh покажет при первом входе
+hostkey_fingerprint() {
+    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $2}'
+    return 0
+}
+
+# Готовый профиль для ssh-mcp (config.toml) — входить агентом, а если учётки
+# агента нет, то админ-учёткой. Хост — IP, а не домен: за оранжевым облаком
+# Cloudflare домен ведёт на Cloudflare, и SSH по нему не пройдёт.
+ssh_mcp_profile() {
+    local user="$ADMIN_USER" fp name
+    if [[ -n "${AGENT_USER:-}" ]] && id "$AGENT_USER" &>/dev/null \
+       && id -nG "$AGENT_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$AGENT_GROUP"; then
+        user="$AGENT_USER"
+    fi
+    fp=$(hostkey_fingerprint)
+    name="${SUBDOMAIN:-$(hostname -s)}"
+    cat <<EOF
+[[profiles]]
+name = "$name"
+host = "${SERVER_IP:-IP_СЕРВЕРА}"
+port = $SSH_PORT
+user = "$user"
+auth = "key"
+keyRef = 'C:\Users\ВАШ_ПОЛЬЗОВАТЕЛЬ\.ssh\КЛЮЧ_АГЕНТА'
+role = "admin"
+approvalPolicy = "auto"
+trustedHostKey = "${fp:-неизвестен}"
+EOF
+    return 0
 }
 
 # ===== lib/60-node.sh ==================================================
@@ -1725,6 +2070,20 @@ docker_group_member() {
     return 0
 }
 
+# Каталог ноды: 750 и группа docker. Заходить в него и смотреть geo-базы могут
+# админ-учётка и агент (оба в группе docker), а сам docker-compose.yml с
+# SECRET_KEY остаётся 600 — секрет защищён на уровне файла. Раньше каталог был
+# 700, и даже своя учётка упиралась в Permission denied. Прав это не добавляет:
+# участник группы docker и так фактически root. Владельца не трогаем — если вы
+# сделали владельцем себя, так и останется.
+node_dir_perms() {
+    [[ -d /opt/remnanode ]] || return 0
+    getent group docker >/dev/null 2>&1 && chgrp docker /opt/remnanode
+    chmod 750 /opt/remnanode
+    [[ -f /opt/remnanode/docker-compose.yml ]] && chmod 600 /opt/remnanode/docker-compose.yml
+    return 0
+}
+
 comp_docker() {
     echo ">>> Установка Docker..."
     if command -v docker >/dev/null 2>&1; then
@@ -1746,6 +2105,11 @@ comp_docker() {
         return 1
     fi
     docker_group_member
+    local a
+    for a in $(getent group "$AGENT_GROUP" 2>/dev/null | cut -d: -f4 | tr ',' ' '); do
+        id -nG "$a" | tr ' ' '\n' | grep -qx docker || usermod -aG docker "$a"
+    done
+    return 0
 }
 
 node_status() {
@@ -1762,15 +2126,15 @@ node_status() {
 
 comp_node() {
     ask_secret
+    validate_node_version
     echo ">>> Разворачивание Remnanode..."
     mkdir -p /opt/remnanode
-    chmod 700 /opt/remnanode
     cat <<EOF > /opt/remnanode/docker-compose.yml
 services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: remnawave/node:latest
+    image: remnawave/node:$REMNANODE_VERSION
     network_mode: host
     restart: always
     cap_add:
@@ -1783,7 +2147,17 @@ services:
       - NODE_PORT=$NODE_PORT
       - SECRET_KEY="${REMNA_SECRET}"
 EOF
-    chmod 600 /opt/remnanode/docker-compose.yml   # внутри SECRET_KEY ноды
+    # Свои geo-базы подключаем, только если они уже скачаны: том на
+    # несуществующий файл docker создал бы каталогом, и Xray не стартовал бы.
+    if geodata_present; then
+        cat <<EOF >> /opt/remnanode/docker-compose.yml
+    volumes:
+      - $GEODATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat:ro
+      - $GEODATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat:ro
+EOF
+        echo "  Подключены geo-базы из $GEODATA_DIR"
+    fi
+    node_dir_perms   # compose — 600 (внутри SECRET_KEY), каталог — 750 с группой docker
     if ! ( cd /opt/remnanode && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
         echo "  [СБОЙ] docker compose up не отработал (см. $SETUP_LOG)"
         node_status
@@ -1807,6 +2181,9 @@ EOF
 comp_node_update() {
     echo ">>> Обновление ноды Remnanode..."
     if [[ -f /opt/remnanode/docker-compose.yml ]]; then
+        # Обновляется ровно тот тег, что записан в compose: закреплённая версия
+        # так и останется, сменить её — пункт «Нода (передеплой)»
+        grep -m1 -E '^[[:space:]]*image:' /opt/remnanode/docker-compose.yml | sed 's/^[[:space:]]*/  Образ: /' 
         if ! ( cd /opt/remnanode && docker compose pull && docker compose up -d ) >>"$SETUP_LOG" 2>&1; then
             echo "  [СБОЙ] обновление не прошло (см. $SETUP_LOG)"
             node_status
@@ -1819,6 +2196,113 @@ comp_node_update() {
         echo "  Нода не установлена (/opt/remnanode/docker-compose.yml не найден)."
         return 1
     fi
+}
+
+# ===== lib/62-geodata.sh ===============================================
+# ##########################################################################
+#  GEO-БАЗЫ
+#  geoip.dat и geosite.dat от Loyalsoldier для Xray внутри ноды и их
+#  ежедневное обновление через cron
+# ##########################################################################
+
+# Встроенные в образ ноды базы обновляются только вместе с образом. Свежие базы
+# Loyalsoldier выходят каждый день; в них то, по чему маршрутизирует ядро
+# (category-ru, geoip ru и т.д.). Поэтому качаем их сами и подключаем томами.
+
+geodata_present() {
+    [[ -s "$GEODATA_DIR/geoip.dat" && -s "$GEODATA_DIR/geosite.dat" ]] && return 0
+    return 1
+}
+
+geodata_mounted() {
+    grep -q "$GEODATA_DIR/geosite.dat" /opt/remnanode/docker-compose.yml 2>/dev/null
+}
+
+# Скрипт обновления. Он же качает базы при установке — один код на оба случая.
+# Логика: сверяем sha256 с опубликованной суммой; одинаковые — ничего не
+# делаем; новые — качаем во временный файл рядом, проверяем сумму и только
+# потом подменяем. Битая или недокачанная база в ноду не попадёт.
+geodata_write_updater() {
+    cat <<SCRIPT > "$GEODATA_BIN"
+#!/bin/bash
+# Обновление geo-баз ноды (rabotahrista). Запускается cron раз в сутки.
+#   --no-restart  только скачать, ноду не перезапускать (нужно при установке)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DIR="$GEODATA_DIR"
+URL="$GEODATA_URL"
+LOG=/var/log/rh-geodata.log
+NO_RESTART=""; [[ "\${1:-}" == "--no-restart" ]] && NO_RESTART=1
+log(){ echo "\$(date '+%F %T') \$*" >> "\$LOG"; }
+mkdir -p "\$DIR"
+changed="" failed=""
+for f in geoip.dat geosite.dat; do
+    want=\$(curl -fsSL --max-time 30 "\$URL/\$f.sha256sum" 2>/dev/null | awk '{print \$1}' | head -1)
+    if [[ ! "\$want" =~ ^[0-9a-f]{64}\$ ]]; then
+        log "\$f: не получил контрольную сумму — пропускаю"; failed+=" \$f"; continue
+    fi
+    have=\$(sha256sum "\$DIR/\$f" 2>/dev/null | awk '{print \$1}')
+    [[ "\$have" == "\$want" ]] && continue
+    tmp="\$DIR/.\$f.new"
+    if ! curl -fsSL --max-time 300 "\$URL/\$f" -o "\$tmp"; then
+        log "\$f: скачивание не удалось"; rm -f "\$tmp"; failed+=" \$f"; continue
+    fi
+    if [[ "\$(sha256sum "\$tmp" | awk '{print \$1}')" != "\$want" ]]; then
+        log "\$f: сумма не совпала — файл битый, оставляю прежний"; rm -f "\$tmp"; failed+=" \$f"; continue
+    fi
+    chmod 644 "\$tmp"
+    mv -f "\$tmp" "\$DIR/\$f"
+    log "\$f: обновлён"
+    changed+=" \$f"
+done
+# Ноду перезапускаем, только если базы реально поменялись и подключены в неё.
+# Перед перезапуском — метка «плановый», чтобы вотчер не кричал «нода упала».
+if [[ -n "\$changed" && -z "\$NO_RESTART" ]] \\
+   && grep -q "\$DIR/geosite.dat" /opt/remnanode/docker-compose.yml 2>/dev/null; then
+    touch /run/rh-node-planned
+    if docker restart remnanode >/dev/null 2>&1; then
+        log "нода перезапущена:\$changed"
+        [[ -x /usr/local/bin/rh-notify.sh ]] && RH_SILENT=1 /usr/local/bin/rh-notify.sh "🗺 Geo-базы обновлены:\$changed — нода перезапущена"
+    else
+        log "перезапуск ноды не удался"
+        [[ -x /usr/local/bin/rh-notify.sh ]] && /usr/local/bin/rh-notify.sh "⚠️ Geo-базы обновлены:\$changed, но перезапустить ноду не удалось"
+    fi
+fi
+[[ -n "\$failed" ]] && exit 1
+exit 0
+SCRIPT
+    chmod 755 "$GEODATA_BIN"
+    return 0
+}
+
+comp_geodata() {
+    echo ">>> Geo-базы Loyalsoldier..."
+    mkdir -p "$GEODATA_DIR"
+    geodata_write_updater
+    if ! "$GEODATA_BIN" --no-restart; then
+        echo "  [СБОЙ] не удалось скачать базы (см. /var/log/rh-geodata.log)"
+        tail -3 /var/log/rh-geodata.log 2>/dev/null | sed 's/^/    /'
+        geodata_present || return 1
+        echo "  Прежние базы на месте — продолжаю с ними."
+    fi
+    geodata_present || { echo "  [СБОЙ] баз нет после скачивания"; return 1; }
+    echo "  Базы на месте: $(du -ch "$GEODATA_DIR"/*.dat | tail -1 | cut -f1)"
+
+    # Минута — своя для каждой ноды, чтобы ноды не ломились на GitHub разом.
+    # Время ночное по UTC: перезапуск ноды рвёт соединения на пару секунд.
+    if [[ ! -f "$GEODATA_CRON" ]]; then
+        printf '# rabotahrista: ежедневная проверка geo-баз ноды\n%d 3 * * * root %s >/dev/null 2>&1\n' \
+            $(( RANDOM % 60 )) "$GEODATA_BIN" > "$GEODATA_CRON"
+        chmod 644 "$GEODATA_CRON"
+    fi
+    echo "  Ежедневная проверка: $(grep -v '^#' "$GEODATA_CRON" | awk '{printf "%02d:%02d UTC", $2, $1}')"
+
+    # Нода уже стоит, а тома в compose нет — передеплоим её с томами.
+    # В полной установке не нужно: следующим шагом нода и так передеплоится.
+    if [[ -z "${RH_FULL_INSTALL:-}" && -f /opt/remnanode/docker-compose.yml ]] && ! geodata_mounted; then
+        echo "  Подключаю базы к уже установленной ноде..."
+        comp_node || return 1
+    fi
+    return 0
 }
 
 # ===== lib/70-web.sh ===================================================
@@ -1970,6 +2454,8 @@ nginx_render_site() {
 server {
     listen 80;
     server_name $dom;
+    # Версию nginx и ОС не показываем: лишний отпечаток для того, кто щупает ноду
+    server_tokens off;
 
     location /.well-known/acme-challenge/ {
         root /var/lib/letsencrypt/;
@@ -1991,6 +2477,7 @@ EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
     server_name _;
+    server_tokens off;
     ssl_reject_handshake on;
 }
 EOF
@@ -2001,6 +2488,7 @@ EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name $dom;
+    server_tokens off;
 
     ssl_certificate ${LE_LIVE}/$dom/fullchain.pem;
     ssl_certificate_key ${LE_LIVE}/$dom/privkey.pem;
@@ -2365,6 +2853,16 @@ comp_change_domain() {
         echo "  допишите конфиг сами по образцу выше, нода останется на прежнем домене до этого."
         return 0
     fi
+    # Старый сайт снимаем с публикации ДО записи нового. Иначе он оставался
+    # включённым (а сообщение ниже уверяло, что отключён), а после удаления его
+    # файла в sites-enabled висела битая ссылка — и nginx не стартовал на
+    # следующей перезагрузке. Заодно новый конфиг получит заглушку
+    # default_server: её держал старый. Чужой конфиг не трогаем.
+    if [[ -n "$old_domain" && -L "$NGINX_ENABLED/$old_domain" ]] \
+       && rh_owns_nginx_site "$NGINX_AVAIL/$old_domain"; then
+        rm -f "$NGINX_ENABLED/$old_domain"
+        echo "  Старый сайт $old_domain снят с публикации."
+    fi
     if ! nginx_apply_site "$FULL_DOMAIN"; then
         echo "  [СБОЙ] nginx не принял конфиг нового домена."
         if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" ]]; then
@@ -2400,7 +2898,9 @@ comp_change_domain() {
             echo "  Сертификат $old_domain оставлен."
         fi
     fi
-    if [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" && -z "$NONINTERACTIVE" ]]; then
+    if [[ -n "$old_domain" && -e "$NGINX_ENABLED/$old_domain" ]]; then
+        echo "  Старый конфиг $old_domain писали не мы — он остаётся включённым, решите сами."
+    elif [[ -n "$old_domain" && -f "$NGINX_AVAIL/$old_domain" && -z "$NONINTERACTIVE" ]]; then
         read -ep "  Удалить старый конфиг nginx $NGINX_AVAIL/$old_domain? [y/N]: " DELCONF || DELCONF=""
         if [[ "$DELCONF" =~ ^[Yy]$ ]]; then
             rm -f "$NGINX_AVAIL/$old_domain"
@@ -2469,6 +2969,8 @@ ARGS=(-s --max-time 15)
 ARGS+=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
 \$1")
 [[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
+# RH_SILENT=1 — сообщение без звука (входы ИИ-агента, плановые перезапуски)
+[[ -n "\${RH_SILENT:-}" ]] && ARGS+=(-d "disable_notification=true")
 curl "\${ARGS[@]}" -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
 SCRIPT
     chmod 755 /usr/local/bin/rh-notify.sh
@@ -2481,12 +2983,20 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # setsid обязателен: PAM дожидается только самого скрипта, а отправку мы уводим
 # в фон, чтобы не задерживать вход. Без отвязки от сессии фоновый curl успевали
 # убить при зачистке процессов раньше, чем он достучится до Telegram.
-setsid /usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
+# Учётки ИИ-агентов (группа AGENT_GROUP_PLACEHOLDER) подписываем отдельно и шлём
+# без звука: такие входы штатные и частые, будить ими не нужно.
+TITLE="🔐 <b>SSH-вход</b>"
+if id -nG "$PAM_USER" 2>/dev/null | tr ' ' '\n' | grep -qx 'AGENT_GROUP_PLACEHOLDER'; then
+    TITLE="🤖 <b>Вход ИИ-агента</b>"
+    export RH_SILENT=1
+fi
+setsid /usr/local/bin/rh-notify.sh "${TITLE}
 Пользователь: <code>${PAM_USER}</code>
 Откуда IP: <code>${PAM_RHOST}</code>
 Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" >/dev/null 2>&1 &
 exit 0
 SCRIPT
+    sed -i "s/AGENT_GROUP_PLACEHOLDER/$AGENT_GROUP/g" /usr/local/bin/rh-ssh-login.sh
     chmod 755 /usr/local/bin/rh-ssh-login.sh
     # Строку переписываем, а не дописываем: на старых нодах она уже есть в
     # прежнем виде (с seteuid), и простое "добавить, если нет" её не обновит.
@@ -2512,8 +3022,10 @@ UNIT
     cat <<'SCRIPT' > /usr/local/bin/rh-node-watch.sh
 #!/bin/bash
 FLAG=/run/rh-node-down
-down(){ [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
-up(){ [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
+# Плановый перезапуск (обновление geo-баз) — не авария, молчим
+planned(){ [[ -f /run/rh-node-planned ]] && (( $(date +%s) - $(stat -c %Y /run/rh-node-planned) < 300 )); }
+down(){ planned && return 0; [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
+up(){ planned && { rm -f /run/rh-node-planned; return 0; }; [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
 docker events --filter 'container=remnanode' --filter 'event=start' --filter 'event=die' --filter 'event=stop' --filter 'event=kill' --format '{{.Action}}' 2>/dev/null | \
 while read -r ev; do
     case "$ev" in
@@ -2544,6 +3056,8 @@ UNIT
 [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
 PORT="\${NODE_PORT:-2222}"
 FLAG=/run/rh-node-down
+# Плановый перезапуск (обновление geo-баз) — не повод для тревоги
+[[ -f /run/rh-node-planned ]] && (( \$(date +%s) - \$(stat -c %Y /run/rh-node-planned) < 300 )) && exit 0
 RUNNING=\$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "false")
 LISTEN=no
 ss -H -ltn 2>/dev/null | grep -q ":\${PORT}" && LISTEN=yes
@@ -2763,12 +3277,25 @@ comp_warp() {
         apt-get "${APT_WAIT[@]}" install -y cloudflare-warp
 
         warp-cli --accept-tos registration new || echo "y" | warp-cli registration new
+        # На случай, если служба после регистрации подключилась сама
+        warp-cli --accept-tos disconnect || true
 
         warp-cli --accept-tos mode proxy || warp-cli mode proxy
         warp-cli --accept-tos proxy port "$WARP_PORT" || warp-cli proxy port "$WARP_PORT"
-
-        warp-cli --accept-tos connect || warp-cli connect
     } >>"$SETUP_LOG" 2>&1 || { echo "  Ошибка установки WARP (см. $SETUP_LOG)"; return 1; }
+
+    # connect разрешаем только в режиме прокси. В обычном режиме WARP заворачивает
+    # в туннель весь трафик сервера, включая ответы SSH, — и сервер пропадает
+    # из сети насовсем. Раньше команды шли подряд, и неудачное переключение
+    # режима молча заканчивалось именно этим.
+    if ! warp-cli --accept-tos settings 2>>"$SETUP_LOG" | grep -qiE 'mode:.*proxy'; then
+        echo "  [СБОЙ] WARP не переключился в режим прокси — не подключаю, иначе пропадёт доступ к серверу"
+        warp-cli --accept-tos settings 2>&1 | grep -i 'mode' >>"$SETUP_LOG" || true
+        return 1
+    fi
+    warp-cli --accept-tos connect >>"$SETUP_LOG" 2>&1 \
+        || { echo "  Ошибка подключения WARP (см. $SETUP_LOG)"; return 1; }
+    return 0
 }
 
 comp_speedtest() {
@@ -2787,6 +3314,184 @@ run_bench() { echo ">>> bench.sh..."; wget -qO- bench.sh | bash || true; }
 run_geo()   { echo ">>> ipregion.sh..."; bash <(wget -qO- https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh) || true; }
 
 run_censor() { echo ">>> Проверка блокировок/DPI/DNS (censorcheck)..."; bash <(wget -qO- https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh) || true; }
+
+# ===== lib/86-egress.sh ================================================
+# ##########################################################################
+#  ВЫХОДЫ ДЛЯ XRAY
+#  warp-native (WARP интерфейсом warp через WireGuard) и Psiphon (SOCKS5)
+# ##########################################################################
+
+# Оба ставятся их собственными установщиками с GitHub — скрипт их не
+# переписывает, а только запускает с нужными ответами и проверяет результат.
+# Так обновления авторов приходят сами, а у нас нет второй копии чужого кода.
+
+# Страна сервера — двумя буквами. Спрашиваем у Cloudflare: он отдаёт страну
+# того, кто обратился (loc=), без сторонних сервисов геолокации.
+node_country() {
+    local c
+    c=$(curl -fsS --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '$1=="loc"{print $2}' | tr -d '\r\n')
+    [[ "$c" =~ ^[A-Z]{2}$ ]] && echo "$c"
+    return 0
+}
+
+warp_native_active() {
+    ip link show warp >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@warp && return 0
+    return 1
+}
+
+# Через интерфейс warp трафик должен выходить из Cloudflare (warp=on)
+warp_native_works() {
+    curl -fsS --max-time 15 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | grep -q '^warp=on' && return 0
+    return 1
+}
+
+comp_warp_native() {
+    echo ">>> warp-native (WARP интерфейсом warp)..."
+    local cc; cc=$(node_country)
+    if [[ "$cc" == "RU" ]]; then
+        echo "  Сервер в России — warp-native здесь не работает, пропускаю."
+        echo "  Для RU-нод остаётся WARP на порту $WARP_PORT."
+        return 0
+    fi
+    if warp_native_active && [[ -z "${RH_FORCE:-}" ]]; then
+        echo "  Уже установлен и работает — не трогаю."
+    else
+        local f; f=$(mktemp)
+        if ! curl -fsSL --max-time 60 "$WARP_NATIVE_URL" -o "$f" || ! bash -n "$f"; then
+            rm -f "$f"; echo "  [СБОЙ] не удалось скачать установщик warp-native"; return 1
+        fi
+        # Ответы установщику: язык — русский, лицензии WARP+ нет, watchdog — 5 мин
+        ui_step_status "warp-native: ставлю (wgcf, WireGuard, watchdog)"
+        printf '2\n\n1\n' | bash "$f" >>"$SETUP_LOG" 2>&1 || true
+        rm -f "$f"
+    fi
+    if ! warp_native_active; then
+        echo "  [СБОЙ] интерфейс warp не поднялся (см. $SETUP_LOG)"
+        return 1
+    fi
+    if warp_native_works; then
+        echo "  Готово: интерфейс warp работает, выход через Cloudflare (warp=on)."
+        echo "  В Xray: outbound freedom с sockopt.interface=\"warp\", mark 51888."
+        return 0
+    fi
+    echo "  [СБОЙ] интерфейс warp поднят, но трафик через него не выходит в Cloudflare"
+    return 1
+}
+
+psiphon_active() {
+    systemctl is-active --quiet vps-psiphon 2>/dev/null && return 0
+    return 1
+}
+
+# Адрес, на котором vps-psiphon опубликовал SOCKS: шлюз docker0 или 127.0.0.1
+psiphon_socks_addr() {
+    local a
+    a=$(ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -E ":${PSIPHON_PORT}\$" | head -1)
+    a="${a%:*}"
+    [[ -z "$a" || "$a" == "0.0.0.0" || "$a" == "*" ]] && a="127.0.0.1"
+    echo "$a"
+    return 0
+}
+
+comp_psiphon() {
+    echo ">>> Psiphon (SOCKS5 на порту $PSIPHON_PORT)..."
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "  [СБОЙ] Psiphon работает в контейнере, а docker не установлен"
+        return 1
+    fi
+    local region
+    region=$(echo "${PSIPHON_REGION:-}" | tr -d '[:space:]' | tr 'a-z' 'A-Z')
+    # Одна страна или пул через запятую: DE или DE,NL,FR
+    if [[ -n "$region" && ! "$region" =~ ^[A-Z]{2}(,[A-Z]{2})*$ ]]; then
+        echo "  [ВНИМАНИЕ] PSIPHON_REGION='$region' — не код страны (нужно, например, DE или DE,NL), беру страну сервера."
+        region=""
+    fi
+    if [[ -z "$region" ]]; then
+        region=$(node_country)
+        # vps-psiphon сам не выходит через RU (и ещё ряд стран): для таких
+        # серверов страну не задаём — Psiphon выберет выход сам
+        if [[ " RU BY IR SY CU KP CN VE " == *" $region "* ]]; then
+            echo "  Сервер в $region — выход в этой стране Psiphon запрещён, регион выберет сам."
+            region=""
+        fi
+    fi
+    if psiphon_active && [[ -z "${RH_FORCE:-}" ]]; then
+        echo "  Уже установлен и работает — не переустанавливаю."
+    else
+        local f args=(--no-http --bulk-test-mb 0)
+        [[ -n "$region" ]] && args+=(--region "$region")
+        f=$(mktemp)
+        if ! curl -fsSL --max-time 60 "$PSIPHON_URL" -o "$f" || ! bash -n "$f"; then
+            rm -f "$f"; echo "  [СБОЙ] не удалось скачать установщик vps-psiphon"; return 1
+        fi
+        echo "  Флаги: ${args[*]}"
+        ui_step_status "Psiphon: ставлю и жду первый туннель"
+        bash "$f" "${args[@]}" </dev/null >>"$SETUP_LOG" 2>&1 || true
+        rm -f "$f"
+    fi
+    # Порог скорости в вотчдоге отключаем: на части нод он ложно браковал выходы
+    if [[ -f /etc/default/vps-psiphon ]]; then
+        if grep -q '^MIN_THROUGHPUT_KBPS=' /etc/default/vps-psiphon; then
+            sed -i 's/^MIN_THROUGHPUT_KBPS=.*/MIN_THROUGHPUT_KBPS=0/' /etc/default/vps-psiphon
+        else
+            echo 'MIN_THROUGHPUT_KBPS=0' >> /etc/default/vps-psiphon
+        fi
+    fi
+    if ! psiphon_active; then
+        echo "  [СБОЙ] служба vps-psiphon не запущена (см. $SETUP_LOG)"
+        return 1
+    fi
+    local addr i
+    addr=$(psiphon_socks_addr)
+    for i in $(seq 1 12); do
+        ui_step_status "Psiphon: проверяю SOCKS $addr:$PSIPHON_PORT ($i/12)"
+        if curl -fsS --max-time 15 --socks5-hostname "$addr:$PSIPHON_PORT" \
+                https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^loc='; then
+            echo "  Готово: SOCKS5 $addr:$PSIPHON_PORT отвечает, регион ${region:-auto}."
+            return 0
+        fi
+        sleep 5
+    done
+    echo "  [СБОЙ] служба работает, но через SOCKS $addr:$PSIPHON_PORT ничего не открывается"
+    echo "         состояние: vps-psiphon; журнал: vps-psiphon logs"
+    return 1
+}
+
+# Из меню — переустановка по требованию, даже если уже работает
+comp_warp_native_menu() { local RH_FORCE=1; comp_warp_native; }
+comp_psiphon_menu()     { local RH_FORCE=1; comp_psiphon; }
+
+# Готовые outbound'ы Xray для тех выходов, что реально работают на этой ноде —
+# чтобы вставить в профиль ноды в панели, не вспоминая адреса и порты.
+# Теги — предложение, переименуйте под свои правила маршрутизации.
+egress_outbounds_json() {
+    local items=() addr
+    if ip link show warp >/dev/null 2>&1; then
+        items+=('{ "tag": "warp-native", "protocol": "freedom",
+    "settings": { "domainStrategy": "ForceIPv4" },
+    "streamSettings": { "sockopt": { "interface": "warp", "mark": 51888, "tcpFastOpen": true } } }')
+    fi
+    if ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qx "127.0.0.1:$WARP_PORT"; then
+        items+=('{ "tag": "warp-socks", "protocol": "socks",
+    "settings": { "servers": [ { "address": "127.0.0.1", "port": '"$WARP_PORT"' } ] } }')
+    fi
+    if systemctl is-active --quiet vps-psiphon 2>/dev/null; then
+        addr=$(psiphon_socks_addr)
+        items+=('{ "tag": "psiphon", "protocol": "socks",
+    "settings": { "servers": [ { "address": "'"$addr"'", "port": '"$PSIPHON_PORT"' } ] } }')
+    fi
+    [[ ${#items[@]} -eq 0 ]] && return 0
+    local i
+    echo "["
+    for i in "${!items[@]}"; do
+        printf '  %s' "${items[$i]}"
+        [[ $i -lt $(( ${#items[@]} - 1 )) ]] && echo "," || echo
+    done
+    echo "]"
+    return 0
+}
 
 # ===== lib/90-install.sh ===============================================
 # ##########################################################################
@@ -2813,14 +3518,20 @@ full_install() {
         if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
             DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
             SETUP_CF=""; CF_API_TOKEN=""; CF_PROXY_CHOICE=""
-            SETUP_SSH=""; SSH_PUBLIC_KEY=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
+            SETUP_SSH=""; SSH_PUBLIC_KEY=""; SSH_EXTRA_KEYS=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
+            AGENT_SSH_KEYS=""; GEODATA=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            REMNANODE_VERSION=""
             SSH_PORT="8422"; ADMIN_USER="admin"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""
         fi
     fi
     # --- сбор всех ответов заранее ---
     ui_section "Нода и панель"
-    ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
+    # Без || return 1 сбой ask_* потерялся бы: full_install вызывается из if,
+    # а там set -e не действует.
+    ask_domain || return 1; ask_panel_ip || return 1
+    ask_subdomain || return 1; ask_secret || return 1; ask_cf || return 1
+    ask_node_version
 
     ui_section "Доступ по SSH"
     ask_ssh_params
@@ -2828,10 +3539,22 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         ask_ssh_key
+        ask_extra_keys
+        ask_agent_key
 
         ui_section "Дополнительно"
         [[ -z "$INSTALL_WARP" ]]      && read -ep "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
         [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Установить Speedtest CLI? [y/N]: " INSTALL_SPEEDTEST
+        [[ -z "$INSTALL_WARP_NATIVE" ]] && read -ep "Установить warp-native (WARP интерфейсом warp)? [Y/n]: " INSTALL_WARP_NATIVE
+        [[ -z "$INSTALL_WARP_NATIVE" ]] && INSTALL_WARP_NATIVE="y"
+        [[ -z "$INSTALL_PSIPHON" ]]   && read -ep "Установить Psiphon (SOCKS5 на $PSIPHON_PORT)? [Y/n]: " INSTALL_PSIPHON
+        [[ -z "$INSTALL_PSIPHON" ]] && INSTALL_PSIPHON="y"
+        if [[ "$INSTALL_PSIPHON" =~ ^[Yy]$ && -z "$PSIPHON_REGION" ]]; then
+            read -ep "Страна выхода Psiphon, две буквы (Enter — страна сервера): " PSIPHON_REGION
+            PSIPHON_REGION=$(echo "$PSIPHON_REGION" | tr -d '[:space:]' | tr 'a-z' 'A-Z')
+        fi
+        [[ -z "$GEODATA" ]]           && read -ep "Geo-базы Loyalsoldier с ежедневным обновлением? [Y/n]: " GEODATA
+        [[ -z "$GEODATA" ]] && GEODATA="y"
 
         ui_section "Telegram-уведомления"
         [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [y/N]: " SETUP_TG
@@ -2845,6 +3568,7 @@ full_install() {
     sleep 1
 
     # --- выполнение (каждый шаг пишет результат в сводку) ---
+    RH_FULL_INSTALL=1
     do_step "Swap" comp_swap
     # Пакеты — фундамент. Без них не встанут ни нода, ни сертификат, ни fail2ban,
     # ни docker, и человек получает шесть сбоев по одной причине плюс отчёт,
@@ -2875,6 +3599,8 @@ full_install() {
         return 1
     fi
     do_step "Пользователь $ADMIN_USER" comp_user
+    [[ -n "${AGENT_SSH_KEYS:-}" ]] && do_step "Учётка ИИ-агента" comp_agent || skip_step "Учётка ИИ-агента (ключ не задан)"
+    do_step "Ключи сервера" comp_hostkeys
     do_step "Харденинг SSH" comp_ssh
     do_step "fail2ban" comp_fail2ban
     do_step "Автообновления безопасности" comp_autoupdates
@@ -2885,6 +3611,10 @@ full_install() {
     do_step "Защита диска (лог-ротация)" comp_disk
     [[ "$INSTALL_SPEEDTEST" =~ ^[Yy]$ ]] && do_step "Speedtest CLI" comp_speedtest || skip_step "Speedtest CLI"
     [[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && do_step "Cloudflare WARP" comp_warp || skip_step "Cloudflare WARP"
+    [[ "${INSTALL_WARP_NATIVE:-n}" =~ ^[Yy]$ ]] && do_step "warp-native" comp_warp_native || skip_step "warp-native"
+    [[ "${INSTALL_PSIPHON:-n}" =~ ^[Yy]$ ]] && do_step "Psiphon" comp_psiphon || skip_step "Psiphon"
+    # Базы — до ноды: тогда compose сразу пишется с томами
+    [[ "${GEODATA:-y}" =~ ^[Yy]$ ]] && do_step "Geo-базы (Loyalsoldier)" comp_geodata || skip_step "Geo-базы (Loyalsoldier)"
     do_step "Нода Remnanode" comp_node
     do_step "Веб (заглушка+сертификат+nginx)" comp_web
     [[ -n "$TG_ON" ]] && do_step "Telegram-уведомления" comp_telegram || skip_step "Telegram-уведомления"
@@ -2894,7 +3624,12 @@ full_install() {
         skip_step "Сторож панели (нода не дежурная)"
     fi
 
-    notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена ($(date '+%H:%M:%S %Z'))"
+    local fails; fails=$(ui_fail_count "${SUMMARY[@]}")
+    if [[ "$fails" -eq 0 ]]; then
+        notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена ($(date '+%H:%M:%S %Z'))"
+    else
+        notify_telegram "⚠️ Нода <code>${FULL_DOMAIN}</code> установлена с ошибками: $fails ($(date '+%H:%M:%S %Z')). Отчёт: $REPORT_FILE"
+    fi
 
     print_summary
 
@@ -2945,6 +3680,7 @@ repair_ssh_hardening() {
         return 0
     fi
 
+    sshd_rundir
     eff_root=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
     eff_pass=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
     eff_port=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
@@ -2990,14 +3726,11 @@ repair_nginx_default() {
 
 repair_perms() {
     local rc=0 f
-    if [[ -d /opt/remnanode ]]; then
-        chmod 700 /opt/remnanode || rc=1
-        [[ -f /opt/remnanode/docker-compose.yml ]] && { chmod 600 /opt/remnanode/docker-compose.yml || rc=1; }
-    fi
+    node_dir_perms || rc=1
     for f in "$SETUP_LOG" "$INSTALL_STATE" "$NOTIFY_ENV" "$PANEL_ENV" "$REPORT_FILE"; do
         [[ -f "$f" ]] && { chmod 600 "$f" || rc=1; }
     done
-    echo "  Права приведены к 600 (каталог ноды — 700)."
+    echo "  Права приведены к 600 (каталог ноды — 750 с группой docker)."
     return $rc
 }
 
@@ -3034,7 +3767,7 @@ repair_build_plan() {
     REPAIR_SKIPS=()
 
     repair_add repair_perms "Права на файлы с секретами" \
-        "chmod 600 на install.conf, notify.env, лог и отчёт; 700 на каталог ноды"
+        "chmod 600 на install.conf, notify.env, лог, отчёт и compose; каталог ноды — 750 с группой docker"
 
     if [[ -f "$SSH_HARDEN_FILE" ]]; then
         repair_add repair_ssh_hardening "Харденинг SSH" \
@@ -3354,7 +4087,12 @@ rh_check() {
     rhc_root=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
     rhc_pass=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
     if [[ -z "$rhc_root$rhc_pass" ]]; then
-        rhc_warn "не удалось прочитать настройки sshd (sshd -T) — sshd не установлен?"
+        if [[ ! -d /run/sshd ]] && systemctl is-active --quiet ssh.socket 2>/dev/null; then
+            # Диагностика ничего не меняет, поэтому каталог не создаём, а объясняем
+            rhc_warn "настройки sshd не прочитать: SSH запущен по требованию (ssh.socket), а без /run/sshd sshd -T не работает — это не поломка"
+        else
+            rhc_warn "не удалось прочитать настройки sshd (sshd -T) — sshd не установлен?"
+        fi
     else
         if [[ "$rhc_root" == "no" ]]; then
             rhc_ok "вход под root запрещён"
@@ -3381,6 +4119,38 @@ rh_check() {
         fi
     fi
 
+    # Учётки ИИ-агентов: узнаются по группе, а не по имени
+    local rhc_agents rhc_a
+    rhc_agents=$(getent group "$AGENT_GROUP" 2>/dev/null | cut -d: -f4 | tr ',' ' ')
+    if [[ -z "$rhc_agents" ]]; then
+        rhc_info "учёток ИИ-агентов нет"
+    fi
+    for rhc_a in $rhc_agents; do
+        rhc_home=$(getent passwd "$rhc_a" | cut -d: -f6)
+        rhc_keys=$(rhc_num "$(grep -cvE '^[[:space:]]*(#|$)' "$rhc_home/.ssh/authorized_keys" 2>/dev/null)")
+        if [[ "$rhc_keys" -eq 0 ]]; then
+            rhc_warn "учётка агента $rhc_a без ключей — войти в неё нельзя"
+        elif [[ -f "/etc/sudoers.d/91-agent-$rhc_a" ]]; then
+            rhc_ok "учётка ИИ-агента $rhc_a: ключей $rhc_keys, sudo есть"
+        else
+            rhc_warn "учётка ИИ-агента $rhc_a без sudo — чинить и ставить ничего не сможет"
+            rhc_fix "агент: меню, пункт 2 -> 24"
+        fi
+    done
+
+    # Ключи сервера от образа хостера (одинаковые у всех его серверов)
+    local rhc_f rhc_c rhc_tpl=""
+    for rhc_f in /etc/ssh/ssh_host_*_key.pub; do
+        [[ -e "$rhc_f" ]] || continue
+        rhc_c=$(awk '{print $3}' "$rhc_f"); rhc_c="${rhc_c#*@}"
+        [[ -z "$rhc_c" || "$rhc_c" == "$(hostname)" || "$rhc_c" == "$(hostname -s)" ]] && continue
+        rhc_tpl+=" $(basename "$rhc_f" .pub)"
+    done
+    if [[ -n "$rhc_tpl" && ! -f /etc/rabotahrista/hostkeys.done ]]; then
+        rhc_warn "ключи сервера, похоже, от образа хостера (подписаны чужим именем):$rhc_tpl"
+        rhc_fix "ключи сервера: полная установка перевыпустит их (шаг «Ключи сервера»)"
+    fi
+
     # ----------------------------------------------------------------------
     rhc_sect "Фаервол"
     # ----------------------------------------------------------------------
@@ -3401,6 +4171,39 @@ rh_check() {
             rhc_bad "порт ноды $rhc_np не открыт — панель не достучится"
             rhc_fix "ufw: меню, пункт 2 -> 5"
         fi
+        # TCP-порты, которые слушает ядро ноды на всех адресах, но которых нет в
+        # ufw: клиенты на них не достучатся. Только TCP: UDP-сокеты ядро держит
+        # и для исходящих соединений на случайных портах, и отличить по ним
+        # входящий порт (Hysteria2) от исходящего снаружи нельзя.
+        local rhc_l rhc_closed=""
+        while read -r rhc_l; do
+            [[ -z "$rhc_l" ]] && continue
+            ufw status 2>/dev/null | grep -qE "^${rhc_l}([[:space:]]|$)" && continue
+            # ufw allow 443 (без протокола) открывает и tcp, и udp
+            ufw status 2>/dev/null | grep -qE "^${rhc_l%/*}([[:space:]]|$)" && continue
+            rhc_closed+=" $rhc_l"
+        done < <(ss -H -lntp 2>/dev/null | sed 's/^/tcp /' | grep -E 'users:\(\("(rw-core|xray)"' \
+                 | awk '$5 ~ /^(0\.0\.0\.0|\*|\[::\]):/ {split($5,a,":"); print a[length(a)] "/" $1}' | sort -u)
+        if [[ -n "$rhc_closed" ]]; then
+            rhc_warn "ядро ноды слушает TCP-порты, закрытые фаерволом:$rhc_closed — клиенты на них не подключатся"
+            rhc_fix "ufw: sudo ufw allow <порт>/<tcp|udp> (учтите: шаг UFW при переустановке сбросит ручные правила)"
+        fi
+        # Заполненность таблицы соединений: при переполнении ядро молча
+        # отбрасывает новые подключения клиентов
+        local rhc_ct rhc_ctmax
+        rhc_ct=$(rhc_num "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)")
+        rhc_ctmax=$(rhc_num "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)")
+        if [[ "$rhc_ctmax" -gt 0 ]]; then
+            if (( rhc_ct * 100 / rhc_ctmax >= 80 )); then
+                rhc_bad "таблица соединений заполнена на $(( rhc_ct * 100 / rhc_ctmax ))% ($rhc_ct из $rhc_ctmax) — скоро начнутся отказы клиентам"
+                rhc_fix "conntrack: меню, пункт 2 -> 6 (Sysctl-тюнинг поднимет лимит)"
+            elif [[ "$rhc_ctmax" -lt 262144 ]]; then
+                rhc_warn "лимит таблицы соединений $rhc_ctmax (занято $rhc_ct) — для VPN-ноды мало"
+                rhc_fix "conntrack: меню, пункт 2 -> 6 (Sysctl-тюнинг)"
+            else
+                rhc_ok "таблица соединений: занято $rhc_ct из $rhc_ctmax"
+            fi
+        fi
         rhc_ipv6=$(grep -E '^IPV6=' /etc/default/ufw 2>/dev/null | cut -d= -f2)
         if [[ -d /proc/sys/net/ipv6 ]]; then
             if [[ "$rhc_ipv6" == "yes" ]]; then
@@ -3420,7 +4223,7 @@ rh_check() {
     local rhc_banned
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
         if fail2ban-client status sshd >/dev/null 2>&1; then
-            rhc_banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/{print $2}' | tr -d ' ')
+            rhc_banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/{print $2}' | tr -d '[:space:]')
             rhc_ok "fail2ban работает, джейл sshd активен (забанено сейчас: ${rhc_banned:-0})"
         else
             rhc_bad "fail2ban запущен, но джейл sshd НЕ поднялся — брутфорс никто не блокирует"
@@ -3474,6 +4277,58 @@ rh_check() {
                 rhc_warn "$ADMIN_USER не в группе docker — docker ps ответит permission denied"
                 rhc_fix "docker: меню, пункт 4 (починка); применится в новой сессии SSH"
             fi
+        fi
+
+        # Geo-базы: свои (Loyalsoldier, обновляются cron) или встроенные в образ
+        local rhc_age f
+        if grep -q "$GEODATA_DIR/geosite.dat" "$rhc_compose" 2>/dev/null; then
+            for f in geoip.dat geosite.dat; do
+                if [[ ! -s "$GEODATA_DIR/$f" ]]; then
+                    rhc_bad "в compose подключён $GEODATA_DIR/$f, а файла нет — Xray не стартует"
+                    rhc_fix "geo-базы: меню, пункт 2 -> 25"
+                    continue
+                fi
+                rhc_age=$(( ( $(date +%s) - $(stat -c %Y "$GEODATA_DIR/$f") ) / 86400 ))
+                if [[ "$rhc_age" -gt 7 ]]; then
+                    rhc_warn "$f не обновлялся $rhc_age дн. — смотри /var/log/rh-geodata.log"
+                else
+                    rhc_ok "$f свежий (обновлён $rhc_age дн. назад)"
+                fi
+            done
+            if [[ -f "$GEODATA_CRON" && -x "$GEODATA_BIN" ]]; then
+                rhc_ok "ежедневное обновление geo-баз включено"
+            else
+                rhc_warn "geo-базы подключены, но ежедневного обновления нет"
+                rhc_fix "geo-базы: меню, пункт 2 -> 25"
+            fi
+        else
+            rhc_info "geo-базы: встроенные в образ ноды (свои не подключены)"
+        fi
+
+        # Выходы для Xray: warp-native (интерфейс warp) и Psiphon (SOCKS)
+        if [[ -d /opt/warp-native ]] || systemctl cat wg-quick@warp >/dev/null 2>&1; then
+            if ip link show warp >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@warp; then
+                if curl -fsS --max-time 10 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
+                    rhc_ok "warp-native: интерфейс warp работает (warp=on)"
+                else
+                    rhc_warn "warp-native: интерфейс warp поднят, но выход не через Cloudflare"
+                fi
+            else
+                rhc_bad "warp-native установлен, но интерфейс warp не работает"
+                rhc_fix "warp-native: меню, пункт 2 -> 26"
+            fi
+        else
+            rhc_info "warp-native не установлен"
+        fi
+        if [[ -f /etc/default/vps-psiphon ]]; then
+            if systemctl is-active --quiet vps-psiphon && rhc_hasport "$PSIPHON_PORT"; then
+                rhc_ok "Psiphon работает, SOCKS на порту $PSIPHON_PORT"
+            else
+                rhc_bad "Psiphon установлен, но служба или порт $PSIPHON_PORT не работают"
+                rhc_fix "Psiphon: меню, пункт 2 -> 27; состояние: vps-psiphon"
+            fi
+        else
+            rhc_info "Psiphon не установлен"
         fi
     else
         rhc_bad "docker не установлен"
@@ -3730,6 +4585,18 @@ menu_step() {
     return 0
 }
 
+# Передеплой из меню — с вопросом о версии: так ноду и откатывают, и возвращают
+comp_node_menu() {
+    ask_node_version
+    comp_node
+}
+
+# Из меню ключ спрашиваем на месте: в полной установке его спросили заранее
+comp_agent_menu() {
+    ask_agent_key
+    comp_agent
+}
+
 # Пункт 8 делает два шага подряд — оборачиваем, чтобы тоже шло через menu_step
 comp_user_and_ssh() { comp_user && comp_ssh; }
 
@@ -3770,7 +4637,9 @@ components_menu() {
         echo "--- Безопасность / обслуживание ---"
         echo "11) Telegram-уведомления  12) fail2ban       13) Автообновления"
         echo "21) Сторож панели вкл.    22) Сторож панели выкл."
-        echo "23) Сменить домен ноды"
+        echo "23) Сменить домен ноды      24) Учётка ИИ-агента"
+        echo "25) Geo-базы Loyalsoldier + ежедневное обновление"
+        echo "26) warp-native (WARP интерфейсом)  27) Psiphon (SOCKS5)"
         echo "14) Защита диска          15) Обновить ноду  16) Статус ноды"
         echo "20) Обновить систему (apt upgrade + перезагрузка)"
         echo "--- Диагностика ---"
@@ -3780,7 +4649,7 @@ components_menu() {
         case "$c" in
              1) menu_step "Cloudflare WARP"      comp_warp ;;
              2) menu_step "Docker"               comp_docker ;;
-             3) menu_step "Нода (передеплой)"    comp_node ;;
+             3) menu_step "Нода (передеплой)"    comp_node_menu ;;
              4) menu_step "Веб (серт + конфиг nginx)" comp_web_menu ;;
              5) menu_step "UFW"                  comp_ufw ;;
              6) menu_step "Sysctl-тюнинг"        comp_sysctl ;;
@@ -3801,6 +4670,10 @@ components_menu() {
             21) menu_step "Сторож панели"        comp_panel_watch ;;
             22) menu_step "Отключение сторожа"   comp_panel_watch_off ;;
             23) menu_step "Смена домена ноды"     comp_change_domain ;;
+            24) menu_step "Учётка ИИ-агента"      comp_agent_menu ;;
+            25) menu_step "Geo-базы"              comp_geodata ;;
+            26) menu_step "warp-native"           comp_warp_native_menu ;;
+            27) menu_step "Psiphon"               comp_psiphon_menu ;;
              0) return ;;
              *) echo "Нет такого пункта." ;;
         esac

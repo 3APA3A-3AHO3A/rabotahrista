@@ -48,6 +48,9 @@ comp_user() {
     grep -qxF "$SSH_PUBLIC_KEY" "$H/.ssh/authorized_keys" || echo "$SSH_PUBLIC_KEY" >> "$H/.ssh/authorized_keys"
     chmod 600 "$H/.ssh/authorized_keys"
     chown -R "$ADMIN_USER:$ADMIN_USER" "$H/.ssh"
+    # Дополнительные ключи. Кривой пропускаем с предупреждением, а не роняем
+    # установку: вход уже обеспечен основным ключом.
+    [[ -n "${SSH_EXTRA_KEYS:-}" ]] && { add_keys_to_user "$ADMIN_USER" "$SSH_EXTRA_KEYS" || true; }
 
     [[ -s "$H/.ssh/authorized_keys" ]] || { echo "  [СБОЙ] authorized_keys пуст"; return 1; }
     echo "Пользователь готов."
@@ -134,6 +137,11 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 UsePAM yes
+# Ноде не нужен проброс графики; 3 попытки и 30 секунд на вход — меньше
+# простора для перебора и висящих неавторизованных соединений
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 30
 EOF
     chmod 644 "$SSH_HARDEN_FILE"
     # Облачные образы включают вход по паролю своими дроп-инами. Наш файл сортируется
@@ -143,6 +151,7 @@ EOF
 
     ssh_neutralize_conflicts
 
+    sshd_rundir
     sshd -t || {
         echo "  [СБОЙ] sshd -t не прошёл — убираю свой файл, SSH не трогаю"
         rm -f "$SSH_HARDEN_FILE"
@@ -248,6 +257,7 @@ comp_ufw() {
         for p in $ssh_ports; do ufw limit "$p/tcp" comment 'SSH Rate Limit'; done
         ufw allow 80/tcp comment 'HTTP'
         ufw allow 443/tcp comment 'HTTPS'
+        ufw allow 443/udp comment 'QUIC / Hysteria2'
         ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'API panel'
         ufw --force enable
     } >>"$SETUP_LOG" 2>&1
@@ -256,7 +266,7 @@ comp_ufw() {
 comp_fail2ban() {
     echo ">>> Настройка fail2ban..."
     # python3-systemd нужен для backend=systemd ниже; без него джейл sshd молча не стартует
-    apt-get install -y fail2ban python3-systemd >>"$SETUP_LOG" 2>&1 || true
+    apt-get "${APT_WAIT[@]}" install -y fail2ban python3-systemd >>"$SETUP_LOG" 2>&1 || true
     cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime  = 1h
@@ -290,4 +300,145 @@ EOF
     done
     echo "  [СБОЙ] джейл sshd в fail2ban не поднялся за 30 сек (см. $SETUP_LOG)"
     return 1
+}
+
+# Добавляет в authorized_keys учётки ключи из многострочной переменной: по
+# одному на строку, пустые и закомментированные строки пропускаются, кривые —
+# с предупреждением. Возвращает 0, если в файле есть хотя бы один ключ.
+add_keys_to_user() {
+    local user="$1" keys="$2" H k
+    H=$(getent passwd "$user" | cut -d: -f6)
+    [[ -n "$H" ]] || return 1
+    install -d -m 700 -o "$user" -g "$user" "$H/.ssh"
+    touch "$H/.ssh/authorized_keys"
+    while IFS= read -r k; do
+        k=$(echo "$k" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$k" || "$k" == \#* ]] && continue
+        if ssh_key_valid "$k"; then
+            grep -qxF "$k" "$H/.ssh/authorized_keys" || echo "$k" >> "$H/.ssh/authorized_keys"
+        else
+            echo "  [!] Строка не похожа на SSH-ключ, пропущена: ${k:0:40}..."
+        fi
+    done <<< "$keys"
+    chmod 600 "$H/.ssh/authorized_keys"
+    chown -R "$user:$user" "$H/.ssh"
+    [[ -s "$H/.ssh/authorized_keys" ]] && return 0
+    return 1
+}
+
+# Учётка ИИ-агента. Без пароля (вход только по ключу), sudo без пароля — агент
+# ставит и чинит то же, что и человек. Узнаётся по группе $AGENT_GROUP: по ней
+# уведомление о входе пишет «ИИ-агент», а не обычный вход. Файл sudoers назван
+# 91-agent-*, а не 90-*: по 90-* установщик находит админ-учётку человека.
+comp_agent() {
+    validate_agent_params
+    if [[ -z "${AGENT_SSH_KEYS:-}" ]]; then
+        echo "  Ключ агента не задан (AGENT_SSH_KEYS) — учётку не создаю."
+        return 0
+    fi
+    echo ">>> Учётка ИИ-агента $AGENT_USER..."
+    getent group "$AGENT_GROUP" >/dev/null 2>&1 || groupadd "$AGENT_GROUP"
+    if ! id "$AGENT_USER" &>/dev/null; then
+        adduser --disabled-password --gecos "AI agent (rabotahrista)" "$AGENT_USER" >>"$SETUP_LOG" 2>&1
+    fi
+    usermod -aG "$AGENT_GROUP" "$AGENT_USER"
+    getent group docker >/dev/null 2>&1 && usermod -aG docker "$AGENT_USER"
+
+    local sf="/etc/sudoers.d/91-agent-$AGENT_USER"
+    echo "$AGENT_USER ALL=(ALL) NOPASSWD:ALL" > "$sf"
+    chmod 440 "$sf"
+    if ! visudo -c >/dev/null 2>>"$SETUP_LOG"; then
+        echo "  [СБОЙ] sudoers не проходит проверку — убираю файл агента"
+        rm -f "$sf"
+        return 1
+    fi
+    if ! add_keys_to_user "$AGENT_USER" "$AGENT_SSH_KEYS"; then
+        echo "  [СБОЙ] у $AGENT_USER не оказалось ни одного рабочего ключа"
+        return 1
+    fi
+    echo "  Готово: вход ssh -p $SSH_PORT $AGENT_USER@сервер, sudo без пароля."
+    return 0
+}
+
+# Ключи сервера, доставшиеся от образа хостера.
+#
+# Пример с живого сервера: ключи RSA и DSA были подписаны root@ns31561980 —
+# именем машины, на которой собирали образ. Значит, у всех серверов из этого
+# образа они одинаковые, и любой такой сервер может выдать себя за ваш.
+# Признак — имя хоста в подписи ключа не совпадает с именем этого сервера.
+# Делается один раз за жизнь сервера (метка в /etc/rabotahrista): иначе после
+# смены hostname ключи перевыпускались бы при каждом запуске.
+comp_hostkeys() {
+    local marker="/etc/rabotahrista/hostkeys.done" f c bad="" stamp hn
+    if [[ -f "$marker" ]]; then
+        echo "  Ключи сервера уже проверялись — не трогаю."
+        return 0
+    fi
+    mkdir -p "$(dirname "$marker")"
+    hn=$(hostname)
+    for f in /etc/ssh/ssh_host_*_key.pub; do
+        [[ -e "$f" ]] || continue
+        c=$(awk '{print $3}' "$f"); c="${c#*@}"
+        [[ -z "$c" || "$c" == "$hn" || "$c" == "${hn%%.*}" ]] && continue
+        bad+=" $(basename "$f" .pub)(${c})"
+    done
+    if [[ -z "$bad" ]]; then
+        echo "  Ключи сервера выпущены на этом сервере — менять не нужно."
+        touch "$marker"
+        return 0
+    fi
+    echo ">>> Ключи сервера достались от образа хостера:$bad"
+    echo "    У всех серверов из этого образа они одинаковые — выпускаю свои."
+    stamp=$(date +%Y%m%d%H%M%S)
+    mkdir -p "$RH_BACKUP_DIR/ssh-hostkeys.$stamp"
+    cp -a /etc/ssh/ssh_host_* "$RH_BACKUP_DIR/ssh-hostkeys.$stamp/"
+    chmod 700 "$RH_BACKUP_DIR/ssh-hostkeys.$stamp"
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -A >>"$SETUP_LOG" 2>&1 || true
+    if [[ ! -s /etc/ssh/ssh_host_ed25519_key ]]; then
+        echo "  [СБОЙ] новые ключи не создались — возвращаю прежние"
+        cp -a "$RH_BACKUP_DIR/ssh-hostkeys.$stamp/"ssh_host_* /etc/ssh/
+        return 1
+    fi
+    touch "$marker"
+    # Уже открытые сессии не рвутся; новые подключения видят новые ключи
+    systemctl try-restart ssh >>"$SETUP_LOG" 2>&1 || true
+    echo "  Готово, прежние ключи — в $RH_BACKUP_DIR/ssh-hostkeys.$stamp"
+    echo "  Новые отпечатки (при первом входе ssh спросит подтверждение):"
+    for f in /etc/ssh/ssh_host_*_key.pub; do
+        ssh-keygen -lf "$f" 2>/dev/null | awk '{print "    " $2 "  " $NF}'
+    done
+    return 0
+}
+
+# Отпечаток ключа сервера ED25519 — тот, что ssh покажет при первом входе
+hostkey_fingerprint() {
+    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $2}'
+    return 0
+}
+
+# Готовый профиль для ssh-mcp (config.toml) — входить агентом, а если учётки
+# агента нет, то админ-учёткой. Хост — IP, а не домен: за оранжевым облаком
+# Cloudflare домен ведёт на Cloudflare, и SSH по нему не пройдёт.
+ssh_mcp_profile() {
+    local user="$ADMIN_USER" fp name
+    if [[ -n "${AGENT_USER:-}" ]] && id "$AGENT_USER" &>/dev/null \
+       && id -nG "$AGENT_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$AGENT_GROUP"; then
+        user="$AGENT_USER"
+    fi
+    fp=$(hostkey_fingerprint)
+    name="${SUBDOMAIN:-$(hostname -s)}"
+    cat <<EOF
+[[profiles]]
+name = "$name"
+host = "${SERVER_IP:-IP_СЕРВЕРА}"
+port = $SSH_PORT
+user = "$user"
+auth = "key"
+keyRef = 'C:\Users\ВАШ_ПОЛЬЗОВАТЕЛЬ\.ssh\КЛЮЧ_АГЕНТА'
+role = "admin"
+approvalPolicy = "auto"
+trustedHostKey = "${fp:-неизвестен}"
+EOF
+    return 0
 }

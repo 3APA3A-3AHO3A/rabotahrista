@@ -34,6 +34,9 @@ trap 'rh_on_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # === НАСТРОЙКИ ===
 INDEX_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/index.html"
+# Откуда скачивать сам установщик. Нужен, когда он запущен через bash <(curl ...):
+# такой «файл» — временный канал, и перезапустить себя внутри tmux по нему нельзя.
+SETUP_URL="https://raw.githubusercontent.com/3APA3A-3AHO3A/rabotahrista/main/setup.sh"
 NOTIFY_ENV="/etc/rabotahrista/notify.env"
 INSTALL_STATE="/etc/rabotahrista/install.conf"
 PANEL_ENV="/etc/rabotahrista/panel.env"
@@ -66,13 +69,29 @@ NGINX_MARK="# rabotahrista: конфиг ноды, перезаписывает�
 SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/01-hardening.conf"
 NODE_PORT="2222"        # порт, на который к ноде ходит панель
 WARP_PORT="6000"        # локальный прокси-порт Cloudflare WARP
+PSIPHON_PORT="1080"     # SOCKS5 Psiphon (vps-psiphon), им пользуется Xray ноды
+# Сторонние установщики выходов — прямо из их репозиториев на GitHub
+WARP_NATIVE_URL="https://raw.githubusercontent.com/distillium/warp-native/main/install.sh"
+PSIPHON_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
+# Geo-базы для Xray внутри ноды (Loyalsoldier) и их ежедневное обновление
+GEODATA_DIR="/opt/remnanode/geodata"
+GEODATA_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+GEODATA_BIN="/usr/local/bin/rh-geodata-update.sh"
+GEODATA_CRON="/etc/cron.d/rh-geodata"
+# Группа, по которой скрипт узнаёт учётки ИИ-агентов (Claude и др. через MCP):
+# по ней уведомление о входе пишет «вход ИИ-агента», а не обычный вход.
+AGENT_GROUP="rh-agents"
 # apt с версии 2.0 умеет сам ждать освобождения блокировки dpkg. Без этого на
 # свежем сервере установщик встречался с первым после загрузки
 # unattended-upgrades, падал на первой же команде — и за ним рушилось всё,
 # что зависит от пакетов: нода, сертификат, fail2ban, docker.
-APT_WAIT=(-o DPkg::Lock::Timeout=600)
+# confdef/confold: если файл настроек пакета менялся (sshd_config, например),
+# dpkg не спрашивает «чей оставить», а оставляет наш. Без этого обновление
+# без терминала падало на вопросе, на который некому ответить.
+APT_WAIT=(-o DPkg::Lock::Timeout=600
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 # Пакеты из apt — один список на установку и на отчёт о версиях
-APT_PACKAGES="sudo curl wget unzip git tmux ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
+APT_PACKAGES="sudo curl wget unzip git tmux cron ufw fail2ban python3-systemd socat jq certbot python3-certbot-nginx nginx dnsutils chrony iproute2 iperf3 btop ncdu"
 # =================
 
 # RH_LIB_ONLY=1 — загрузить только функции, ничего не выполняя (используется тестами)

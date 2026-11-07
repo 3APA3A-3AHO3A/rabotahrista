@@ -22,14 +22,20 @@ full_install() {
         if [[ "$USE_SAVED" =~ ^[Nn]$ ]]; then
             DOMAIN=""; SUBDOMAIN=""; PANEL_IP=""; REMNA_SECRET=""
             SETUP_CF=""; CF_API_TOKEN=""; CF_PROXY_CHOICE=""
-            SETUP_SSH=""; SSH_PUBLIC_KEY=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
+            SETUP_SSH=""; SSH_PUBLIC_KEY=""; SSH_EXTRA_KEYS=""; INSTALL_WARP=""; INSTALL_SPEEDTEST=""
+            AGENT_SSH_KEYS=""; GEODATA=""; INSTALL_WARP_NATIVE=""; INSTALL_PSIPHON=""; PSIPHON_REGION=""
+            REMNANODE_VERSION=""
             SSH_PORT="8422"; ADMIN_USER="admin"
             SETUP_TG=""; TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_TOPIC_ID=""
         fi
     fi
     # --- сбор всех ответов заранее ---
     ui_section "Нода и панель"
-    ask_domain; ask_panel_ip; ask_subdomain; ask_secret; ask_cf
+    # Без || return 1 сбой ask_* потерялся бы: full_install вызывается из if,
+    # а там set -e не действует.
+    ask_domain || return 1; ask_panel_ip || return 1
+    ask_subdomain || return 1; ask_secret || return 1; ask_cf || return 1
+    ask_node_version
 
     ui_section "Доступ по SSH"
     ask_ssh_params
@@ -37,10 +43,22 @@ full_install() {
 
     if [[ -z "$NONINTERACTIVE" ]]; then
         ask_ssh_key
+        ask_extra_keys
+        ask_agent_key
 
         ui_section "Дополнительно"
         [[ -z "$INSTALL_WARP" ]]      && read -ep "Установить Cloudflare WARP? [y/N]: " INSTALL_WARP
         [[ -z "$INSTALL_SPEEDTEST" ]] && read -ep "Установить Speedtest CLI? [y/N]: " INSTALL_SPEEDTEST
+        [[ -z "$INSTALL_WARP_NATIVE" ]] && read -ep "Установить warp-native (WARP интерфейсом warp)? [Y/n]: " INSTALL_WARP_NATIVE
+        [[ -z "$INSTALL_WARP_NATIVE" ]] && INSTALL_WARP_NATIVE="y"
+        [[ -z "$INSTALL_PSIPHON" ]]   && read -ep "Установить Psiphon (SOCKS5 на $PSIPHON_PORT)? [Y/n]: " INSTALL_PSIPHON
+        [[ -z "$INSTALL_PSIPHON" ]] && INSTALL_PSIPHON="y"
+        if [[ "$INSTALL_PSIPHON" =~ ^[Yy]$ && -z "$PSIPHON_REGION" ]]; then
+            read -ep "Страна выхода Psiphon, две буквы (Enter — страна сервера): " PSIPHON_REGION
+            PSIPHON_REGION=$(echo "$PSIPHON_REGION" | tr -d '[:space:]' | tr 'a-z' 'A-Z')
+        fi
+        [[ -z "$GEODATA" ]]           && read -ep "Geo-базы Loyalsoldier с ежедневным обновлением? [Y/n]: " GEODATA
+        [[ -z "$GEODATA" ]] && GEODATA="y"
 
         ui_section "Telegram-уведомления"
         [[ -z "$SETUP_TG" && -z "$TG_BOT_TOKEN" ]] && read -ep "Настроить Telegram-уведомления? [y/N]: " SETUP_TG
@@ -54,6 +72,7 @@ full_install() {
     sleep 1
 
     # --- выполнение (каждый шаг пишет результат в сводку) ---
+    RH_FULL_INSTALL=1
     do_step "Swap" comp_swap
     # Пакеты — фундамент. Без них не встанут ни нода, ни сертификат, ни fail2ban,
     # ни docker, и человек получает шесть сбоев по одной причине плюс отчёт,
@@ -84,6 +103,8 @@ full_install() {
         return 1
     fi
     do_step "Пользователь $ADMIN_USER" comp_user
+    [[ -n "${AGENT_SSH_KEYS:-}" ]] && do_step "Учётка ИИ-агента" comp_agent || skip_step "Учётка ИИ-агента (ключ не задан)"
+    do_step "Ключи сервера" comp_hostkeys
     do_step "Харденинг SSH" comp_ssh
     do_step "fail2ban" comp_fail2ban
     do_step "Автообновления безопасности" comp_autoupdates
@@ -94,6 +115,10 @@ full_install() {
     do_step "Защита диска (лог-ротация)" comp_disk
     [[ "$INSTALL_SPEEDTEST" =~ ^[Yy]$ ]] && do_step "Speedtest CLI" comp_speedtest || skip_step "Speedtest CLI"
     [[ "$INSTALL_WARP" =~ ^[Yy]$ ]] && do_step "Cloudflare WARP" comp_warp || skip_step "Cloudflare WARP"
+    [[ "${INSTALL_WARP_NATIVE:-n}" =~ ^[Yy]$ ]] && do_step "warp-native" comp_warp_native || skip_step "warp-native"
+    [[ "${INSTALL_PSIPHON:-n}" =~ ^[Yy]$ ]] && do_step "Psiphon" comp_psiphon || skip_step "Psiphon"
+    # Базы — до ноды: тогда compose сразу пишется с томами
+    [[ "${GEODATA:-y}" =~ ^[Yy]$ ]] && do_step "Geo-базы (Loyalsoldier)" comp_geodata || skip_step "Geo-базы (Loyalsoldier)"
     do_step "Нода Remnanode" comp_node
     do_step "Веб (заглушка+сертификат+nginx)" comp_web
     [[ -n "$TG_ON" ]] && do_step "Telegram-уведомления" comp_telegram || skip_step "Telegram-уведомления"
@@ -103,7 +128,12 @@ full_install() {
         skip_step "Сторож панели (нода не дежурная)"
     fi
 
-    notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена ($(date '+%H:%M:%S %Z'))"
+    local fails; fails=$(ui_fail_count "${SUMMARY[@]}")
+    if [[ "$fails" -eq 0 ]]; then
+        notify_telegram "🚀 Нода <code>${FULL_DOMAIN}</code> установлена ($(date '+%H:%M:%S %Z'))"
+    else
+        notify_telegram "⚠️ Нода <code>${FULL_DOMAIN}</code> установлена с ошибками: $fails ($(date '+%H:%M:%S %Z')). Отчёт: $REPORT_FILE"
+    fi
 
     print_summary
 

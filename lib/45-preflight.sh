@@ -165,8 +165,23 @@ rh_session_guard() {
         return 0
     fi
 
+    # bash <(curl ...) — «файл» здесь временный канал /dev/fd/NN. Сервер tmux
+    # его не унаследует, и установка внутри tmux не стартовала вовсе (проверено
+    # на сервере). Поэтому в таком случае сохраняем установщик в файл.
+    local self="$0"
+    if [[ ! -f "$self" ]]; then
+        self="/root/rabotahrista-setup.sh"
+        if ! curl -fsSL --max-time 60 "$SETUP_URL" -o "$self" 2>/dev/null || ! bash -n "$self" 2>/dev/null; then
+            rm -f "$self"
+            ui_warn "не смог сохранить установщик в файл — работаю без tmux"
+            ui_info "не закрывайте окно до конца установки"
+            return 0
+        fi
+        chmod 700 "$self"
+    fi
+
     local cmd a
-    cmd="bash $(printf '%q' "$0")"
+    cmd="bash $(printf '%q' "$self")"
     for a in "$@"; do cmd+=" $(printf '%q' "$a")"; done
     # После выхода скрипта окно не закрываем: иначе итоговый отчёт с паролем
     # учётки мелькнёт и исчезнет вместе с сессией.

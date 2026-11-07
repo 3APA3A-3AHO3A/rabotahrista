@@ -27,6 +27,7 @@ repair_ssh_hardening() {
         return 0
     fi
 
+    sshd_rundir
     eff_root=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
     eff_pass=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
     eff_port=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
@@ -72,14 +73,11 @@ repair_nginx_default() {
 
 repair_perms() {
     local rc=0 f
-    if [[ -d /opt/remnanode ]]; then
-        chmod 700 /opt/remnanode || rc=1
-        [[ -f /opt/remnanode/docker-compose.yml ]] && { chmod 600 /opt/remnanode/docker-compose.yml || rc=1; }
-    fi
+    node_dir_perms || rc=1
     for f in "$SETUP_LOG" "$INSTALL_STATE" "$NOTIFY_ENV" "$PANEL_ENV" "$REPORT_FILE"; do
         [[ -f "$f" ]] && { chmod 600 "$f" || rc=1; }
     done
-    echo "  Права приведены к 600 (каталог ноды — 700)."
+    echo "  Права приведены к 600 (каталог ноды — 750 с группой docker)."
     return $rc
 }
 
@@ -116,7 +114,7 @@ repair_build_plan() {
     REPAIR_SKIPS=()
 
     repair_add repair_perms "Права на файлы с секретами" \
-        "chmod 600 на install.conf, notify.env, лог и отчёт; 700 на каталог ноды"
+        "chmod 600 на install.conf, notify.env, лог, отчёт и compose; каталог ноды — 750 с группой docker"
 
     if [[ -f "$SSH_HARDEN_FILE" ]]; then
         repair_add repair_ssh_hardening "Харденинг SSH" \

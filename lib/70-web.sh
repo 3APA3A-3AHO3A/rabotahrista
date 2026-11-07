@@ -146,6 +146,8 @@ nginx_render_site() {
 server {
     listen 80;
     server_name $dom;
+    # Версию nginx и ОС не показываем: лишний отпечаток для того, кто щупает ноду
+    server_tokens off;
 
     location /.well-known/acme-challenge/ {
         root /var/lib/letsencrypt/;
@@ -167,6 +169,7 @@ EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol default_server;
     server_name _;
+    server_tokens off;
     ssl_reject_handshake on;
 }
 EOF
@@ -177,6 +180,7 @@ EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name $dom;
+    server_tokens off;
 
     ssl_certificate ${LE_LIVE}/$dom/fullchain.pem;
     ssl_certificate_key ${LE_LIVE}/$dom/privkey.pem;

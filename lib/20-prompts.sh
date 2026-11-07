@@ -6,6 +6,7 @@
 ask_domain() {
     DOMAIN=$(echo "${DOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] DOMAIN в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите основной домен (например, domain.com): " DOMAIN
         DOMAIN=$(echo "$DOMAIN" | tr -d '[:space:]')
         [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Только буквы, цифры, точки и дефисы."
@@ -16,6 +17,7 @@ ask_domain() {
 ask_subdomain() {
     SUBDOMAIN=$(echo "${SUBDOMAIN:-}" | tr -d '[:space:]')
     while [[ ! "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] SUBDOMAIN в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите имя ноды/субдомена (например, node-nl-1): " SUBDOMAIN
         SUBDOMAIN=$(echo "$SUBDOMAIN" | tr -d '[:space:]')
         [[ "$SUBDOMAIN" =~ ^[a-zA-Z0-9-]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Только буквы, цифры и дефисы (без точек)."
@@ -26,6 +28,7 @@ ask_subdomain() {
 ask_panel_ip() {
     PANEL_IP=$(echo "${PANEL_IP:-}" | tr -d '[:space:]')
     while [[ ! "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] PANEL_IP в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите IP-адрес мастер-панели (для UFW): " PANEL_IP
         PANEL_IP=$(echo "$PANEL_IP" | tr -d '[:space:]')
         [[ "$PANEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || echo -e "\e[31m[Ошибка]\e[0m Введите корректный IPv4."
@@ -36,6 +39,7 @@ ask_panel_ip() {
 ask_secret() {
     REMNA_SECRET=$(echo "${REMNA_SECRET:-}" | tr -d '[:space:]')
     while [[ -z "$REMNA_SECRET" ]]; do
+        [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] REMNA_SECRET в конфиге не задан или некорректен"; return 1; }
         read -ep "Введите SECRET_KEY для Remnanode: " REMNA_SECRET
         REMNA_SECRET=$(echo "$REMNA_SECRET" | tr -d '[:space:]')
     done
@@ -66,6 +70,93 @@ ask_ssh_key() {
         fi
         [[ -n "$NONINTERACTIVE" ]] && { echo "  [СБОЙ] SSH_PUBLIC_KEY в конфиге некорректен"; return 1; }
         read -ep "Публичный SSH-ключ (ssh-ed25519 AAA...): " SSH_PUBLIC_KEY
+    done
+    return 0
+}
+
+# Дополнительные ключи той же учётке: второй компьютер, коллега, Claude.
+# Хранятся в SSH_EXTRA_KEYS по одному на строку. Основной ключ остаётся
+# обязательным, эти — по желанию; спрашиваем, только если их ещё нет.
+ask_extra_keys() {
+    [[ -n "$NONINTERACTIVE" || -n "${SSH_EXTRA_KEYS:-}" ]] && return 0
+    local k
+    while true; do
+        read -ep "Ещё один публичный ключ для этой учётки (Enter — не нужно): " k || k=""
+        k=$(echo "$k" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$k" ]] && break
+        if ssh_key_valid "$k"; then
+            SSH_EXTRA_KEYS+="${SSH_EXTRA_KEYS:+$'\n'}$k"
+            echo "  Ключ добавлен."
+        else
+            echo -e "\e[31m[Ошибка]\e[0m Это не похоже на публичный SSH-ключ — пропускаю."
+        fi
+    done
+    return 0
+}
+
+# --- Версия ноды ------------------------------------------------------------
+# Тег образа remnawave/node: latest или конкретная версия (3.4.3). Конкретная
+# нужна, когда свежая версия что-то ломает и ноду откатывают: с latest любая
+# переустановка вернула бы сломанную версию обратно.
+validate_node_version() {
+    REMNANODE_VERSION=$(echo "${REMNANODE_VERSION:-}" | tr -d '[:space:]')
+    if [[ -n "$REMNANODE_VERSION" && ! "$REMNANODE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "  [ВНИМАНИЕ] REMNANODE_VERSION='$REMNANODE_VERSION' — не похоже на тег образа, ставлю latest."
+        REMNANODE_VERSION=""
+    fi
+    [[ -z "$REMNANODE_VERSION" ]] && REMNANODE_VERSION="latest"
+    return 0
+}
+
+# Спрашивается при каждой интерактивной установке. Если нода уже стоит на
+# закреплённой версии, она предлагается по умолчанию — чтобы Enter не отменил
+# откат. На чистом сервере Enter — latest.
+ask_node_version() {
+    [[ -n "$NONINTERACTIVE" ]] && { validate_node_version; return 0; }
+    local v def="${REMNANODE_VERSION:-latest}"
+    read -ep "Версия ноды Remnawave, например 3.4.3 (Enter — $def): " v || v=""
+    v=$(echo "$v" | tr -d '[:space:]')
+    REMNANODE_VERSION="${v:-$def}"
+    validate_node_version
+    return 0
+}
+
+# --- Учётка ИИ-агента -----------------------------------------------------
+# Отдельный вход для Claude и других агентов, которые ходят на сервер по MCP.
+# Зачем отдельный: в уведомлении о входе видно, кто зашёл — человек или агент,
+# а доступ агента можно закрыть, не трогая свою учётку.
+validate_agent_params() {
+    # Запасное имя не должно совпасть с админ-учёткой, если её саму назвали agent
+    local fallback="agent"
+    [[ "${ADMIN_USER:-}" == "agent" ]] && fallback="ai-agent"
+    AGENT_USER=$(echo "${AGENT_USER:-}" | tr -d '[:space:]')
+    [[ -z "$AGENT_USER" ]] && AGENT_USER="$fallback"
+    if [[ ! "$AGENT_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || [[ "$AGENT_USER" == "root" ]] \
+       || [[ "$AGENT_USER" == "$ADMIN_USER" ]] || (( ${#AGENT_USER} > 32 )); then
+        echo "  [ВНИМАНИЕ] Некорректное AGENT_USER='$AGENT_USER' (или совпадает с админ-учёткой) — использую '$fallback'."
+        AGENT_USER="$fallback"
+    fi
+    return 0
+}
+
+ask_agent_key() {
+    [[ -n "$NONINTERACTIVE" || -n "${AGENT_SSH_KEYS:-}" ]] && return 0
+    local k
+    echo "  Учётка для ИИ-агентов (Claude и др. по MCP): свой ключ, sudo, в уведомлениях"
+    echo "  вход подписан как вход агента. Не нужна — просто Enter."
+    while true; do
+        read -ep "Публичный ключ агента (Enter — не создавать): " k || k=""
+        k=$(echo "$k" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$k" ]] && break
+        if ssh_key_valid "$k"; then
+            AGENT_SSH_KEYS="$k"
+            read -ep "Имя учётки агента [${AGENT_USER:-agent}]: " k || k=""
+            k=$(echo "$k" | tr -d '[:space:]')
+            [[ -n "$k" ]] && AGENT_USER="$k"
+            validate_agent_params
+            break
+        fi
+        echo -e "\e[31m[Ошибка]\e[0m Это не похоже на публичный SSH-ключ."
     done
     return 0
 }
@@ -189,6 +280,12 @@ ask_ssh_params() {
 ask_cf() {
     [[ -z "$SETUP_CF" && -z "$NONINTERACTIVE" ]] && read -ep "Настроить DNS в Cloudflare автоматически? [y/N]: " SETUP_CF
     if [[ "$SETUP_CF" =~ ^[Yy]$ ]]; then
+        if [[ -n "$NONINTERACTIVE" ]]; then
+            # Спрашивать некому: без токена DNS не настроить — так и говорим
+            [[ -z "$CF_API_TOKEN" ]] && { echo "  [СБОЙ] SETUP_CF=y, а CF_API_TOKEN в конфиге пуст"; return 1; }
+            [[ "$CF_PROXY_CHOICE" =~ ^[Yy]$ ]] && CF_PROXIED="true" || CF_PROXIED="false"
+            return 0
+        fi
         while [[ -z "$CF_API_TOKEN" ]]; do
             read -ep "API Token Cloudflare (Edit DNS): " CF_API_TOKEN
             CF_API_TOKEN=$(echo "$CF_API_TOKEN" | tr -d '[:space:]')

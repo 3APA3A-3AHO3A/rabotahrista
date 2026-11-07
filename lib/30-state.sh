@@ -70,6 +70,13 @@ detect_existing_setup() {
                    | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
     fi
 
+    # Версия ноды — тег образа из compose (чтобы не потерять откат на старую)
+    if [[ -z "${REMNANODE_VERSION:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
+        v=$(grep -m1 -E '^[[:space:]]*image:[[:space:]]*remnawave/node' /opt/remnanode/docker-compose.yml 2>/dev/null \
+            | sed -E 's/.*remnawave\/node:?//' | tr -d '"'"'"'" \r\n')
+        REMNANODE_VERSION="${v:-latest}"
+    fi
+
     # Секрет ноды — из compose (кавычки вокруг значения снимаем)
     if [[ -z "${REMNA_SECRET:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
         REMNA_SECRET=$(grep -m1 'SECRET_KEY=' /opt/remnanode/docker-compose.yml 2>/dev/null \
@@ -134,7 +141,9 @@ save_state() {
     # и секрет вида a$(команда) иначе выполнился бы, а пароль с $ — молча испортился.
     {
         for _v in DOMAIN SUBDOMAIN PANEL_IP REMNA_SECRET SETUP_CF CF_API_TOKEN \
-                  CF_PROXY_CHOICE SETUP_SSH SSH_PUBLIC_KEY SSH_PORT ADMIN_USER \
+                  CF_PROXY_CHOICE SETUP_SSH SSH_PUBLIC_KEY SSH_EXTRA_KEYS SSH_PORT ADMIN_USER \
+                  AGENT_USER AGENT_SSH_KEYS GEODATA INSTALL_WARP_NATIVE INSTALL_PSIPHON PSIPHON_REGION \
+                  REMNANODE_VERSION \
                   USER_NODE_LABEL INSTALL_WARP INSTALL_SPEEDTEST SETUP_TG \
                   TG_BOT_TOKEN TG_CHAT_ID TG_TOPIC_ID TG_PROXY PANEL_WATCH \
                   PANEL_PROBE_PORT PANEL_FAIL_CHECKS; do

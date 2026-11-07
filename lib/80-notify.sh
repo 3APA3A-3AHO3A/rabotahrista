@@ -45,6 +45,8 @@ ARGS=(-s --max-time 15)
 ARGS+=(-d "chat_id=\${TG_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=\${HEADER}
 \$1")
 [[ -n "\$TG_TOPIC_ID" ]] && ARGS+=(-d "message_thread_id=\${TG_TOPIC_ID}")
+# RH_SILENT=1 — сообщение без звука (входы ИИ-агента, плановые перезапуски)
+[[ -n "\${RH_SILENT:-}" ]] && ARGS+=(-d "disable_notification=true")
 curl "\${ARGS[@]}" -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
 SCRIPT
     chmod 755 /usr/local/bin/rh-notify.sh
@@ -57,12 +59,20 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # setsid обязателен: PAM дожидается только самого скрипта, а отправку мы уводим
 # в фон, чтобы не задерживать вход. Без отвязки от сессии фоновый curl успевали
 # убить при зачистке процессов раньше, чем он достучится до Telegram.
-setsid /usr/local/bin/rh-notify.sh "🔐 <b>SSH-вход</b>
+# Учётки ИИ-агентов (группа AGENT_GROUP_PLACEHOLDER) подписываем отдельно и шлём
+# без звука: такие входы штатные и частые, будить ими не нужно.
+TITLE="🔐 <b>SSH-вход</b>"
+if id -nG "$PAM_USER" 2>/dev/null | tr ' ' '\n' | grep -qx 'AGENT_GROUP_PLACEHOLDER'; then
+    TITLE="🤖 <b>Вход ИИ-агента</b>"
+    export RH_SILENT=1
+fi
+setsid /usr/local/bin/rh-notify.sh "${TITLE}
 Пользователь: <code>${PAM_USER}</code>
 Откуда IP: <code>${PAM_RHOST}</code>
 Время: $(date '+%Y-%m-%d %H:%M:%S %Z')" >/dev/null 2>&1 &
 exit 0
 SCRIPT
+    sed -i "s/AGENT_GROUP_PLACEHOLDER/$AGENT_GROUP/g" /usr/local/bin/rh-ssh-login.sh
     chmod 755 /usr/local/bin/rh-ssh-login.sh
     # Строку переписываем, а не дописываем: на старых нодах она уже есть в
     # прежнем виде (с seteuid), и простое "добавить, если нет" её не обновит.
@@ -88,8 +98,10 @@ UNIT
     cat <<'SCRIPT' > /usr/local/bin/rh-node-watch.sh
 #!/bin/bash
 FLAG=/run/rh-node-down
-down(){ [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
-up(){ [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
+# Плановый перезапуск (обновление geo-баз) — не авария, молчим
+planned(){ [[ -f /run/rh-node-planned ]] && (( $(date +%s) - $(stat -c %Y /run/rh-node-planned) < 300 )); }
+down(){ planned && return 0; [[ -f "$FLAG" ]] || { /usr/local/bin/rh-notify.sh "⚠️ <b>Нода упала</b>: remnanode $1 ($(date '+%H:%M:%S'))"; touch "$FLAG"; }; }
+up(){ planned && { rm -f /run/rh-node-planned; return 0; }; [[ -f "$FLAG" ]] && { /usr/local/bin/rh-notify.sh "✅ <b>Нода поднялась</b>: remnanode запущен ($(date '+%H:%M:%S'))"; rm -f "$FLAG"; }; }
 docker events --filter 'container=remnanode' --filter 'event=start' --filter 'event=die' --filter 'event=stop' --filter 'event=kill' --format '{{.Action}}' 2>/dev/null | \
 while read -r ev; do
     case "$ev" in
@@ -120,6 +132,8 @@ UNIT
 [[ -f "$NOTIFY_ENV" ]] && source "$NOTIFY_ENV"
 PORT="\${NODE_PORT:-2222}"
 FLAG=/run/rh-node-down
+# Плановый перезапуск (обновление geo-баз) — не повод для тревоги
+[[ -f /run/rh-node-planned ]] && (( \$(date +%s) - \$(stat -c %Y /run/rh-node-planned) < 300 )) && exit 0
 RUNNING=\$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null || echo "false")
 LISTEN=no
 ss -H -ltn 2>/dev/null | grep -q ":\${PORT}" && LISTEN=yes
